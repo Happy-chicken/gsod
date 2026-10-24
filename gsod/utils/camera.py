@@ -182,8 +182,7 @@ def camera_azimuth(cam2world) -> float:
 def azimuth_rotation(cam2world) -> np.ndarray:
     """3x3 yaw rotation (about +z) of a camera's azimuth.
 
-    This is the azi_rot stored per view. Its inverse is the world ->
-    azimuth-frame map (uORF's nss2cam0).
+    Its inverse is the world -> azimuth-frame map (uORF's nss2cam0).
     """
     angle = camera_azimuth(cam2world)
     c, s = np.cos(angle), np.sin(angle)

@@ -9,6 +9,7 @@ _EPS = 1e-6
 
 __all__ = ["Primitive", "Sphere", "Cuboid", "make_primitive"]
 
+
 class Primitive(ABC):
     """Base class for a solid shape."""
 
@@ -21,13 +22,6 @@ class Primitive(ABC):
         there is no hit). ``direction`` need not be normalised.
         """
 
-    @abstractmethod
-    def sample_surface(self, n: int, rng: np.random.Generator) -> np.ndarray:
-        """``(n, 3)`` points sampled on the surface."""
-
-    @abstractmethod
-    def bounding_sphere(self) -> tuple[np.ndarray, float]:
-        """``(center, radius)`` of the tightest enclosing sphere."""
 
 class Sphere(Primitive):
     def __init__(self, center, radius: float):
@@ -52,20 +46,6 @@ class Sphere(Primitive):
         normal = (points - self.center) / self.radius
         normal[~hit] = 0.0
         return t, hit, normal
-
-    def sample_surface(self, n: int, rng: np.random.Generator) -> np.ndarray:
-        # Fibonacci sphere: near-uniform without rejection sampling.
-        i = np.arange(n, dtype=np.float64) + 0.5
-        phi = np.arccos(1.0 - 2.0 * i / n)
-        theta = np.pi * (1.0 + np.sqrt(5.0)) * i
-        unit = np.stack(
-            [np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)],
-            axis=-1,
-        )
-        return self.center + self.radius * unit
-
-    def bounding_sphere(self):
-        return self.center.copy(), self.radius
 
 
 class Cuboid(Primitive):
@@ -106,42 +86,12 @@ class Cuboid(Primitive):
         normal[~hit] = 0.0
         return t, hit, normal
 
-    def sample_surface(self, n: int, rng: np.random.Generator) -> np.ndarray:
-        hx, hy, hz = self.half_extents
-        # +x/-x: 4*hy*hz, +y/-y: 4*hx*hz, +z/-z: 4*hx*hy
-        face_areas = np.array([4.0 * hy * hz, 4.0 * hx * hz, 4.0 * hx * hy])
-        probs = face_areas / face_areas.sum()
 
-        axis = rng.choice(3, size=n, p=probs)
-        sign = rng.choice([-1.0, 1.0], size=n)
-
-        # Local coords on the [-1, 1]^2 face, then map to the two other axes.
-        uv = rng.uniform(-1.0, 1.0, size=(n, 2))
-        points = np.empty((n, 3))
-        for a in range(3):
-            sel = axis == a
-            if not sel.any():
-                continue
-            others = [b for b in range(3) if b != a]
-            points[sel, a] = sign[sel] * self.half_extents[a]
-            points[sel, others[0]] = uv[sel, 0] * self.half_extents[others[0]]
-            points[sel, others[1]] = uv[sel, 1] * self.half_extents[others[1]]
-        return self.center + points
-
-    def bounding_sphere(self):
-        return self.center.copy(), float(np.linalg.norm(self.half_extents))
-
-
-def make_primitive(kind: str, center, size, rng: np.random.Generator) -> Primitive:
-    """Factory: build a ``kind`` primitive of rough scale ``size``.
-
-    ``size`` is the sphere radius or the cube half side length. Cuboids are
-    sampled as cubes for now (``kind in {"cuboid", "cube", "box"}``).
-    """
-    kind = kind.lower()
+def make_primitive(kind: str, center, size: float) -> Primitive:
+    """Build a ``kind`` primitive: a sphere of radius ``size`` or a cube
+    (``"cuboid"``) of half side length ``size``."""
     if kind == "sphere":
         return Sphere(center, size)
-    if kind in {"cuboid", "cube", "box"}:
+    if kind == "cuboid":
         return Cuboid(center, [size, size, size])
     raise ValueError(f"unknown primitive kind: {kind!r}")
-

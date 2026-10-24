@@ -12,6 +12,3 @@ PALETTE: tuple[tuple[float, float, float], ...] = (
     (0.92, 0.45, 0.15),  # orange
     (0.90, 0.42, 0.68),  # pink
 )
-
-BACKGROUND_COLOR: tuple[float, float, float] = (0.93, 0.93, 0.95)
-FLOOR_COLOR: tuple[float, float, float] = (0.55, 0.55, 0.60)

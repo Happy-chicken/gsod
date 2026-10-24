@@ -11,7 +11,6 @@ Layout (one folder per scene, one set of files per view)::
         img0.png                # RGB image
         img0_mask.png           # per-pixel labels (0 = background, i = object i)
         img0_RT.txt             # cam2world, 4x4
-        img0_azi_rot.txt        # azi_rot, 3x3
         img0_depth.npy          # depth, HxWx1 float32
         img1.png ...
       sc0001/
@@ -33,7 +32,6 @@ __all__ = [
     "scene_dirname",
     "frame_stem",
     "write_frame",
-    "read_frame",
     "read_view",
     "write_dataset",
     "find_scene_frames",
@@ -58,8 +56,8 @@ def frame_stem(view_index: int) -> str:
     return f"img{view_index}"
 
 
-def write_frame(scene_dir, stem: str, image, mask, cam2world, azi_rot, depth) -> None:
-    """Write the five files (image, mask, RT, azi_rot, depth) of one view."""
+def write_frame(scene_dir, stem: str, image, mask, cam2world, depth) -> None:
+    """Write the four files (image, mask, RT, depth) of one view."""
     scene_dir = Path(scene_dir)
     save_png(scene_dir / f"{stem}.png", np.asarray(image, dtype=np.uint8))
     save_png(scene_dir / f"{stem}_mask.png", np.asarray(mask, dtype=np.uint8))
@@ -68,34 +66,9 @@ def write_frame(scene_dir, stem: str, image, mask, cam2world, azi_rot, depth) ->
         np.asarray(cam2world, dtype=np.float64),
         fmt="%.6f",
     )
-    np.savetxt(
-        scene_dir / f"{stem}_azi_rot.txt",
-        np.asarray(azi_rot, dtype=np.float64),
-        fmt="%.6f",
-    )
     np.save(
         scene_dir / f"{stem}_depth.npy", np.asarray(depth, dtype=np.float32)[..., None]
     )
-
-
-def read_frame(scene_dir, stem: str) -> dict:
-    """Read one view's files into a dict of arrays (requires Pillow)."""
-    from PIL import Image  # lazy: generation does not need Pillow
-
-    scene_dir = Path(scene_dir)
-    image = np.asarray(
-        Image.open(scene_dir / f"{stem}.png").convert("RGB"), dtype=np.uint8
-    )
-    mask = np.asarray(
-        Image.open(scene_dir / f"{stem}_mask.png").convert("L"), dtype=np.int16
-    )
-    return {
-        "image": image,
-        "mask": mask,
-        "cam2world": np.loadtxt(scene_dir / f"{stem}_RT.txt", dtype=np.float64),
-        "azi_rot": np.loadtxt(scene_dir / f"{stem}_azi_rot.txt", dtype=np.float64),
-        "depth": np.load(scene_dir / f"{stem}_depth.npy"),
-    }
 
 
 def read_view(scene_dir, stem: str) -> dict:
@@ -142,7 +115,6 @@ def write_dataset(root, records, meta: dict) -> Path:
                 images[view_index],
                 record["mask"][view_index],
                 record["cam2world"][view_index],
-                record["azi_rot"][view_index],
                 record["depth"][view_index],
             )
             n_frames += 1

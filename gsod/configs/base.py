@@ -56,13 +56,14 @@ class BaseConfig:
     # --- data ------------------------------------------------------------------
     # Dataset format: "primordia" or "clevr567".
     dataset_mode: str = "primordia"
-    # Square image size used by the CLEVR-567 loader; ignored by Primordia.
+    # CLEVR-567 loader only (Primordia reads all of these from meta.json):
+    # square image size (uORF trains at 128x128),
     dataset_image_size: int = 128
-    # Camera focal ratio (fx/W, fy/H) for CLEVR-567; ignored by Primordia.
+    # uORF's focal ratio (fx/W, fy/H) for its 320x240 renders,
     dataset_focal_ratio: tuple[float, float] = (350.0 / 320.0, 350.0 / 240.0)
-    # Number of views loaded per CLEVR-567 scene; ignored by Primordia.
+    # views loaded per scene (uORF uses four),
     n_views: int = 4
-    # Fraction of the CLEVR-567 training root held out for validation.
+    # fraction of the training root held out for validation.
     val_fraction: float = 0.1
 
     # Dataset root. Primordia expects meta.json; CLEVR-567 expects the flat

@@ -6,8 +6,8 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from gsod.data_generator.constants import FLOOR_COLOR, PALETTE
-from gsod.utils.camera import azimuth_rotation, orbit
+from gsod.data_generator.constants import PALETTE
+from gsod.utils.camera import orbit
 from gsod.data_generator.primitives import make_primitive
 from gsod.data_generator.scene import Scene
 
@@ -36,11 +36,8 @@ class SceneGenConfig:
     azimuth_jitter: float = 3.0
     target_height: float = 0.4
 
-    floor_half: float = 8.0
-    floor_z: float = 0.0  # objects rest on this plane even when it is not drawn
-    floor_checker: float = 0.0
-    # Simplified scenes: no visible floor, one uniform background colour.
-    render_floor: bool = False
+    # Objects rest on this plane; it is not drawn (one uniform background).
+    floor_z: float = 0.0
     background_color: tuple[float, float, float] = (0.5, 0.5, 0.5)
 
     split: tuple[float, float, float] = (0.8, 0.1, 0.1)
@@ -76,19 +73,14 @@ def sample_scene(cfg: SceneGenConfig, rng: np.random.Generator) -> Scene:
         else:
             continue  # could not place this object; drop it
         center = np.array([xy[0], xy[1], cfg.floor_z + size])
-        primitives.append(make_primitive(kind, center, size, rng))
+        primitives.append(make_primitive(kind, center, size))
         placed.append((xy, size))
 
     colors = colors[: len(primitives)]
     return Scene(
         primitives=primitives,
         colors=colors,
-        floor_z=cfg.floor_z,
-        floor_half=cfg.floor_half,
-        floor_color=FLOOR_COLOR,
-        floor_checker=cfg.floor_checker,
         background_color=tuple(cfg.background_color),
-        render_floor=cfg.render_floor,
     )
 
 
@@ -109,13 +101,11 @@ def sample_views(cfg: SceneGenConfig, rng: np.random.Generator) -> np.ndarray:
 
 
 def generate(cfg: SceneGenConfig):
-    """Yield {"scene", "cam2world", "azi_rot"} dicts, one per scene."""
+    """Yield {"scene", "cam2world"} dicts, one per scene."""
     rng = np.random.default_rng(cfg.seed)
     for _ in range(cfg.n_scenes):
         scene = sample_scene(cfg, rng)
-        cam2world = sample_views(cfg, rng)
-        azi_rot = np.stack([azimuth_rotation(c) for c in cam2world])
-        yield {"scene": scene, "cam2world": cam2world, "azi_rot": azi_rot}
+        yield {"scene": scene, "cam2world": sample_views(cfg, rng)}
 
 
 def config_dict(cfg: SceneGenConfig) -> dict:

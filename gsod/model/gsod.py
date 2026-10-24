@@ -42,7 +42,7 @@ Splatter = Callable[..., dict[str, torch.Tensor]]
 def view_yaw(cam2world: torch.Tensor) -> torch.Tensor:
     """Azimuth (rad) of one camera's viewing direction about world +z.
 
-    Same as gsod.utils.camera.camera_azimuth; azi_rot = Rz(view_yaw).
+    Same as gsod.utils.camera.camera_azimuth.
     """
     forward = cam2world[:3, 2]
     return torch.atan2(forward[1], forward[0])
