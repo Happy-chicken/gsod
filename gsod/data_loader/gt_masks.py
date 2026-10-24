@@ -52,6 +52,9 @@ class WithGTMasks:
 
     def __getattr__(self, name):
         # Forward everything else (split lists, meta, ...) to the dataset.
+        # Guard: before __init__ ran (unpickling), self.dataset is missing too.
+        if name == "dataset":
+            raise AttributeError(name)
         return getattr(self.dataset, name)
 
     def _frames(self, scene: int) -> list[tuple[np.ndarray, str]]:

@@ -12,7 +12,7 @@ Answers, per scene and on average:
 
 Usage (from your own test script, after loading a checkpoint):
 
-    from gsod.eval.diagnose import diagnose          # adjust to your layout
+    from gsod.utils.diagnose import diagnose
     report = diagnose(model, val_dataset, device, "debug/step_020000")
 
 Also run it once on a freshly initialised model: the "init" checks should
@@ -345,7 +345,6 @@ def make_grid(
     from PIL import Image, ImageDraw
 
     n_views = rec["rgb"].shape[0]
-    n_slots = rec["alpha"].shape[1]
     size = rec["mask_idx"].shape[1:]
     blank = np.zeros(size + (3,), dtype=np.uint8)
     attn_up = np.stack([upsample_labels(a, size) for a in rec["attn"]])

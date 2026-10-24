@@ -190,12 +190,12 @@ def azimuth_rotation(cam2world) -> np.ndarray:
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
- 
 def get_camera_matrices(camera: Camera, near: float = 0.1, far: float = 100.0) -> dict:
     """Camera matrices for a 3DGS-style rasterizer.
 
-    Returns transposed world_view_transform / full_proj_transform (as
-    the CUDA rasterizer expects), the camera center, and FoV/tan terms.
+    Returns transposed world_view_transform / projection_matrix /
+    full_proj_transform (as the CUDA rasterizer expects), the camera center,
+    and FoV/tan terms.
     """
     width, height = camera.width, camera.height
     fx = camera.focal_ratio[0] * width
@@ -223,10 +223,11 @@ def get_camera_matrices(camera: Camera, near: float = 0.1, far: float = 100.0) -
     projection[3, 2] = 1.0
 
     world_view_t = world_view.T
+    projection_t = projection.T
     return {
         "world_view_transform": world_view_t,
-        "full_proj_transform": world_view_t @ projection,
-        "projection_matrix": projection,
+        "full_proj_transform": world_view_t @ projection_t,
+        "projection_matrix": projection_t,
         "camera_center": camera.center.copy(),
         "FoVx": float(fov_x),
         "FoVy": float(fov_y),

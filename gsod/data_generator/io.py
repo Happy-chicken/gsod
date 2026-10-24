@@ -156,9 +156,11 @@ def write_dataset(root, records, meta: dict) -> Path:
     if object_counts:
         meta["objects_per_scene"] = object_counts
     if "split" not in meta:
-        meta["split"] = make_split(
-            n_scenes, meta.get("split_ratios", (0.8, 0.1, 0.1)), meta.get("seed", 0)
-        )
+        # SceneGenConfig keeps its ratios / seed under meta["config"].
+        config = meta.get("config", {})
+        ratios = meta.get("split_ratios", config.get("split", (0.8, 0.1, 0.1)))
+        seed = meta.get("seed", config.get("seed", 0))
+        meta["split"] = make_split(n_scenes, ratios, seed)
     write_meta(root, meta)
     return root
 

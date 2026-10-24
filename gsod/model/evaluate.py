@@ -42,11 +42,11 @@ PALETTE = np.array(
 
 
 def run_model(model: GSODModel, item: dict, device: torch.device, seed: int) -> dict:
-    """One forward pass with a fixed slot-initialisation seed.
+    """One forward pass with a fixed seed.
 
-    Slot attention samples its initial slots, so without a fixed seed two
-    evaluations of the same checkpoint give different numbers. The global RNG
-    state is restored afterwards so training is not affected.
+    Slot initialisation is deterministic (BO-QSA queries); the seed only guards
+    any remaining randomness so two evaluations of the same checkpoint agree.
+    The global RNG state is restored afterwards so training is not affected.
     """
     images, cams = item["images"].to(device), item["cam2world"].to(device)
     devices = [device] if device.type == "cuda" else []
@@ -151,6 +151,7 @@ def render_scenes(
       attn_mask.png         slot-attention argmax on view 0 (same colours)
     """
     out = Path(out_dir)
+    was_training = model.training
     model.eval()
     for i in range(len(dataset)):
         item = dataset[i]
@@ -174,6 +175,7 @@ def render_scenes(
                 save_png(scene_dir / f"view{v}_slot{k}.png", gray.astype(np.uint8))
         attn = attn_labels(result, model, mask_idx.shape[1:])
         save_png(scene_dir / "attn_mask.png", _colorize(attn, MASK_BG))
+    model.train(was_training)
 
 
 def _to_uint8(chw: torch.Tensor) -> np.ndarray:
