@@ -1,0 +1,353 @@
+"""Slot model: encoder -> slot attention -> object decoder + static background -> splatting.
+
+views[0] -> Encoder -> tokens -> SlotAttention -> K-1 object slots
+object slots -> Gaussian decoder -> object Gaussians (view-0 azimuth frame -> world)
+BackgroundShell (learnable, scene-independent) -> background Gaussians (world)
+all Gaussians -> splatting
+
+Slot indices used by every output (masks, slot_alpha, attention rows):
+    0       background (BackgroundShell; attention row 0 = learned bg query)
+    1..K-1  object slots
+``num_slots`` = K counts the background, so configs keep their meaning.
+
+Frames
+------
+Only views[0] is encoded and the camera azimuth is uniform over 360 deg, so the
+image alone does not say where objects are in *world* xy. Object Gaussians are
+therefore predicted in the azimuth frame of view 0 (yaw-rotated so view 0 looks
+along +x; uORF's nss2cam0) and rotated into the world before splatting. The
+background shell is static and lives in the world frame. Cameras are never
+modified.
+
+Everything that is rendered comes from Gaussians: there is no constant colour
+fill; a pixel no Gaussian covers renders black.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from gsod.model.background import BackgroundShell
+from gsod.model.decoders import (
+    AttentionDecoder,
+    PerSlotMLPDecoder,
+    SharedMLPDecoder,
+    SlotFrame,
+)
+from gsod.model.encoder import Encoder
+from gsod.model.slot_attention import SlotAttention
+
+Splatter = Callable[..., dict[str, torch.Tensor]]
+
+
+def view_yaw(cam2world: torch.Tensor) -> torch.Tensor:
+    """Azimuth (rad) of one camera's viewing direction about world +z.
+
+    Same as gsod.utils.camera.camera_azimuth; azi_rot = Rz(view_yaw).
+    """
+    forward = cam2world[:3, 2]
+    return torch.atan2(forward[1], forward[0])
+
+
+def _yaw_matrix(angle: torch.Tensor) -> torch.Tensor:
+    c, s = torch.cos(angle), torch.sin(angle)
+    zero, one = torch.zeros_like(c), torch.ones_like(c)
+    return torch.stack(
+        [
+            torch.stack([c, -s, zero]),
+            torch.stack([s, c, zero]),
+            torch.stack([zero, zero, one]),
+        ]
+    )
+
+
+def _quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of (..., 4) wxyz quaternions."""
+    aw, ax, ay, az = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        dim=-1,
+    )
+
+
+def yaw_to_world(
+    gaussians: dict[str, torch.Tensor], yaw: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Rotate Gaussians from the view-0 azimuth frame into the world frame."""
+    rot = _yaw_matrix(yaw).to(gaussians["mu"].dtype)
+    half = 0.5 * yaw
+    q_yaw = torch.stack(
+        [
+            torch.cos(half),
+            torch.zeros_like(half),
+            torch.zeros_like(half),
+            torch.sin(half),
+        ]
+    ).to(gaussians["quat"].dtype)
+    return {
+        **gaussians,
+        "mu": gaussians["mu"] @ rot.T,
+        "quat": _quat_mul(q_yaw.expand_as(gaussians["quat"]), gaussians["quat"]),
+    }
+
+
+def attention_anchors(
+    attn_obj: torch.Tensor,
+    cam2world0: torch.Tensor,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+    height: float,
+) -> dict[str, torch.Tensor]:
+    """Back-project each object slot's attention centroid onto z = height.
+
+    attn_obj: (K-1, s*s) object rows of the view-0 slot attention.
+    Returns, per object slot (all differentiable in attn_obj):
+      points  (K-1, 3) centroid ray on the plane, view-0 azimuth frame
+      depth   (K-1,)   camera-space depth of that point in view 0
+      pix_var (K-1,)   attention-weighted spatial variance in image pixels^2
+    """
+    side = int(round(attn_obj.shape[1] ** 0.5))
+    h, w = image_size
+    weights = attn_obj / attn_obj.sum(dim=-1, keepdim=True)
+    idx = torch.arange(side, device=attn_obj.device, dtype=attn_obj.dtype)
+    # Token centres in image pixel coordinates (pixel centres at integers,
+    # matching the dataset; F.interpolate with align_corners=False).
+    u = (idx + 0.5) * w / side - 0.5
+    v = (idx + 0.5) * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    u_bar = (weights * uu.reshape(-1)).sum(-1)
+    v_bar = (weights * vv.reshape(-1)).sum(-1)
+    pix_var = (
+        weights
+        * (
+            (uu.reshape(-1) - u_bar[:, None]) ** 2
+            + (vv.reshape(-1) - v_bar[:, None]) ** 2
+        )
+    ).sum(-1)
+
+    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
+    cx, cy = (w - 1.0) / 2.0, (h - 1.0) / 2.0
+    d_cam = torch.stack(
+        [(u_bar - cx) / fx, (v_bar - cy) / fy, torch.ones_like(u_bar)], -1
+    )
+    c2w = cam2world0.to(attn_obj.dtype)
+    d = d_cam @ c2w[:3, :3].T
+    origin = c2w[:3, 3]
+    # Rays at or above the horizon never reach the plane; keep them finite
+    # (the frame's xy bound then clamps the result).
+    dz = d[:, 2].clamp(max=-1e-2)
+    t = ((height - origin[2]) / dz).clamp(min=0.0)
+    points = origin + t[:, None] * d
+    points = points @ _yaw_matrix(-view_yaw(cam2world0)).to(attn_obj.dtype).T
+    # d_cam has z = 1, so t is the camera-space depth of the point.
+    return {"points": points, "depth": t, "pix_var": pix_var}
+
+
+class GSODModel(nn.Module):
+    def __init__(
+        self,
+        splat: Splatter,
+        image_size: tuple[int, int] = (128, 128),
+        input_size: int = 64,
+        z_dim: int = 64,
+        num_slots: int = 6,
+        attn_iter: int = 3,
+        gaussians_per_slot: int = 512,
+        bg_gaussians_per_slot: int = 1024,
+        decoder_hidden_dim: int = 128,
+        focal_ratio: tuple[float, float] = (1.0, 1.0),
+        near: float = 0.1,
+        scene_config: dict | None = None,
+        canonical_azimuth: bool = True,
+        anchor_frames: bool = True,
+    ):
+        """num_slots: K, background included (K-1 object slots).
+        bg_gaussians_per_slot: number of background-shell Gaussians.
+        scene_config: the SceneGenConfig dict from meta.json; sets the
+        object-frame priors and the background-shell radius.
+        Object slots are initialised BO-QSA style (see slot_attention.py)."""
+        super().__init__()
+        assert num_slots >= 2, "num_slots counts the background; need >= 2"
+        self.splat = splat
+        self.image_size = tuple(image_size)
+        self.input_size = input_size
+        self.num_slots = num_slots
+        self.focal_ratio = tuple(focal_ratio)
+        self.near = near
+        self.want_depth = False
+        self.canonical_azimuth = bool(canonical_azimuth)
+        # Object frame centres follow the slot-attention centroids
+        # (requires canonical_azimuth, as the anchors are in that frame).
+        self.anchor_frames = bool(anchor_frames) and self.canonical_azimuth
+        # Largest object radius: scale for the attention compactness ratio.
+        self.object_radius = (
+            float(scene_config["radius_range"][1]) if scene_config is not None else 0.55
+        )
+
+        self.encoder = Encoder(3, z_dim=z_dim)
+        self.slot_attention = SlotAttention(
+            num_slots=num_slots - 1,
+            in_dim=z_dim,
+            slot_dim=z_dim,
+            iters=attn_iter,
+        )
+        frame = (
+            SlotFrame.from_scene_config(z_dim, scene_config)
+            if scene_config is not None
+            else SlotFrame(z_dim)
+        )
+        self.decoder = AttentionDecoder(
+            n_slots=num_slots - 1,
+            z_dim=z_dim,
+            gaussians_per_slot=gaussians_per_slot,
+            hidden_dim=decoder_hidden_dim,
+            frame=frame,
+        )
+        # Background shell well outside every camera.
+        radius = 20.0
+        if scene_config is not None:
+            cam_max = float(scene_config["distance_range"][1]) + float(
+                scene_config.get("target_height", 0.4)
+            )
+            radius = 3.0 * cam_max
+        self.background = BackgroundShell(
+            n_gaussians=bg_gaussians_per_slot, radius=radius
+        )
+
+    def networks(self) -> dict[str, nn.Module]:
+        """Named networks for checkpoint.save_networks / load_networks."""
+        return {
+            "Encoder": self.encoder,
+            "SlotAttention": self.slot_attention,
+            "Decoder": self.decoder,
+            "Background": self.background,
+        }
+
+    def forward(
+        self, images: torch.Tensor, cam2world: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
+        Only views[0] is encoded."""
+        feat = self.encoder(
+            F.interpolate(
+                images[0:1], size=self.input_size, mode="bilinear", align_corners=False
+            )
+        )
+        tokens = feat.flatten(start_dim=2).permute(0, 2, 1)
+        obj_slots, attn = self.slot_attention(tokens)
+        obj_slots, attn = obj_slots.squeeze(0), attn.squeeze(0)  # (K-1, C), (K, N)
+
+        # Object Gaussians (view-0 azimuth frame), with attention-anchored frames.
+        frame = getattr(getattr(self.decoder, "head", None), "frame", None)
+        anchor_height = frame.anchor_height if frame is not None else 0.45
+        anchors = attention_anchors(
+            attn[1:], cam2world[0], self.image_size, self.focal_ratio, anchor_height
+        )
+        if frame is not None and self.anchor_frames:
+            frame.anchor = anchors["points"]
+        frame_centre = frame_extent = None
+        try:
+            obj_gaussians, obj_probs = self.decoder(obj_slots)
+            if frame is not None:
+                with torch.no_grad():  # frames actually used, for diagnostics
+                    frame_centre, frame_extent = frame(obj_slots)
+        finally:
+            if frame is not None:
+                frame.anchor = None
+        if self.canonical_azimuth:
+            obj_gaussians = yaw_to_world(obj_gaussians, view_yaw(cam2world[0]))
+
+        # Static background Gaussians (world frame) + object Gaussians.
+        bg_gaussians = self.background()
+        n_bg = self.background.n_gaussians
+        gaussians = {
+            name: torch.cat([bg_gaussians[name], obj_gaussians[name]], dim=0)
+            for name in bg_gaussians
+        }
+        device = obj_probs.device
+        slot_ids = torch.cat(
+            [
+                torch.zeros(n_bg, dtype=torch.long, device=device),
+                obj_probs.argmax(-1) + 1,
+            ]
+        )
+        slot_probs = F.one_hot(slot_ids, self.num_slots).to(obj_probs.dtype)
+
+        rendered = self.splat(
+            gaussians,
+            slot_probs,
+            cam2world,
+            self.image_size,
+            self.focal_ratio,
+            self.near,
+            want_depth=self.want_depth,
+        )
+
+        # Per-slot weights sum to the pixel's Gaussian coverage. Uncovered
+        # pixels render black; for masks they count as background.
+        alpha = rendered["slot_alpha"]
+        coverage = alpha.sum(dim=1, keepdim=True)
+        empty = (1.0 - coverage).clamp(min=0.0)
+        alpha_full = torch.cat([alpha[:, :1] + empty, alpha[:, 1:]], dim=1)
+        mask_idx = alpha_full.argmax(dim=1)
+
+        # Every view rendered with the background alone; view 0 of it is the
+        # reference for the residual foreground target in losses.py.
+        bg_only = self.splat(
+            bg_gaussians,
+            slot_probs[:n_bg],
+            cam2world,
+            self.image_size,
+            self.focal_ratio,
+            self.near,
+            want_depth=False,
+        )
+
+        # Attention compactness: spatial variance of each object slot's
+        # attention relative to that of a disk of the largest object radius
+        # at the slot's depth (var of a disk of pixel radius rho = rho^2 / 2).
+        # On generated data a single object scores <= 2.5 in 99% of cases,
+        # two objects merged into one slot > 2.5 in ~70%.
+        rho = (
+            self.focal_ratio[0]
+            * self.image_size[1]
+            * self.object_radius
+            / anchors["depth"].clamp_min(1e-3)
+        )
+        attn_compact = anchors["pix_var"] / (0.5 * rho**2)
+
+        depth = None
+        if self.want_depth and "depth_sum" in rendered:
+            depth = rendered["depth_sum"] / (coverage.squeeze(1) + 1e-6)
+
+        return {
+            "rgb": rendered["rgb"],
+            "slot_alpha": alpha,  # Gaussian weights only
+            "slot_alpha_full": alpha_full,  # uncovered share added to slot 0
+            "coverage": coverage,
+            "mask_idx": mask_idx,
+            "attn": attn,  # (K, s*s); row 0 = background query
+            "slots": obj_slots,  # (K-1, C) object slots
+            "slot_probs": slot_probs,
+            "slot_ids": slot_ids,
+            "depth": depth,
+            "gaussians": gaussians,  # world frame, background first
+            "bg_rgb": bg_only["rgb"],  # (N, 3, H, W) background-only render
+            "bg_rgb_view0": bg_only["rgb"][:1],
+            "attn_compact": attn_compact,  # (K-1,) attention spread / one-object spread
+            "attn_mass": attn[1:].mean(
+                -1
+            ),  # (K-1,) mean attention share per object slot
+            "frame_centre": frame_centre,  # (K-1, 3) object frames, view-0 azimuth frame
+            "frame_extent": frame_extent,
+        }
