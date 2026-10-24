@@ -1,7 +1,7 @@
 """Base configuration for the GS slot model.
 
-There are no anchor points and no spatial priors. Each slot has its own MLP
-that maps the slot latent directly to a fixed number of Gaussians.
+Each object slot is decoded into a fixed number of Gaussians by the decoder
+class passed to ``build_model`` (``AttentionDecoder`` by default).
 
 ``PrimordiaConfig`` and ``Clevr567Config`` inherit these fields and only
 override dataset-specific values.
@@ -30,7 +30,7 @@ class BaseConfig:
     gaussians_per_slot: int = 512
     # Background usually covers more pixels, so it gets its own (larger) count.
     bg_gaussians_per_slot: int = 1024
-    # Hidden width of each per-slot MLP.
+    # Hidden width of the decoder (MLP width, or attention width d_model).
     decoder_hidden_dim: int = 128
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1

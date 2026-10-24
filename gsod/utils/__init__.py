@@ -3,6 +3,7 @@
 from gsod.utils.camera import (
     Camera,
     azimuth_rotation,
+    camera_azimuth,
     get_camera_matrices,
     look_at,
     orbit,
@@ -20,8 +21,8 @@ __all__ = [
     "look_at",
     "orbit",
     "orbit_views",
+    "camera_azimuth",
     "azimuth_rotation",
     "get_camera_matrices",
     "GsplatSplatter",
-    "diagnose",
 ]

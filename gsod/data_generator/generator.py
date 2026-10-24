@@ -48,7 +48,8 @@ class SceneGenConfig:
 
 
 def _sample_colors(rng: np.random.Generator, k: int) -> np.ndarray:
-    assert(k <= len(PALETTE))
+    if k > len(PALETTE):
+        raise ValueError(f"{k} objects exceed the {len(PALETTE)} palette colours")
     idx = rng.choice(len(PALETTE), size=k, replace=False)
     return np.asarray([PALETTE[i] for i in idx], dtype=np.float64)
 

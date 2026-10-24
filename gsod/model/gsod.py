@@ -32,12 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.background import BackgroundShell
-from gsod.model.decoders import (
-    AttentionDecoder,
-    PerSlotMLPDecoder,
-    SharedMLPDecoder,
-    SlotFrame,
-)
+from gsod.model.decoders import AttentionDecoder, SlotFrame
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 
@@ -170,11 +165,14 @@ class GSODModel(nn.Module):
         scene_config: dict | None = None,
         canonical_azimuth: bool = True,
         anchor_frames: bool = True,
+        decoder_cls: type[nn.Module] = AttentionDecoder,
     ):
         """num_slots: K, background included (K-1 object slots).
         bg_gaussians_per_slot: number of background-shell Gaussians.
         scene_config: the SceneGenConfig dict from meta.json; sets the
         object-frame priors and the background-shell radius.
+        decoder_cls: object decoder class (AttentionDecoder, SharedMLPDecoder,
+        PerSlotMLPDecoder), built with the common decoder signature.
         Object slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
@@ -206,7 +204,7 @@ class GSODModel(nn.Module):
             if scene_config is not None
             else SlotFrame(z_dim)
         )
-        self.decoder = AttentionDecoder(
+        self.decoder = decoder_cls(
             n_slots=num_slots - 1,
             z_dim=z_dim,
             gaussians_per_slot=gaussians_per_slot,

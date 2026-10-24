@@ -4,7 +4,14 @@ The gsplat splatter lives in ``gsod/utils/splatter.py``. ``build_model`` is
 kept here as the package-level factory, so callers can use::
 
     from gsod.model import GSODModel, build_model, load_networks
+
+The decoder is chosen by passing its class, e.g.
+``build_model(cfg, meta, decoder_cls=SharedMLPDecoder)``.
 """
+
+from __future__ import annotations
+
+from torch import nn
 
 from gsod.configs import BaseConfig
 from gsod.model.decoders import (
@@ -20,15 +27,17 @@ from gsod.model.gsod import GSODModel
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.splatter import GsplatSplatter
 
-# Manual decoder selection. Options:
-#   "slot"         one MLP per slot
-#   "fg_bg"        background MLP + shared foreground MLP
-#   "attention"    Gaussian queries cross-attend to slot tokens
-DECODER_TYPE = "attention"
 
+def build_model(
+    cfg: BaseConfig,
+    meta: dict,
+    decoder_cls: type[nn.Module] = AttentionDecoder,
+) -> GSODModel:
+    """Build a GSODModel from a config profile and dataset metadata.
 
-def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
-    """Build a GSODModel from a config profile and dataset metadata."""
+    decoder_cls: ``AttentionDecoder``, ``SharedMLPDecoder`` or
+    ``PerSlotMLPDecoder`` (any class with the common decoder signature).
+    """
     height, width = meta["image_size"]
     return GSODModel(
         splat=GsplatSplatter(),
@@ -42,6 +51,9 @@ def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
+        # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none.
+        scene_config=meta.get("config"),
+        decoder_cls=decoder_cls,
     )
 
 

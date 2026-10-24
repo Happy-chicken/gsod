@@ -1,4 +1,4 @@
-"""constansts for scene generation"""
+"""Constants for scene generation."""
 
 from __future__ import annotations
 
