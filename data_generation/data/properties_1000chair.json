@@ -1,0 +1,21 @@
+{
+  "shapes": {
+    "chair_37351": "Chair_37351"
+  },
+  "colors": {
+    "black": [20, 20, 20],
+    "gray": [100, 100, 100],
+    "red": [173, 35, 35],
+    "blue": [42, 75, 215],
+    "green": [29, 105, 20],
+    "purple": [129, 38, 192],
+    "cyan": [41, 208, 208],
+    "yellow": [255, 238, 51]
+  },
+  "materials": {
+    "diffuse": "Diffuse"
+  },
+  "sizes": {
+    "large": 1.4
+  }
+}
