@@ -24,7 +24,6 @@ def render_scene(sample: dict, cfg: SceneGenConfig) -> dict:
     return {
         "images": rendered["images"],
         "cam2world": sample["cam2world"].astype(np.float32),
-        "azi_rot": sample["azi_rot"].astype(np.float32),
         "mask": rendered["mask"],
         "depth": rendered["depth"],
         "num_objects": sample["scene"].num_objects,
@@ -41,7 +40,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--views", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shapes", nargs="+", default=["sphere", "cuboid"])
-    parser.add_argument("--floor-checker", type=float, default=0.0)
     parser.add_argument("--placement-radius", type=float, default=1.8,
                         help="max object-centre radius in the xy plane")
     parser.add_argument("--radius-min", type=float, default=0.35)
@@ -67,7 +65,6 @@ def main() -> None:
         n_views=args.views,
         seed=args.seed,
         shapes=tuple(args.shapes),
-        floor_checker=args.floor_checker,
         placement_radius=args.placement_radius,
         radius_range=(args.radius_min, args.radius_max),
         min_gap=args.min_gap,

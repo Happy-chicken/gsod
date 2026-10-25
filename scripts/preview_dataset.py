@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+from PIL import Image
+
 from gsod.data_generator import io
 from gsod.data_generator.constants import PALETTE
 from gsod.utils.png import save_png
@@ -44,9 +46,10 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     for view, stem in enumerate(frames):
-        frame = io.read_frame(scene_dir, stem)
-        save_png(args.out / f"img_v{view}.png", frame["image"])
-        save_png(args.out / f"mask_v{view}.png", colorize_mask(frame["mask"]))
+        image = io.read_view(scene_dir, stem)["image"]
+        mask = np.asarray(Image.open(scene_dir / f"{stem}_mask.png").convert("L"))
+        save_png(args.out / f"img_v{view}.png", image)
+        save_png(args.out / f"mask_v{view}.png", colorize_mask(mask))
     print(f"scene {args.scene}: {len(frames)} views -> {args.out}/img_v*.png, mask_v*.png")
 
 

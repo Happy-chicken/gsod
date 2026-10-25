@@ -92,7 +92,7 @@ def train(
         images, cams = images[order].to(device), cams[order].to(device)
 
         out_dict = model(images, cams)
-        loss, terms = criterion(out_dict, images)
+        loss, terms = criterion(out_dict, images, step)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -108,7 +108,7 @@ def train(
         if len(val_set) and step % cfg.eval_every == 0:
             metrics = evaluate(model, val_set, device)
             print(
-                f"step {step} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f}"
+                f"step {step} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f} "
                 f"fg_ari {metrics['fg_ari']:.3f} attn_fg_ari {metrics['attn_fg_ari']:.3f}"
             )
             if metrics["psnr"] > best_psnr:
