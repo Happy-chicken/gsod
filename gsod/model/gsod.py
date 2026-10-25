@@ -299,18 +299,6 @@ class GSODModel(nn.Module):
         alpha_full = torch.cat([alpha[:, :1] + empty, alpha[:, 1:]], dim=1)
         mask_idx = alpha_full.argmax(dim=1)
 
-        # Every view rendered with the background alone; view 0 of it is the
-        # reference for the residual foreground target in losses.py.
-        bg_only = self.splat(
-            bg_gaussians,
-            slot_probs[:n_bg],
-            cam2world,
-            self.image_size,
-            self.focal_ratio,
-            self.near,
-            want_depth=False,
-        )
-
         # Attention compactness: spatial variance of each object slot's
         # attention relative to that of a disk of the largest object radius
         # at the slot's depth (var of a disk of pixel radius rho = rho^2 / 2).
@@ -340,8 +328,6 @@ class GSODModel(nn.Module):
             "slot_ids": slot_ids,
             "depth": depth,
             "gaussians": gaussians,  # world frame, background first
-            "bg_rgb": bg_only["rgb"],  # (N, 3, H, W) background-only render
-            "bg_rgb_view0": bg_only["rgb"][:1],
             "attn_compact": attn_compact,  # (K-1,) attention spread / one-object spread
             "attn_mass": attn[1:].mean(
                 -1

@@ -21,7 +21,7 @@ pass before training starts.
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
                       key scores; row 1 images and masks of views 0/1 plus the
-                      background-only render and residual target; then slot
+                      background-only render of view 0; then slot
                       attention, view-0 alpha and view-1 alpha per slot, each
                       caption with the slot's mask colour (slot 0 = background).
                       Needs Pillow.
@@ -79,6 +79,16 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         result = model(images, cams)
         # Frames as used in the forward pass (with attention anchors).
         centre, extent = result.get("frame_centre"), result.get("frame_extent")
+        # What the (scene-independent) background alone renders in view 0.
+        bg = model.background()
+        bg_view0 = model.splat(
+            bg,
+            bg["mu"].new_ones(bg["mu"].shape[0], 1),
+            cams[:1],
+            model.image_size,
+            model.focal_ratio,
+            model.near,
+        )["rgb"][0]
 
     def np_(x):
         return None if x is None else x.detach().float().cpu().numpy()
@@ -101,9 +111,7 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
-        "bg_view0": np_(result["bg_rgb_view0"][0])
-        if "bg_rgb_view0" in result
-        else None,
+        "bg_view0": np_(bg_view0),
     }
 
 
@@ -221,7 +229,7 @@ def verdicts(mean: dict) -> list[str]:
         redundant = g("attn_dominance") - g("render_dominance") > 0.1
         cause = (
             "several slots redraw the same object (render dominance well below "
-            "attention's); use the fg_render loss."
+            "attention's); raise the consistency loss weight."
             if redundant
             else "slots draw their own objects, but the render is soft or misplaced "
             "(edges / thin parts lost to the background); see bg_on_objects."
@@ -290,7 +298,6 @@ _TEXT = {
     "mask": "render mask v{v}",
     "attn_mask": "attn mask v0",
     "bg_only": "bg-only render v0",
-    "fg_target": "fg target F v0",
     "attn": "attn {slot}",
     "alpha": "alpha v{v} {slot}",
     "row_attn": "slot attention (view 0, white = 1)",
@@ -336,7 +343,7 @@ def make_grid(
 
     Row 1  view 0: target, render, GT mask, render mask, attention mask;
            view 1: target, render, render mask; then the background-only render
-           of view 0 and the residual foreground target F used by the losses.
+           of view 0.
     Row 2  slot attention per slot (slot 0 = background query).
     Row 3  rendered alpha per slot, view 0.
     Row 4  rendered alpha per slot, view 1.
@@ -374,12 +381,7 @@ def make_grid(
             (_colorize(rec["mask_idx"][1]), _txt("mask", v=1), None),
         ]
     if rec.get("bg_view0") is not None:
-        diff = np.abs(rec["target"][0] - rec["bg_view0"]).max(0)
-        fg_target = 1.0 / (1.0 + np.exp(-(diff - 0.1) / 0.02))
-        row0 += [
-            (_rgb(rec["bg_view0"]), _txt("bg_only"), None),
-            (_gray(fg_target), _txt("fg_target"), None),
-        ]
+        row0.append((_rgb(rec["bg_view0"]), _txt("bg_only"), None))
     rows = [(None, row0)]
     rows.append(
         (
