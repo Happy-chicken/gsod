@@ -21,7 +21,8 @@ pass before training starts.
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
                       key scores; row 1 images and masks of views 0/1 plus the
-                      background-only render of view 0; then slot
+                      background-only render and foreground target F of
+                      view 0; then slot
                       attention, view-0 alpha and view-1 alpha per slot, each
                       caption with the slot's mask colour (slot 0 = background).
                       Needs Pillow.
@@ -71,47 +72,39 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
     """Run the model on one scene and return everything as numpy arrays."""
     import torch
 
+    from gsod.model.losses import background_residual_target
+
     images = item["images"].to(device)
     cams = item["cam2world"].to(device)
     devices = [device] if getattr(device, "type", "") == "cuda" else []
     with torch.no_grad(), torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         result = model(images, cams)
-        # Frames as used in the forward pass (with attention anchors).
-        centre, extent = result.get("frame_centre"), result.get("frame_extent")
-        # What the (scene-independent) background alone renders in view 0.
-        bg = model.background()
-        bg_view0 = model.splat(
-            bg,
-            bg["mu"].new_ones(bg["mu"].shape[0], 1),
-            cams[:1],
-            model.image_size,
-            model.focal_ratio,
-            model.near,
-        )["rgb"][0]
+        # Foreground target F of view 0, as the losses compute it.
+        fg_target = background_residual_target(result, images)[0]
 
     def np_(x):
         return None if x is None else x.detach().float().cpu().numpy()
 
-    alpha_full = result.get("slot_alpha_full", result["slot_alpha"])
     side = model.input_size
     gt = item.get("masks")
     g = result["gaussians"]
     return {
         "target": np_(images),
         "rgb": np_(result["rgb"].clamp(0, 1)),
-        "alpha": np_(alpha_full),  # (N, K, H, W)
+        "alpha": np_(result["slot_alpha_full"]),  # (N, K, H, W)
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (N, H, W)
         "attn": np_(result["attn"]).reshape(-1, side, side),  # (K, s, s)
-        "slots": np_(result["slots"]),  # (K, C)
-        "centre": np_(centre),  # (K, 3) or None
-        "extent": np_(extent),
+        "slots": np_(result["slots"]),  # (K-1, C) object slots
+        # Object frames as used in the forward pass: (K-1, 3) or None.
+        "centre": np_(result["frame_centre"]),
         "mu": np_(g["mu"]),
         "scale": np_(g["scale"]),
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
-        "bg_view0": np_(bg_view0),
+        "bg_view0": np_(result["bg_rgb"][0]),
+        "fg_target": np_(fg_target),
     }
 
 
@@ -148,8 +141,7 @@ def analyse(rec: dict) -> dict:
     else:
         obj = alpha0[1:].sum(0) > 0.3
 
-    # Object slot latents (older models also returned a background latent).
-    fg = rec["slots"][-(n_slots - 1) :]
+    fg = rec["slots"]  # object slot latents
     fg_n = fg / (np.linalg.norm(fg, axis=1, keepdims=True) + 1e-8)
     cos = fg_n @ fg_n.T
     off = cos[~np.eye(len(fg), dtype=bool)] if len(fg) > 1 else np.array([np.nan])
@@ -179,9 +171,7 @@ def analyse(rec: dict) -> dict:
     centre_min_dist = float("nan")
     if rec["centre"] is not None:
         active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
-        # Object frames are (K-1, 3) (older models: (K, 3) with background first).
-        offset = 1 if rec["centre"].shape[0] == n_slots - 1 else 0
-        c = rec["centre"][[k - offset for k in active]]
+        c = rec["centre"][[k - 1 for k in active]]  # frames are object slots 1..K-1
         if len(c) > 1:
             d = np.linalg.norm(c[:, None] - c[None], axis=-1)
             centre_min_dist = float(d[~np.eye(len(c), dtype=bool)].min())
@@ -229,7 +219,7 @@ def verdicts(mean: dict) -> list[str]:
         redundant = g("attn_dominance") - g("render_dominance") > 0.1
         cause = (
             "several slots redraw the same object (render dominance well below "
-            "attention's); raise render_from_attn."
+            "attention's); use the fg_render loss."
             if redundant
             else "slots draw their own objects, but the render is soft or misplaced "
             "(edges / thin parts lost to the background); see bg_on_objects."
@@ -298,6 +288,7 @@ _TEXT = {
     "mask": "render mask v{v}",
     "attn_mask": "attn mask v0",
     "bg_only": "bg-only render v0",
+    "fg_target": "fg target F v0",
     "attn": "attn {slot}",
     "alpha": "alpha v{v} {slot}",
     "row_attn": "slot attention (view 0, white = 1)",
@@ -343,7 +334,7 @@ def make_grid(
 
     Row 1  view 0: target, render, GT mask, render mask, attention mask;
            view 1: target, render, render mask; then the background-only render
-           of view 0.
+           of view 0 and the foreground target F used by the losses.
     Row 2  slot attention per slot (slot 0 = background query).
     Row 3  rendered alpha per slot, view 0.
     Row 4  rendered alpha per slot, view 1.
@@ -380,8 +371,10 @@ def make_grid(
             (_rgb(rec["rgb"][1]), _txt("render", v=1), None),
             (_colorize(rec["mask_idx"][1]), _txt("mask", v=1), None),
         ]
-    if rec.get("bg_view0") is not None:
-        row0.append((_rgb(rec["bg_view0"]), _txt("bg_only"), None))
+    row0 += [
+        (_rgb(rec["bg_view0"]), _txt("bg_only"), None),
+        (_gray(rec["fg_target"]), _txt("fg_target"), None),
+    ]
     rows = [(None, row0)]
     rows.append(
         (

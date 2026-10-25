@@ -38,7 +38,6 @@ class GsplatSplatter:
         image_size: tuple[int, int],
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
-        want_depth: bool = False,
     ) -> dict[str, torch.Tensor]:
         if not gaussians["mu"].is_cuda:
             raise RuntimeError(
@@ -72,7 +71,6 @@ class GsplatSplatter:
             .contiguous()
         )
 
-        render_mode = "RGB+D" if want_depth else "RGB"
         rendered, _, _ = rasterization(
             means=mu,
             quats=quat,
@@ -89,22 +87,18 @@ class GsplatSplatter:
             eps2d=self.eps2d,
             sh_degree=None,
             packed=self.packed,
-            render_mode=render_mode,
+            render_mode="RGB",
             rasterize_mode=self.rasterize_mode,
             channel_chunk=self.channel_chunk,
             camera_model="pinhole",
         )
 
-        result = {
+        return {
             "rgb": rendered[..., :3].permute(0, 3, 1, 2).contiguous(),
             "slot_alpha": rendered[..., 3 : 3 + num_slots]
             .permute(0, 3, 1, 2)
             .contiguous(),
         }
-        if want_depth:
-            # Accumulated camera-space z; GSODModel normalises by coverage.
-            result["depth_sum"] = rendered[..., -1]
-        return result
 
 
 def _intrinsics(

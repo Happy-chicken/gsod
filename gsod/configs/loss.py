@@ -1,8 +1,4 @@
-"""Loss configuration shared by all training profiles (see model/losses.py).
-
-The same weights are used for Primordia and CLEVR-567: no term assumes a
-uniform background or a dataset-specific colour threshold.
-"""
+"""Loss configuration shared by all training profiles (see model/losses.py)."""
 
 from __future__ import annotations
 
@@ -16,20 +12,15 @@ class LossConfig:
     ssim: float = 0.2
     # L1 on view 0, the encoded view.
     view0: float = 1.0
-    # attn_from_render: slot attention learns the rendered partition of view
-    # 0 (background included), only where the render reconstructs the image.
-    attn_from_render: float = 0.1
-    # render_from_attn: on tokens the attention gives to objects, the render
-    # splits them among object slots like the attention does.
-    render_from_attn: float = 0.05
-    # Per-pixel reconstruction error (max over RGB, in [0, 1]) at which the
-    # render is no longer trusted as a target for the attention.
-    trust_tau: float = 0.1
-    # opacity: object Gaussians either opaque or transparent, o * (1 - o).
-    # Off by default: early on it pushes object opacity towards 0.
-    opacity: float = 0.0
-    # The structural terms above are off until `start`, then ramp linearly to
-    # their weight over `warmup` steps; reconstruction alone makes objects
-    # appear first.
-    start: int = 2_000
-    warmup: int = 2_000
+    # fg_cov: object slots must draw the object pixels (target F), all views.
+    fg_cov: float = 0.1
+    # bg_attn: slot attention hands the background pixels to the background.
+    bg_attn: float = 0.1
+    # fg_render: each object is drawn by the slot that attends to it.
+    fg_render: float = 0.05
+    # Step from which F is used: fg_cov, bg_attn and the object-pixel
+    # weighting of the L1 terms. 0 = from the start, which works when the
+    # background shell starts close to the data background (Primordia).
+    residual_start: int = 0
+    # Colour difference (max over RGB, in [0, 1]) that counts as foreground in F.
+    residual_tau: float = 0.1

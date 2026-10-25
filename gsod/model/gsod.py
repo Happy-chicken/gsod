@@ -102,14 +102,12 @@ def attention_anchors(
     image_size: tuple[int, int],
     focal_ratio: tuple[float, float],
     height: float,
-) -> dict[str, torch.Tensor]:
+) -> torch.Tensor:
     """Back-project each object slot's attention centroid onto z = height.
 
     attn_obj: (K-1, s*s) object rows of the view-0 slot attention.
-    Returns, per object slot (all differentiable in attn_obj):
-      points  (K-1, 3) centroid ray on the plane, view-0 azimuth frame
-      depth   (K-1,)   camera-space depth of that point in view 0
-      pix_var (K-1,)   attention-weighted spatial variance in image pixels^2
+    Returns (K-1, 3) points in the view-0 azimuth frame, differentiable in
+    attn_obj.
     """
     side = int(round(attn_obj.shape[1] ** 0.5))
     h, w = image_size
@@ -122,13 +120,6 @@ def attention_anchors(
     vv, uu = torch.meshgrid(v, u, indexing="ij")
     u_bar = (weights * uu.reshape(-1)).sum(-1)
     v_bar = (weights * vv.reshape(-1)).sum(-1)
-    pix_var = (
-        weights
-        * (
-            (uu.reshape(-1) - u_bar[:, None]) ** 2
-            + (vv.reshape(-1) - v_bar[:, None]) ** 2
-        )
-    ).sum(-1)
 
     fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
     cx, cy = (w - 1.0) / 2.0, (h - 1.0) / 2.0
@@ -143,9 +134,7 @@ def attention_anchors(
     dz = d[:, 2].clamp(max=-1e-2)
     t = ((height - origin[2]) / dz).clamp(min=0.0)
     points = origin + t[:, None] * d
-    points = points @ _yaw_matrix(-view_yaw(cam2world0)).to(attn_obj.dtype).T
-    # d_cam has z = 1, so t is the camera-space depth of the point.
-    return {"points": points, "depth": t, "pix_var": pix_var}
+    return points @ _yaw_matrix(-view_yaw(cam2world0)).to(attn_obj.dtype).T
 
 
 class GSODModel(nn.Module):
@@ -182,15 +171,10 @@ class GSODModel(nn.Module):
         self.num_slots = num_slots
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
-        self.want_depth = False
         self.canonical_azimuth = bool(canonical_azimuth)
         # Object frame centres follow the slot-attention centroids
         # (requires canonical_azimuth, as the anchors are in that frame).
         self.anchor_frames = bool(anchor_frames) and self.canonical_azimuth
-        # Largest object radius: scale for the attention compactness ratio.
-        self.object_radius = (
-            float(scene_config["radius_range"][1]) if scene_config is not None else 0.55
-        )
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -247,18 +231,20 @@ class GSODModel(nn.Module):
 
         # Object Gaussians (view-0 azimuth frame), with attention-anchored frames.
         frame = getattr(getattr(self.decoder, "head", None), "frame", None)
-        anchor_height = frame.anchor_height if frame is not None else 0.45
-        anchors = attention_anchors(
-            attn[1:], cam2world[0], self.image_size, self.focal_ratio, anchor_height
-        )
         if frame is not None and self.anchor_frames:
-            frame.anchor = anchors["points"]
-        frame_centre = frame_extent = None
+            frame.anchor = attention_anchors(
+                attn[1:],
+                cam2world[0],
+                self.image_size,
+                self.focal_ratio,
+                frame.anchor_height,
+            )
+        frame_centre = None
         try:
             obj_gaussians, obj_probs = self.decoder(obj_slots)
             if frame is not None:
                 with torch.no_grad():  # frames actually used, for diagnostics
-                    frame_centre, frame_extent = frame(obj_slots)
+                    frame_centre = frame(obj_slots)[0]
         finally:
             if frame is not None:
                 frame.anchor = None
@@ -288,7 +274,6 @@ class GSODModel(nn.Module):
             self.image_size,
             self.focal_ratio,
             self.near,
-            want_depth=self.want_depth,
         )
 
         # Per-slot weights sum to the pixel's Gaussian coverage. Uncovered
@@ -299,39 +284,27 @@ class GSODModel(nn.Module):
         alpha_full = torch.cat([alpha[:, :1] + empty, alpha[:, 1:]], dim=1)
         mask_idx = alpha_full.argmax(dim=1)
 
-        # Attention compactness: spatial variance of each object slot's
-        # attention relative to that of a disk of the largest object radius
-        # at the slot's depth (var of a disk of pixel radius rho = rho^2 / 2).
-        # On generated data a single object scores <= 2.5 in 99% of cases,
-        # two objects merged into one slot > 2.5 in ~70%.
-        rho = (
-            self.focal_ratio[0]
-            * self.image_size[1]
-            * self.object_radius
-            / anchors["depth"].clamp_min(1e-3)
-        )
-        attn_compact = anchors["pix_var"] / (0.5 * rho**2)
-
-        depth = None
-        if self.want_depth and "depth_sum" in rendered:
-            depth = rendered["depth_sum"] / (coverage.squeeze(1) + 1e-6)
+        # Every view rendered with the background alone: the reference for
+        # the foreground target F in losses.py, which takes no gradient.
+        with torch.no_grad():
+            bg_rgb = self.splat(
+                bg_gaussians,
+                slot_probs[:n_bg],
+                cam2world,
+                self.image_size,
+                self.focal_ratio,
+                self.near,
+            )["rgb"]
 
         return {
             "rgb": rendered["rgb"],
             "slot_alpha": alpha,  # Gaussian weights only
             "slot_alpha_full": alpha_full,  # uncovered share added to slot 0
-            "coverage": coverage,
             "mask_idx": mask_idx,
             "attn": attn,  # (K, s*s); row 0 = background query
             "slots": obj_slots,  # (K-1, C) object slots
-            "slot_probs": slot_probs,
             "slot_ids": slot_ids,
-            "depth": depth,
             "gaussians": gaussians,  # world frame, background first
-            "attn_compact": attn_compact,  # (K-1,) attention spread / one-object spread
-            "attn_mass": attn[1:].mean(
-                -1
-            ),  # (K-1,) mean attention share per object slot
+            "bg_rgb": bg_rgb,  # (N, 3, H, W) background-only render
             "frame_centre": frame_centre,  # (K-1, 3) object frames, view-0 azimuth frame
-            "frame_extent": frame_extent,
         }
