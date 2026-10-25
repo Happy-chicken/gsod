@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/cuda_env.sh
-DATA=clevr_567_train
+DATA=data/clevr/clevr_567_train
 if [[ $# -gt 0 && $1 != -* ]]; then
     DATA=$1
     shift

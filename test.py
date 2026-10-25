@@ -3,8 +3,7 @@
 
 Examples:
     python test.py --dataset primordia --split test
-    python test.py --dataset clevr567 \
-        --data clevr_567_test --checkpoint checkpoints/clevr567_<timestamp> --split test
+    python test.py --dataset clevr567 --split test   # data/clevr/clevr_567_test
 """
 
 from __future__ import annotations
@@ -40,7 +39,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = config_for(args.dataset)
-    data_root = args.data or cfg.data_root
+    data_root = args.data or (
+        cfg.test_root if args.split == "test" and cfg.test_root else cfg.data_root
+    )
     checkpoint = args.checkpoint or latest_run_dir(cfg.dataset_mode)
     if checkpoint is None:
         raise FileNotFoundError(

@@ -51,8 +51,9 @@ def build_model(
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
-        # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none.
-        scene_config=meta.get("config"),
+        # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none
+        # and uses the profile's scene_prior instead.
+        scene_config=meta.get("config", cfg.scene_prior),
         decoder_cls=decoder_cls,
     )
 

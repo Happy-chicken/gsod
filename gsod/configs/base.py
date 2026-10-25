@@ -69,5 +69,12 @@ class BaseConfig:
     # Dataset root. Primordia expects meta.json; CLEVR-567 expects the flat
     # uORF layout with *scNNNN*.png and *_RT.txt files.
     data_root: str = "data/primordia"
+    # Root of the test split, if it is a separate directory (CLEVR-567);
+    # None: the test split lives in data_root (Primordia).
+    test_root: str | None = None
+    # Scene priors (SceneGenConfig keys) for datasets without meta.json; they
+    # set the object-frame bounds and the background-shell radius, which are
+    # not stored in checkpoints, so train and test must use the same values.
+    scene_prior: dict | None = None
     # Directory for checkpoints and their *_state.json files.
     out_dir: str = field(default_factory=lambda: default_out_dir("run"))
