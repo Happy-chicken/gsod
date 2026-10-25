@@ -70,6 +70,7 @@ def main() -> None:
         n_views=cfg.n_views,
         val_fraction=cfg.val_fraction,
         seed=cfg.seed,
+        load_masks=True,  # CLEVR-567 *_mask.png; ignored by Primordia
     )
     if cfg.dataset_mode == "primordia":
         dataset = WithGTMasks(dataset, data_root)

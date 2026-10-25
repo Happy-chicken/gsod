@@ -39,11 +39,13 @@ class PrimordiaScenes(Dataset):
 
     images:    (V, 3, H, W) float32 in [0, 1]
     cam2world: (V, 4, 4) float32
-    depths:    (V, H, W) float32 camera-space z; 0 where there is no surface
+    depths:    (V, H, W) float32 camera-space z, 0 where there is no surface;
+               None unless load_depth (training does not use depth)
     """
 
-    def __init__(self, root, split: str = "train"):
+    def __init__(self, root, split: str = "train", *, load_depth: bool = False):
         self.root = Path(root)
+        self.load_depth = load_depth
         meta = load_meta(self.root)
         self.meta = meta
         self.image_size = tuple(meta["image_size"])
@@ -63,17 +65,22 @@ class PrimordiaScenes(Dataset):
         cams = torch.tensor(
             np.stack([v["cam2world"] for v in views]), dtype=torch.float32
         )
-        depths = np.stack(
-            [
-                hit_distance_to_depth(
-                    np.load(scene_dir / f"{stem}_depth.npy")[..., 0], self.focal_ratio
+        depths = None
+        if self.load_depth:
+            depths = torch.from_numpy(
+                np.stack(
+                    [
+                        hit_distance_to_depth(
+                            np.load(scene_dir / f"{stem}_depth.npy")[..., 0],
+                            self.focal_ratio,
+                        )
+                        for stem in self.frames[scene]
+                    ]
                 )
-                for stem in self.frames[scene]
-            ]
-        )
+            )
         return {
             "scene": scene,
             "images": images,
             "cam2world": cams,
-            "depths": torch.from_numpy(depths),
+            "depths": depths,
         }

@@ -50,14 +50,15 @@ def train(
         seed=cfg.seed,
     )
     train_set = make_dataset(cfg.data_root, "train", **dataset_kwargs)
-    val_set = make_dataset(cfg.data_root, "val", **dataset_kwargs)
-    if cfg.dataset_mode == "primordia":  # CLEVR-567 的扁平目录里没有 mask 文件
+    # CLEVR-567 reads *_mask.png when present (and skips them otherwise);
+    # Primordia masks live in the scene folders and need the wrapper.
+    val_set = make_dataset(cfg.data_root, "val", load_masks=True, **dataset_kwargs)
+    if cfg.dataset_mode == "primordia":
         val_set = WithGTMasks(val_set, cfg.data_root)
     print(
         f"data={cfg.data_root} train_scenes={len(train_set)} val_scenes={len(val_set)}"
     )
 
-    torch.manual_seed(cfg.seed)
     rng = random.Random(cfg.seed)
     loader = DataLoader(
         train_set,
@@ -217,6 +218,8 @@ def main() -> None:
         image_size=cfg.dataset_image_size,
         focal_ratio=cfg.dataset_focal_ratio,
     )
+    # Seed before building the model so cfg.seed also fixes its initialisation.
+    torch.manual_seed(cfg.seed)
     model = build_model(cfg, meta)
     train(model, device, cfg, resume=args.resume)
 

@@ -6,8 +6,13 @@ Writes ``img_v<i>.png`` and ``mask_v<i>.png`` into ``--out`` (no stitching).
 
 from __future__ import annotations
 
-import argparse
+import sys
 from pathlib import Path
+
+# Run from anywhere: the gsod package lives one level up.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import argparse
 
 import numpy as np
 

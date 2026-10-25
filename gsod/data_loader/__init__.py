@@ -40,7 +40,7 @@ def make_dataset(
 ):
     """Build the dataset for ``split`` using the configured format."""
     if dataset_mode == "primordia":
-        return PrimordiaScenes(root, split)
+        return PrimordiaScenes(root, split, load_depth=load_depth)
     if dataset_mode == "clevr567":
         return Clevr567Scenes(
             root,

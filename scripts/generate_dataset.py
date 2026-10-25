@@ -7,9 +7,14 @@ Glues the three responsibilities together: sample (generator) -> render
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Run from anywhere: the gsod package lives one level up.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import argparse
 import time
-from pathlib import Path
 
 import numpy as np
 
