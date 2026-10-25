@@ -65,9 +65,18 @@ def _load_rgb(path: Path, size: tuple[int, int]) -> torch.Tensor:
 
 
 def _load_mask(path: Path, size: tuple[int, int]) -> torch.Tensor:
-    mask = Image.open(path).convert("L")
-    mask = mask.resize((size[1], size[0]), Image.NEAREST)
-    return torch.from_numpy(np.asarray(mask, dtype=np.int64))
+    """uORF mask PNG -> (H, W) int64 labels, 0 = background, i > 0 = objects.
+
+    The masks are flat colours. As in uORF's MultiscenesDataset, they are
+    compared in grayscale: every distinct grey value is one region and the
+    background is the second-darkest value (uORF's greyscale_dict[1]).
+    """
+    mask = Image.open(path).convert("L").resize((size[1], size[0]), Image.NEAREST)
+    gray = np.asarray(mask, dtype=np.int64)
+    values, labels = np.unique(gray, return_inverse=True)
+    labels = labels.reshape(gray.shape) + 1
+    labels[gray == values[min(1, len(values) - 1)]] = 0
+    return torch.from_numpy(labels)
 
 
 class Clevr567Scenes(Dataset):
@@ -78,7 +87,8 @@ class Clevr567Scenes(Dataset):
         images: (V,3,H,W) float32 in [0,1]
         cam2world: (V,4,4) float32
         depths: (V,H,W) float32 or None when no depth files exist
-        masks: (V,H,W) int64 or None when no mask files exist
+        masks: (V,H,W) int64, 0 = background; only when load_masks and every
+            view has a *_mask.png
     """
 
     def __init__(

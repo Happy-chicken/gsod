@@ -3,7 +3,7 @@
 
 Examples:
     python train.py --dataset primordia
-    python train.py --dataset clevr567 --data clevr_567_train
+    python train.py --dataset clevr567          # data/clevr/clevr_567_train
 
 The training loop lives here because train.py is the only training entry
 point. Model code stays training-loop-agnostic.
