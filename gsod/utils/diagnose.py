@@ -20,11 +20,11 @@ pass before training starts.
 
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
-                      key scores; headed rows for view 0 (input, render,
-                      masks, background-only render, F), view 1 (novel view),
-                      slot attention, and rendered slot weights of views 0
-                      and 1, each slot tile with its mask colour and share of
-                      the image (bg = background). Needs Pillow.
+                      key scores; one block per view: view 0 (images, masks
+                      and F; slot attention; rendered slot weights), then
+                      view 1 (images and masks; rendered slot weights). Each
+                      slot tile has its mask colour and share of the image
+                      (bg = background). Needs Pillow.
     summary.json      per-scene and mean statistics plus verdicts
 """
 
@@ -102,7 +102,6 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
-        "bg_view0": np_(result["bg_rgb"][0]),
         "fg_target": np_(fg_target),
     }
 
@@ -281,18 +280,18 @@ def _gray(hw: np.ndarray) -> np.ndarray:
 
 
 _TEXT = {
-    "row_view0": "View 0 - the encoded input view (masks: argmax slot per pixel)",
-    "row_view1": "View 1 - a novel view, never seen by the encoder (tests the 3D)",
-    "row_attn": "Slot attention, view 0 - share of each token given to the slot "
+    "view0": "View 0 - the encoded input view",
+    "view1": "View 1 - a novel view, never seen by the encoder (tests the 3D)",
+    "row_images": "images (masks: argmax slot per pixel)",
+    "row_attn": "slot attention - share of each token given to the slot "
     "(white = 1; % = share of the image)",
-    "row_alpha": "Rendered slot weight, view {v} - share of each pixel drawn by "
-    "the slot's Gaussians (bg includes uncovered pixels; % = share of the image)",
+    "row_alpha": "rendered slot weight - share of each pixel drawn by the slot's "
+    "Gaussians (bg includes uncovered pixels; % = share of the image)",
     "image": "input image",
     "render": "render",
     "gt": "GT mask",
     "mask": "render mask",
     "attn_mask": "attention mask",
-    "bg_only": "bg-only render",
     "fg_target": "F: differs from bg",
     "slot": "{slot} {share:.0%}",
 }
@@ -332,14 +331,13 @@ def make_grid(
     title: str | None = None,
     min_tile: int = 128,
 ) -> np.ndarray:
-    """Diagnostic sheet: one headed row per topic, a caption under every tile.
+    """Diagnostic sheet: one block per view, a caption under every tile.
 
-    View 0     input image, render, GT mask, render mask, attention mask,
-               background-only render, foreground target F of the losses.
-    View 1     input image, render, GT mask, render mask (novel view).
-    Attention  slot attention of view 0 per slot (bg = background query).
-    Weight v0  rendered weight per slot, view 0.
-    Weight v1  rendered weight per slot, view 1.
+    View 0  images: input, render, GT mask, render mask, attention mask, F
+            slot attention per slot (bg = background query)
+            rendered weight per slot
+    View 1  images: input, render, GT mask, render mask (novel view)
+            rendered weight per slot
     Slot captions carry the slot's mask colour and its share of the image,
     so empty slots read 0%. Captions are English.
     """
@@ -357,7 +355,7 @@ def make_grid(
     cap_h = font.size + 8 if hasattr(font, "size") else 16
     head_h = cap_h
 
-    def view_tiles(v: int) -> list:
+    def image_tiles(v: int) -> list:
         return [
             (_rgb(rec["target"][v]), _txt("image"), None),
             (_rgb(rec["rgb"][v]), _txt("render"), None),
@@ -371,28 +369,43 @@ def make_grid(
             for k, m in enumerate(maps)
         ]
 
-    # (heading, [(image, caption, slot index for the colour swatch or None)])
-    rows = [
+    # Blocks of (view heading, [(row heading, [(image, caption, slot or None)])]).
+    blocks = [
         (
-            _txt("row_view0"),
-            view_tiles(0)
-            + [
-                (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
-                (_rgb(rec["bg_view0"]), _txt("bg_only"), None),
-                (_gray(rec["fg_target"]), _txt("fg_target"), None),
+            _txt("view0"),
+            [
+                (
+                    _txt("row_images"),
+                    image_tiles(0)
+                    + [
+                        (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
+                        (_gray(rec["fg_target"]), _txt("fg_target"), None),
+                    ],
+                ),
+                (_txt("row_attn"), slot_tiles(rec["attn"])),
+                (_txt("row_alpha"), slot_tiles(rec["alpha"][0])),
             ],
         )
     ]
     if n_views > 1:
-        rows.append((_txt("row_view1"), view_tiles(1)))
-    rows.append((_txt("row_attn"), slot_tiles(rec["attn"])))
-    for v in range(min(n_views, 2)):
-        rows.append((_txt("row_alpha", v=v), slot_tiles(rec["alpha"][v])))
+        blocks.append(
+            (
+                _txt("view1"),
+                [
+                    (_txt("row_images"), image_tiles(1)),
+                    (_txt("row_alpha"), slot_tiles(rec["alpha"][1])),
+                ],
+            )
+        )
 
-    n_cols = max(len(r) for _, r in rows)
+    n_cols = max(len(row) for _, rows in blocks for _, row in rows)
     block_h = tile_h + cap_h
     top = head_h if title else 0
-    height = top + sum(head_h + block_h + pad for _ in rows) + pad
+    height = (
+        top
+        + sum(head_h + pad + len(rows) * (head_h + block_h + pad) for _, rows in blocks)
+        + pad
+    )
     width = n_cols * (tile_w + pad) + pad
     sheet = Image.new("RGB", (width, height), (255, 255, 255))
     draw = ImageDraw.Draw(sheet)
@@ -407,33 +420,40 @@ def make_grid(
     if title:
         draw.text((pad, 4), fit(title, width - 2 * pad), fill=(0, 0, 0), font=font)
     y = top + pad
-    for heading, row in rows:
-        draw.text((pad, y), fit(heading, width - 2 * pad), fill=(90, 90, 90), font=font)
-        y += head_h
-        for c, (img, caption, slot) in enumerate(row):
-            x = pad + c * (tile_w + pad)
-            tile = Image.fromarray(img).resize((tile_w, tile_h), Image.NEAREST)
-            sheet.paste(tile, (x, y))
-            # Thin frame so white tiles stay visible on the white sheet.
-            draw.rectangle(
-                [x - 1, y - 1, x + tile_w, y + tile_h], outline=(170, 170, 170)
-            )
-            text_x = x
-            if slot is not None:
-                sw = cap_h - 10
-                draw.rectangle(
-                    [x, y + tile_h + 5, x + sw, y + tile_h + 5 + sw],
-                    fill=tuple(int(c_) for c_ in _slot_color(slot)),
-                    outline=(0, 0, 0),
-                )
-                text_x = x + sw + 4
+    for view_heading, rows in blocks:
+        # View heading on a light band, so the two views read as blocks.
+        draw.rectangle([0, y, width, y + head_h - 2], fill=(230, 230, 236))
+        draw.text((pad, y + 2), fit(view_heading, width - 2 * pad), fill=(0, 0, 0), font=font)
+        y += head_h + pad
+        for heading, row in rows:
             draw.text(
-                (text_x, y + tile_h + 3),
-                fit(caption, tile_w - (text_x - x)),
-                fill=(0, 0, 0),
-                font=font,
+                (pad, y), fit(heading, width - 2 * pad), fill=(90, 90, 90), font=font
             )
-        y += block_h + pad
+            y += head_h
+            for c, (img, caption, slot) in enumerate(row):
+                x = pad + c * (tile_w + pad)
+                tile = Image.fromarray(img).resize((tile_w, tile_h), Image.NEAREST)
+                sheet.paste(tile, (x, y))
+                # Thin frame so white tiles stay visible on the white sheet.
+                draw.rectangle(
+                    [x - 1, y - 1, x + tile_w, y + tile_h], outline=(170, 170, 170)
+                )
+                text_x = x
+                if slot is not None:
+                    sw = cap_h - 10
+                    draw.rectangle(
+                        [x, y + tile_h + 5, x + sw, y + tile_h + 5 + sw],
+                        fill=tuple(int(c_) for c_ in _slot_color(slot)),
+                        outline=(0, 0, 0),
+                    )
+                    text_x = x + sw + 4
+                draw.text(
+                    (text_x, y + tile_h + 3),
+                    fit(caption, tile_w - (text_x - x)),
+                    fill=(0, 0, 0),
+                    font=font,
+                )
+            y += block_h + pad
     return np.asarray(sheet)
 
 
