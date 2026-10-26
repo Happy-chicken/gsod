@@ -96,18 +96,19 @@ def yaw_to_world(
     }
 
 
-def attention_anchors(
+def attention_rays(
     attn_obj: torch.Tensor,
     cam2world0: torch.Tensor,
     image_size: tuple[int, int],
     focal_ratio: tuple[float, float],
-    height: float,
-) -> torch.Tensor:
-    """Back-project each object slot's attention centroid onto z = height.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ray of view 0 through each object slot's attention centroid.
 
     attn_obj: (K-1, s*s) object rows of the view-0 slot attention.
-    Returns (K-1, 3) points in the view-0 azimuth frame, differentiable in
-    attn_obj.
+    Returns (origin (3,), directions (K-1, 3)) in the view-0 azimuth frame,
+    differentiable in attn_obj. The azimuth frame is a rotation about +z, so
+    heights are world heights; SlotFrame intersects each ray with the height
+    it predicts for that slot.
     """
     side = int(round(attn_obj.shape[1] ** 0.5))
     h, w = image_size
@@ -127,14 +128,11 @@ def attention_anchors(
         [(u_bar - cx) / fx, (v_bar - cy) / fy, torch.ones_like(u_bar)], -1
     )
     c2w = cam2world0.to(attn_obj.dtype)
-    d = d_cam @ c2w[:3, :3].T
-    origin = c2w[:3, 3]
-    # Rays at or above the horizon never reach the plane; keep them finite
-    # (the frame's xy bound then clamps the result).
-    dz = d[:, 2].clamp(max=-1e-2)
-    t = ((height - origin[2]) / dz).clamp(min=0.0)
-    points = origin + t[:, None] * d
-    return points @ _yaw_matrix(-view_yaw(cam2world0)).to(attn_obj.dtype).T
+    to_azimuth = _yaw_matrix(-view_yaw(cam2world0)).to(attn_obj.dtype)
+    # World ray o + t * R d_cam, rotated into the azimuth frame.
+    origin = to_azimuth @ c2w[:3, 3]
+    directions = d_cam @ (to_azimuth @ c2w[:3, :3]).T
+    return origin, directions
 
 
 class GSODModel(nn.Module):
@@ -173,7 +171,7 @@ class GSODModel(nn.Module):
         self.near = near
         self.canonical_azimuth = bool(canonical_azimuth)
         # Object frame centres follow the slot-attention centroids
-        # (requires canonical_azimuth, as the anchors are in that frame).
+        # (requires canonical_azimuth, as the rays are in that frame).
         self.anchor_frames = bool(anchor_frames) and self.canonical_azimuth
 
         self.encoder = Encoder(3, z_dim=z_dim)
@@ -232,12 +230,8 @@ class GSODModel(nn.Module):
         # Object Gaussians (view-0 azimuth frame), with attention-anchored frames.
         frame = getattr(getattr(self.decoder, "head", None), "frame", None)
         if frame is not None and self.anchor_frames:
-            frame.anchor = attention_anchors(
-                attn[1:],
-                cam2world[0],
-                self.image_size,
-                self.focal_ratio,
-                frame.anchor_height,
+            frame.ray = attention_rays(
+                attn[1:], cam2world[0], self.image_size, self.focal_ratio
             )
         frame_centre = None
         try:
@@ -247,7 +241,7 @@ class GSODModel(nn.Module):
                     frame_centre = frame(obj_slots)[0]
         finally:
             if frame is not None:
-                frame.anchor = None
+                frame.ray = None
         if self.canonical_azimuth:
             obj_gaussians = yaw_to_world(obj_gaussians, view_yaw(cam2world[0]))
 

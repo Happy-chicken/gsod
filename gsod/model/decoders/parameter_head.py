@@ -69,9 +69,13 @@ def _logit(p: float) -> float:
 class SlotFrame(nn.Module):
     """object-slot latent -> (centre, extent), bounded by dataset priors.
 
-    centre xy in [-fg_xy, fg_xy], centre z in [fg_z[0], fg_z[1]],
-    extent in [fg_extent[0], fg_extent[1]], initialised at fg_extent_init.
-    Gaussian centres: centre + extent * tanh(offset).
+    centre z in [fg_z[0], fg_z[1]] is predicted first. With a ray per slot
+    (``self.ray``, set by GSODModel from the attention centroid), centre xy is
+    where that ray reaches height z, plus a learned residual of at most
+    anchor_residual; so the centre stays on the line of sight of what the slot
+    attends to, whatever height is predicted. centre xy is softly bounded to
+    [-fg_xy, fg_xy]. extent in [fg_extent[0], fg_extent[1]], initialised at
+    fg_extent_init. Gaussian centres: centre + extent * tanh(offset).
 
     Defaults match ``SceneGenConfig`` defaults; use ``from_scene_config`` to
     derive them from a dataset's meta.json.
@@ -86,18 +90,16 @@ class SlotFrame(nn.Module):
         fg_z: tuple[float, float] = (0.0, 0.8),
         fg_extent: tuple[float, float] = (0.1, 0.75),
         fg_extent_init: float = 0.5,
-        anchor_height: float = 0.45,
         anchor_residual: float = 0.5,
     ):
         super().__init__()
-        # Height of the plane the attention centroid ray is intersected with
-        # (typical object-centre height), and how far the learned residual may
-        # move a frame centre away from its anchor in xy.
-        self.anchor_height = float(anchor_height)
+        # How far the learned residual may move a frame centre in xy away
+        # from the point where the slot's ray reaches the predicted height.
         self.anchor_residual = float(anchor_residual)
-        # Set by GSODModel for the current forward pass: (K, 3) points in the
-        # view-0 azimuth frame, or None to fall back to free centres.
-        self.anchor: torch.Tensor | None = None
+        # Set by GSODModel for the current forward pass: rays through the
+        # attention centroids in the view-0 azimuth frame, (origin (3,),
+        # directions (K, 3)); None falls back to free centres.
+        self.ray: tuple[torch.Tensor, torch.Tensor] | None = None
         self.fg_xy = float(fg_xy)
         self.fg_z = (float(fg_z[0]), float(fg_z[1]))
         self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
@@ -115,7 +117,7 @@ class SlotFrame(nn.Module):
     @classmethod
     def from_scene_config(cls, z_dim: int, gen: dict, **kwargs) -> "SlotFrame":
         """Priors from a SceneGenConfig dict (meta.json["config"])."""
-        r_min, r_max = (float(x) for x in gen["radius_range"])
+        r_max = float(gen["radius_range"][1])
         place = float(gen["placement_radius"])
         floor_z = float(gen.get("floor_z", 0.0))
         return cls(
@@ -125,25 +127,29 @@ class SlotFrame(nn.Module):
             # tanh rarely reaches 1, so the extent must exceed the half size.
             fg_extent=(0.1, 1.35 * r_max),
             fg_extent_init=min(0.5, 1.2 * r_max),
-            # Objects rest on z = floor_z (drawn or not).
-            anchor_height=floor_z + 0.5 * (r_min + r_max),
             **kwargs,
         )
 
     def forward(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """slots: (K, C) object slots -> centre (K, 3), extent (K, 3)."""
         out = self.fg(slots)
-        if self.anchor is not None:
-            # Centre = attention centroid on the ground-parallel plane + a
-            # bounded learned residual. Slots attending to different objects
-            # get different frames, and the rendering loss reaches the
-            # attention maps through the centroid.
-            xy = self.anchor[:, 0:2] + self.anchor_residual * torch.tanh(out[:, 0:2])
+        z_lo, z_hi = self.fg_z
+        z = z_lo + (z_hi - z_lo) * torch.sigmoid(out[:, 2:3])
+        if self.ray is not None:
+            # Centre = where the attention-centroid ray reaches height z, plus
+            # a bounded residual. Slots attending to different objects get
+            # different frames; the rendering loss reaches the attention maps
+            # through the ray and the predicted height through t.
+            origin, direction = self.ray
+            # Rays at or above the horizon never come down to z; keep them
+            # finite (the xy bound below then clamps the result).
+            dz = direction[:, 2:3].clamp(max=-1e-2)
+            t = ((z - origin[2]) / dz).clamp(min=0.0)
+            xy = origin[0:2] + t * direction[:, 0:2]
+            xy = xy + self.anchor_residual * torch.tanh(out[:, 0:2])
         else:
             xy = out[:, 0:2]
         xy = self.fg_xy * torch.tanh(xy / self.fg_xy)
-        z_lo, z_hi = self.fg_z
-        z = z_lo + (z_hi - z_lo) * torch.sigmoid(out[:, 2:3])
         e_lo, e_hi = self.fg_extent
         extent = e_lo + (e_hi - e_lo) * torch.sigmoid(out[:, 3:6])
         return torch.cat([xy, z], dim=-1), extent
