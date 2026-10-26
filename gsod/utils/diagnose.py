@@ -280,13 +280,11 @@ def _gray(hw: np.ndarray) -> np.ndarray:
 
 
 _TEXT = {
-    "view0": "View 0 - the encoded input view",
-    "view1": "View 1 - a novel view, never seen by the encoder (tests the 3D)",
+    "view0": "View 0",
+    "view1": "View 1",
     "row_images": "images (masks: argmax slot per pixel)",
-    "row_attn": "slot attention - share of each token given to the slot "
-    "(white = 1; % = share of the image)",
-    "row_alpha": "rendered slot weight - share of each pixel drawn by the slot's "
-    "Gaussians (bg includes uncovered pixels; % = share of the image)",
+    "row_attn": "slot attention",
+    "row_alpha": "rendered slot weight",
     "image": "input image",
     "render": "render",
     "gt": "GT mask",
@@ -338,8 +336,13 @@ def make_grid(
             rendered weight per slot
     View 1  images: input, render, GT mask, render mask (novel view)
             rendered weight per slot
-    Slot captions carry the slot's mask colour and its share of the image,
-    so empty slots read 0%. Captions are English.
+    View 0 is the encoded input; view 1 is a novel view the encoder never
+    sees, so it tests the 3D. Slot attention: share of each token given to
+    the slot. Rendered slot weight: share of each pixel drawn by the slot's
+    Gaussians (bg includes uncovered pixels). Grey tiles: white = 1 (all of
+    the token / pixel), black = 0. Slot captions carry the slot's mask colour
+    and its share of the image (the tile mean), so empty slots read 0%.
+    Captions are English.
     """
     from PIL import Image, ImageDraw
 
