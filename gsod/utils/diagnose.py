@@ -20,12 +20,11 @@ pass before training starts.
 
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
-                      key scores; row 1 images and masks of views 0/1 plus the
-                      background-only render and foreground target F of
-                      view 0; then slot
-                      attention, view-0 alpha and view-1 alpha per slot, each
-                      caption with the slot's mask colour (slot 0 = background).
-                      Needs Pillow.
+                      key scores; headed rows for view 0 (input, render,
+                      masks, background-only render, F), view 1 (novel view),
+                      slot attention, and rendered slot weights of views 0
+                      and 1, each slot tile with its mask colour and share of
+                      the image (bg = background). Needs Pillow.
     summary.json      per-scene and mean statistics plus verdicts
 """
 
@@ -282,17 +281,20 @@ def _gray(hw: np.ndarray) -> np.ndarray:
 
 
 _TEXT = {
-    "target": "target v{v}",
-    "render": "render v{v}",
-    "gt": "GT mask v{v}",
-    "mask": "render mask v{v}",
-    "attn_mask": "attn mask v0",
-    "bg_only": "bg-only render v0",
-    "fg_target": "fg target F v0",
-    "attn": "attn {slot}",
-    "alpha": "alpha v{v} {slot}",
-    "row_attn": "slot attention (view 0, white = 1)",
-    "row_alpha": "rendered slot alpha, view {v} (white = 1)",
+    "row_view0": "View 0 - the encoded input view (masks: argmax slot per pixel)",
+    "row_view1": "View 1 - a novel view, never seen by the encoder (tests the 3D)",
+    "row_attn": "Slot attention, view 0 - share of each token given to the slot "
+    "(white = 1; % = share of the image)",
+    "row_alpha": "Rendered slot weight, view {v} - share of each pixel drawn by "
+    "the slot's Gaussians (bg includes uncovered pixels; % = share of the image)",
+    "image": "input image",
+    "render": "render",
+    "gt": "GT mask",
+    "mask": "render mask",
+    "attn_mask": "attention mask",
+    "bg_only": "bg-only render",
+    "fg_target": "F: differs from bg",
+    "slot": "{slot} {share:.0%}",
 }
 _FONTS = (
     "DejaVuSans.ttf",
@@ -330,15 +332,16 @@ def make_grid(
     title: str | None = None,
     min_tile: int = 128,
 ) -> np.ndarray:
-    """Diagnostic sheet with a caption under every tile.
+    """Diagnostic sheet: one headed row per topic, a caption under every tile.
 
-    Row 1  view 0: target, render, GT mask, render mask, attention mask;
-           view 1: target, render, render mask; then the background-only render
-           of view 0 and the foreground target F used by the losses.
-    Row 2  slot attention per slot (slot 0 = background query).
-    Row 3  rendered alpha per slot, view 0.
-    Row 4  rendered alpha per slot, view 1.
-    Slot captions carry the slot's colour from the mask tiles. Captions are English.
+    View 0     input image, render, GT mask, render mask, attention mask,
+               background-only render, foreground target F of the losses.
+    View 1     input image, render, GT mask, render mask (novel view).
+    Attention  slot attention of view 0 per slot (bg = background query).
+    Weight v0  rendered weight per slot, view 0.
+    Weight v1  rendered weight per slot, view 1.
+    Slot captions carry the slot's mask colour and its share of the image,
+    so empty slots read 0%. Captions are English.
     """
     from PIL import Image, ImageDraw
 
@@ -346,6 +349,7 @@ def make_grid(
     size = rec["mask_idx"].shape[1:]
     blank = np.zeros(size + (3,), dtype=np.uint8)
     attn_up = np.stack([upsample_labels(a, size) for a in rec["attn"]])
+    gt = rec["gt"]
 
     scale = max(1, min_tile // max(size))
     tile_h, tile_w = size[0] * scale, size[1] * scale
@@ -353,57 +357,42 @@ def make_grid(
     cap_h = font.size + 8 if hasattr(font, "size") else 16
     head_h = cap_h
 
-    # (image, caption, slot index for the colour swatch or None)
-    row0 = [
-        (_rgb(rec["target"][0]), _txt("target", v=0), None),
-        (_rgb(rec["rgb"][0]), _txt("render", v=0), None),
-        (
-            _colorize(rec["gt"][0]) if rec["gt"] is not None else blank,
-            _txt("gt", v=0),
-            None,
-        ),
-        (_colorize(rec["mask_idx"][0]), _txt("mask", v=0), None),
-        (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
-    ]
-    if n_views > 1:
-        row0 += [
-            (_rgb(rec["target"][1]), _txt("target", v=1), None),
-            (_rgb(rec["rgb"][1]), _txt("render", v=1), None),
-            (_colorize(rec["mask_idx"][1]), _txt("mask", v=1), None),
+    def view_tiles(v: int) -> list:
+        return [
+            (_rgb(rec["target"][v]), _txt("image"), None),
+            (_rgb(rec["rgb"][v]), _txt("render"), None),
+            (_colorize(gt[v]) if gt is not None else blank, _txt("gt"), None),
+            (_colorize(rec["mask_idx"][v]), _txt("mask"), None),
         ]
-    row0 += [
-        (_rgb(rec["bg_view0"]), _txt("bg_only"), None),
-        (_gray(rec["fg_target"]), _txt("fg_target"), None),
-    ]
-    rows = [(None, row0)]
-    rows.append(
+
+    def slot_tiles(maps: np.ndarray) -> list:
+        return [
+            (_gray(m), _txt("slot", slot=_slot_name(k), share=float(m.mean())), k)
+            for k, m in enumerate(maps)
+        ]
+
+    # (heading, [(image, caption, slot index for the colour swatch or None)])
+    rows = [
         (
-            _txt("row_attn"),
-            [
-                (_gray(a), _txt("attn", slot=_slot_name(k)), k)
-                for k, a in enumerate(attn_up)
+            _txt("row_view0"),
+            view_tiles(0)
+            + [
+                (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
+                (_rgb(rec["bg_view0"]), _txt("bg_only"), None),
+                (_gray(rec["fg_target"]), _txt("fg_target"), None),
             ],
         )
-    )
+    ]
+    if n_views > 1:
+        rows.append((_txt("row_view1"), view_tiles(1)))
+    rows.append((_txt("row_attn"), slot_tiles(rec["attn"])))
     for v in range(min(n_views, 2)):
-        rows.append(
-            (
-                _txt("row_alpha", v=v),
-                [
-                    (_gray(a), _txt("alpha", v=v, slot=_slot_name(k)), k)
-                    for k, a in enumerate(rec["alpha"][v])
-                ],
-            )
-        )
+        rows.append((_txt("row_alpha", v=v), slot_tiles(rec["alpha"][v])))
 
     n_cols = max(len(r) for _, r in rows)
     block_h = tile_h + cap_h
     top = head_h if title else 0
-    height = (
-        top
-        + sum((head_h if heading else 0) + block_h + pad for heading, _ in rows)
-        + pad
-    )
+    height = top + sum(head_h + block_h + pad for _ in rows) + pad
     width = n_cols * (tile_w + pad) + pad
     sheet = Image.new("RGB", (width, height), (255, 255, 255))
     draw = ImageDraw.Draw(sheet)
@@ -419,11 +408,8 @@ def make_grid(
         draw.text((pad, 4), fit(title, width - 2 * pad), fill=(0, 0, 0), font=font)
     y = top + pad
     for heading, row in rows:
-        if heading:
-            draw.text(
-                (pad, y), fit(heading, width - 2 * pad), fill=(90, 90, 90), font=font
-            )
-            y += head_h
+        draw.text((pad, y), fit(heading, width - 2 * pad), fill=(90, 90, 90), font=font)
+        y += head_h
         for c, (img, caption, slot) in enumerate(row):
             x = pad + c * (tile_w + pad)
             tile = Image.fromarray(img).resize((tile_w, tile_h), Image.NEAREST)
@@ -466,17 +452,17 @@ def summarize(per_scene: list[dict]) -> dict:
 
 
 def _title(stats: dict) -> str:
-    parts = [f"scene {stats['scene']:04d}"]
-    for key, name in (
-        ("attn_fg_ari", "attn FG-ARI"),
-        ("render_fg_ari_view0", "render FG-ARI v0"),
-        ("attn_dominance", "attn dom"),
-        ("render_dominance", "render dom"),
-    ):
-        value = stats.get(key)
-        if value is not None and not np.isnan(value):
-            parts.append(f"{name} {value:.2f}")
-    return " | ".join(parts)
+    def fmt(value) -> str:
+        return "-" if value is None or np.isnan(value) else f"{value:.2f}"
+
+    g = stats.get
+    return (
+        f"scene {stats['scene']:04d} | FG-ARI: attention {fmt(g('attn_fg_ari'))}, "
+        f"render v0 {fmt(g('render_fg_ari_view0'))}, "
+        f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
+        f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
+        f"bg on objects {fmt(stats['per_slot'][0]['bg_on_objects'])}"
+    )
 
 
 def diagnose(
