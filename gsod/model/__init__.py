@@ -14,7 +14,6 @@ from __future__ import annotations
 from torch import nn
 
 from gsod.configs import BaseConfig
-from gsod.model.aux_decoder import SpatialBroadcastDecoder
 from gsod.model.decoders import (
     AttentionDecoder,
     SharedMLPDecoder,
@@ -56,7 +55,6 @@ def build_model(
         # and uses the profile's scene_prior instead.
         scene_config=meta.get("config", cfg.scene_prior),
         decoder_cls=decoder_cls,
-        aux2d_size=cfg.aux2d_size,
     )
 
 
@@ -69,7 +67,6 @@ __all__ = [
     "GaussianParameterHead",
     "SlotFrame",
     "GSODModel",
-    "SpatialBroadcastDecoder",
     "build_model",
     "save_networks",
     "load_networks",
