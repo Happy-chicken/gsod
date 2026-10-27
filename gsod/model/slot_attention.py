@@ -106,16 +106,24 @@ class SlotAttention(nn.Module):
         grid = torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1)
         return grid.reshape(1, n_tokens, 4)
 
+    def project_inputs(
+        self, feat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """BxNxC tokens -> (keys, values), each BxNxD.
+
+        The keys are the space the attention compares slots in: a token can
+        only be told apart from another if their keys differ.
+        """
+        feat = feat + self.pos_proj(self._grid(feat.shape[1], feat.device))
+        feat = self.norm_feat(self.feat_mlp(feat))
+        return self.to_k(feat), self.to_v(feat)
+
     def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
         slots_init = self.slot_queries.expand(b, -1, -1)
         slots = slots_init
 
-        feat = feat + self.pos_proj(self._grid(feat.shape[1], feat.device))
-        feat = self.feat_mlp(feat)
-        feat = self.norm_feat(feat)
-        k = self.to_k(feat)
-        v = self.to_v(feat)
+        k, v = self.project_inputs(feat)
         dots_bg = torch.einsum("bid,bjd->bij", self.bg_query.expand(b, -1, -1), k) * self.scale
 
         attn = None

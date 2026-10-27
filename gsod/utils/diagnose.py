@@ -9,6 +9,10 @@ Answers, per scene and on average:
                        or do several slots redundantly draw the same object
                        (render dominance, attn/render ARI)?
 4. Frames           -- are foreground frame centres distinct?
+5. Features         -- can the encoder features / attention keys separate the
+                       objects at all (k-means FG-ARI)? High while the
+                       attention FG-ARI is low: the slot competition fails;
+                       both low: the features do not tell the objects apart.
 
 Usage (from your own test script, after loading a checkpoint):
 
@@ -81,6 +85,9 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         result = model(images, cams)
         # Foreground target F of view 0, as the losses compute it.
         fg_target = background_residual_target(result, images)[0]
+        # View-0 tokens: encoder output and the keys slot attention compares.
+        tokens = model.encode(images)
+        keys, _ = model.slot_attention.project_inputs(tokens)
 
     def np_(x):
         return None if x is None else x.detach().float().cpu().numpy()
@@ -103,6 +110,8 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
         "fg_target": np_(fg_target),
+        "feat_enc": np_(tokens[0]),  # (s*s, C) encoder features, view 0
+        "feat_key": np_(keys[0]),  # (s*s, D) attention keys, view 0
     }
 
 
@@ -123,6 +132,55 @@ def _dominance(weights: np.ndarray, pixels: np.ndarray) -> float:
     if not keep.any():
         return float("nan")
     return float((w[:, keep].max(0) / total[keep]).mean())
+
+
+def _token_labels(rec: dict) -> np.ndarray | None:
+    """GT labels of view 0 at token resolution (s, s), or None without GT."""
+    if rec["gt"] is None:
+        return None
+    side = rec["attn"].shape[-1]
+    return upsample_labels(rec["gt"][0], (side, side))  # nearest
+
+
+def _kmeans(x: np.ndarray, k: int, seed: int = 0, n_init: int = 10) -> np.ndarray:
+    """k-means++ / Lloyd on rows of x; labels of the lowest-inertia run."""
+    rng = np.random.default_rng(seed)
+    best, best_inertia = np.zeros(len(x), dtype=np.int64), np.inf
+    for _ in range(n_init):
+        centres = x[rng.integers(len(x))][None]
+        for _ in range(1, k):
+            d2 = ((x[:, None] - centres[None]) ** 2).sum(-1).min(1)
+            p = d2 / d2.sum() if d2.sum() > 0 else None
+            centres = np.vstack([centres, x[rng.choice(len(x), p=p)]])
+        for _ in range(100):
+            labels = ((x[:, None] - centres[None]) ** 2).sum(-1).argmin(1)
+            new = np.stack(
+                [x[labels == j].mean(0) if (labels == j).any() else centres[j] for j in range(k)]
+            )
+            if np.allclose(new, centres):
+                break
+            centres = new
+        inertia = float(((x - centres[labels]) ** 2).sum())
+        if inertia < best_inertia:
+            best, best_inertia = labels, inertia
+    return best
+
+
+def feature_fg_ari(feat: np.ndarray, labels: np.ndarray) -> float:
+    """FG-ARI of k-means on the object tokens' (L2-normalised) features.
+
+    feat: (s*s, C); labels: (s, s) GT at token resolution. k is the number of
+    visible GT objects, so this is an upper bound on what any grouping of
+    these features can reach; nan without at least two object tokens.
+    """
+    obj = labels.ravel() > 0
+    if obj.sum() < 2:
+        return float("nan")
+    x = feat[obj]
+    x = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-8)
+    gt = labels.ravel()[obj]
+    pred = _kmeans(x, len(np.unique(gt)))
+    return ari(gt, pred)
 
 
 def analyse(rec: dict) -> dict:
@@ -186,6 +244,9 @@ def analyse(rec: dict) -> dict:
     }
     if gt is not None:
         out["attn_fg_ari"] = fg_ari(gt[0], attn_lab)
+        tok = _token_labels(rec)
+        out["feat_enc_fg_ari"] = feature_fg_ari(rec["feat_enc"], tok)
+        out["feat_key_fg_ari"] = feature_fg_ari(rec["feat_key"], tok)
         out["render_fg_ari_view0"] = fg_ari(gt[0], rec["mask_idx"][0])
         novel = [fg_ari(gt[v], rec["mask_idx"][v]) for v in range(1, gt.shape[0])]
         novel = [x for x in novel if not np.isnan(x)]
@@ -252,6 +313,19 @@ def verdicts(mean: dict) -> list[str]:
             "[3D] view 0 is segmented but novel views are not; objects are flat or "
             "at the wrong depth. Check multi-view loss weighting and cameras."
         )
+    feat, attn = g("feat_key_fg_ari"), g("attn_fg_ari")
+    if feat - attn > 0.1:
+        msgs.append(
+            f"[slot attention] the attention keys separate the objects (k-means "
+            f"FG-ARI {feat:.2f}) better than the attention does ({attn:.2f}): "
+            "the slot competition fails, not the encoder."
+        )
+    elif feat < ARI_GOOD and attn < ARI_GOOD:
+        msgs.append(
+            f"[encoder] neither the attention keys (k-means FG-ARI {feat:.2f}) nor "
+            f"the attention ({attn:.2f}) separate the objects: the features do "
+            "not tell them apart; improve the encoder."
+        )
     if not msgs:
         msgs.append("no failure pattern matched")
     return msgs
@@ -274,6 +348,34 @@ def _rgb(chw: np.ndarray) -> np.ndarray:
     return (np.clip(chw.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
+def _pca_rgb(feat: np.ndarray, rec: dict, size: tuple[int, int]) -> np.ndarray:
+    """First 3 principal components of view-0 token features as RGB.
+
+    PCA is fitted on object tokens only (GT, else F > 0.5), otherwise the
+    background, ~80% of the tokens, takes the main components; each component
+    is stretched over its 1-99% range on those tokens; background is dimmed.
+    """
+    side = rec["attn"].shape[-1]
+    labels = _token_labels(rec)
+    obj = (
+        labels > 0
+        if labels is not None
+        else upsample_labels(rec["fg_target"], (side, side)) > 0.5
+    ).ravel()
+    if obj.sum() < 3:
+        obj = np.ones_like(obj)
+    x = feat - feat[obj].mean(0)
+    _, _, vt = np.linalg.svd(x[obj], full_matrices=False)
+    proj = x @ vt[:3].T
+    lo, hi = np.percentile(proj[obj], [1, 99], axis=0)
+    rgb = np.clip((proj - lo) / np.maximum(hi - lo, 1e-8), 0.0, 1.0)
+    rgb[~obj] *= 0.25
+    rgb = rgb.reshape(side, side, 3)
+    rows = (np.arange(size[0]) * side) // size[0]
+    cols = (np.arange(size[1]) * side) // size[1]
+    return (rgb[rows[:, None], cols[None, :]] * 255 + 0.5).astype(np.uint8)
+
+
 def _gray(hw: np.ndarray) -> np.ndarray:
     g = (np.clip(hw, 0, 1) * 255 + 0.5).astype(np.uint8)
     return np.repeat(g[..., None], 3, axis=-1)
@@ -291,6 +393,8 @@ _TEXT = {
     "mask": "render mask",
     "attn_mask": "attention mask",
     "fg_target": "F: differs from bg",
+    "pca_enc": "features (PCA)",
+    "pca_key": "keys (PCA)",
     "slot": "{slot} {share:.0%}",
 }
 _FONTS = (
@@ -331,7 +435,8 @@ def make_grid(
 ) -> np.ndarray:
     """Diagnostic sheet: one block per view, a caption under every tile.
 
-    View 0  images: input, render, GT mask, render mask, attention mask, F
+    View 0  images: input, render, GT mask, render mask, attention mask, F,
+            PCA of the encoder features and of the attention keys
             slot attention per slot (bg = background query)
             rendered weight per slot
     View 1  images: input, render, GT mask, render mask (novel view)
@@ -383,6 +488,8 @@ def make_grid(
                     + [
                         (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
                         (_gray(rec["fg_target"]), _txt("fg_target"), None),
+                        (_pca_rgb(rec["feat_enc"], rec, size), _txt("pca_enc"), None),
+                        (_pca_rgb(rec["feat_key"], rec, size), _txt("pca_key"), None),
                     ],
                 ),
                 (_txt("row_attn"), slot_tiles(rec["attn"])),
@@ -484,7 +591,8 @@ def _title(stats: dict) -> str:
         f"render v0 {fmt(g('render_fg_ari_view0'))}, "
         f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
         f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
-        f"bg on objects {fmt(stats['per_slot'][0]['bg_on_objects'])}"
+        f"bg on objects {fmt(stats['per_slot'][0]['bg_on_objects'])} | "
+        f"keys k-means FG-ARI {fmt(g('feat_key_fg_ari'))}"
     )
 
 
@@ -522,6 +630,8 @@ def diagnose(
         "fg_slot_cos_mean",
         "attn_dominance",
         "render_dominance",
+        "feat_enc_fg_ari",
+        "feat_key_fg_ari",
         "attn_fg_ari",
         "render_fg_ari_view0",
         "render_fg_ari_novel",

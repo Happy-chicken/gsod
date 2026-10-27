@@ -213,17 +213,21 @@ class GSODModel(nn.Module):
             "Background": self.background,
         }
 
-    def forward(
-        self, images: torch.Tensor, cam2world: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
-        Only views[0] is encoded."""
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """images: (N,3,H,W) -> (1, s*s, C) encoder tokens of views[0], s = input_size."""
         feat = self.encoder(
             F.interpolate(
                 images[0:1], size=self.input_size, mode="bilinear", align_corners=False
             )
         )
-        tokens = feat.flatten(start_dim=2).permute(0, 2, 1)
+        return feat.flatten(start_dim=2).permute(0, 2, 1)
+
+    def forward(
+        self, images: torch.Tensor, cam2world: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
+        Only views[0] is encoded."""
+        tokens = self.encode(images)
         obj_slots, attn = self.slot_attention(tokens)
         obj_slots, attn = obj_slots.squeeze(0), attn.squeeze(0)  # (K-1, C), (K, N)
 
