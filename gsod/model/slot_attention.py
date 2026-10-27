@@ -46,7 +46,7 @@ from torch.nn import init
 
 
 class SlotAttention(nn.Module):
-    """BxNxC tokens -> (BxKxC object slots, Bx(1+K)xN attention)."""
+    """BxNxC tokens -> (BxKxC object slots, Bx(1+K)xN attention, Bx1xD background latent)."""
 
     def __init__(
         self,
@@ -147,4 +147,11 @@ class SlotAttention(nn.Module):
             ).reshape(b, -1, self.slot_dim)
             slots = slots + self.to_res(slots)
 
-        return slots, attn
+        # Background latent: values averaged under the final background row.
+        # Not a slot (it is never refined); only the 2D auxiliary decoder
+        # (fg_source = "attention") reads it.
+        attn_bg = attn[:, :1, :]
+        bg_slot = torch.einsum(
+            "bjd,bij->bid", v, attn_bg / attn_bg.sum(dim=-1, keepdim=True)
+        )
+        return slots, attn, bg_slot

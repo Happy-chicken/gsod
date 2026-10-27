@@ -83,10 +83,14 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
     with torch.no_grad(), torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         result = model(images, cams)
-        # Foreground target F of view 0, as the losses compute it.
-        fg_target = background_residual_target(result, images)[0]
+        # Foreground target of view 0, as the losses compute it: F, or with
+        # fg_source = "attention" the attention foreground.
+        if model.fg_from_attention:
+            fg_target = model.attention_foreground(images[:1], result["attn"])[0]
+        else:
+            fg_target = background_residual_target(result, images)[0]
         # View-0 tokens: encoder output and the keys slot attention compares.
-        tokens = model.encode(images)
+        tokens = model.encode(images[:1])
         keys, _ = model.slot_attention.project_inputs(tokens)
 
     def np_(x):
@@ -110,6 +114,8 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
         "fg_target": np_(fg_target),
+        # Caption key of the fg_target tile.
+        "fg_caption": "fg_attn" if model.fg_from_attention else "fg_target",
         "feat_enc": np_(tokens[0]),  # (s*s, C) encoder features, view 0
         "feat_key": np_(keys[0]),  # (s*s, D) attention keys, view 0
     }
@@ -393,6 +399,7 @@ _TEXT = {
     "mask": "render mask",
     "attn_mask": "attention mask",
     "fg_target": "F: differs from bg",
+    "fg_attn": "fg target: 1 - attn bg",
     "pca_enc": "features (PCA)",
     "pca_key": "keys (PCA)",
     "slot": "{slot} {share:.0%}",
@@ -435,7 +442,8 @@ def make_grid(
 ) -> np.ndarray:
     """Diagnostic sheet: one block per view, a caption under every tile.
 
-    View 0  images: input, render, GT mask, render mask, attention mask, F,
+    View 0  images: input, render, GT mask, render mask, attention mask, F
+            (fg_source = "attention": 1 - attention background row),
             PCA of the encoder features and of the attention keys
             slot attention per slot (bg = background query)
             rendered weight per slot
@@ -487,7 +495,7 @@ def make_grid(
                     image_tiles(0)
                     + [
                         (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
-                        (_gray(rec["fg_target"]), _txt("fg_target"), None),
+                        (_gray(rec["fg_target"]), _txt(rec["fg_caption"]), None),
                         (_pca_rgb(rec["feat_enc"], rec, size), _txt("pca_enc"), None),
                         (_pca_rgb(rec["feat_key"], rec, size), _txt("pca_key"), None),
                     ],

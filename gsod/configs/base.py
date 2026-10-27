@@ -34,6 +34,17 @@ class BaseConfig:
     decoder_hidden_dim: int = 128
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
+    # Foreground target of the losses: "residual" = F, where the image differs
+    # from the background render; "attention" = the slot attention's own
+    # foreground (1 - background row), with slot attention trained by a 2D
+    # auxiliary decoder (see model/gsod.py, model/losses.py).
+    fg_source: str = "residual"
+    # "attention" only: side of the 2D auxiliary reconstruction of view 0,
+    aux2d_size: int = 32
+    # and the opacity floor of object Gaussians, decaying linearly from
+    # opacity_floor to 0 over the first opacity_floor_steps steps.
+    opacity_floor: float = 0.2
+    opacity_floor_steps: int = 5_000
 
     # --- optimisation ----------------------------------------------------------
     # Number of optimisation steps; each step trains on one scene.
@@ -78,3 +89,9 @@ class BaseConfig:
     scene_prior: dict | None = None
     # Directory for checkpoints and their *_state.json files.
     out_dir: str = field(default_factory=lambda: default_out_dir("run"))
+
+    def __post_init__(self) -> None:
+        if self.fg_source not in ("residual", "attention"):
+            raise ValueError(
+                f"fg_source must be 'residual' or 'attention', got {self.fg_source!r}"
+            )

@@ -21,6 +21,17 @@ modified.
 
 Everything that is rendered comes from Gaussians: there is no constant colour
 fill; a pixel no Gaussian covers renders black.
+
+Foreground source (fg_from_attention, config fg_source = "attention")
+---------------------------------------------------------------------
+The default losses use F, the background residual (losses.py). With
+fg_from_attention the slot attention is trained by a 2D auxiliary decoder
+(aux_decoder.py) instead, and its own foreground (1 - background row) is the
+target: in training the model also outputs ``attn_fg`` for every view (views
+1+ are encoded with no gradient, for the target only) and the object
+Gaussians get an opacity floor (``opacity_floor``, set by train.py) so they
+stay alive until the attention has found the objects. Inference still
+encodes view 0 only.
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from gsod.model.aux_decoder import SpatialBroadcastDecoder
 from gsod.model.background import BackgroundShell
 from gsod.model.decoders import AttentionDecoder, SlotFrame
 from gsod.model.encoder import Encoder
@@ -153,6 +165,8 @@ class GSODModel(nn.Module):
         canonical_azimuth: bool = True,
         anchor_frames: bool = True,
         decoder_cls: type[nn.Module] = AttentionDecoder,
+        fg_from_attention: bool = False,
+        aux2d_size: int = 32,
     ):
         """num_slots: K, background included (K-1 object slots).
         bg_gaussians_per_slot: number of background-shell Gaussians.
@@ -160,6 +174,8 @@ class GSODModel(nn.Module):
         object-frame priors and the background-shell radius.
         decoder_cls: object decoder class (AttentionDecoder, SharedMLPDecoder,
         PerSlotMLPDecoder), built with the common decoder signature.
+        fg_from_attention: train with the 2D auxiliary decoder (of size
+        aux2d_size) and the attention foreground instead of F.
         Object slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
@@ -203,32 +219,66 @@ class GSODModel(nn.Module):
         self.background = BackgroundShell(
             n_gaussians=bg_gaussians_per_slot, radius=radius
         )
+        self.fg_from_attention = bool(fg_from_attention)
+        self.aux_decoder = (
+            SpatialBroadcastDecoder(z_dim, size=aux2d_size)
+            if self.fg_from_attention
+            else None
+        )
+        # Minimum opacity of object Gaussians in training (o -> f + (1 - f) o);
+        # set per step by train.py, 0 = off.
+        self.opacity_floor = 0.0
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks for checkpoint.save_networks / load_networks."""
-        return {
+        nets = {
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
             "Decoder": self.decoder,
             "Background": self.background,
         }
+        if self.aux_decoder is not None:
+            nets["AuxDecoder"] = self.aux_decoder
+        return nets
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """images: (N,3,H,W) -> (1, s*s, C) encoder tokens of views[0], s = input_size."""
+        """images: (N,3,H,W) -> (N, s*s, C) encoder tokens, s = input_size."""
         feat = self.encoder(
             F.interpolate(
-                images[0:1], size=self.input_size, mode="bilinear", align_corners=False
+                images, size=self.input_size, mode="bilinear", align_corners=False
             )
         )
         return feat.flatten(start_dim=2).permute(0, 2, 1)
+
+    def attention_foreground(
+        self, images: torch.Tensor, attn0: torch.Tensor
+    ) -> torch.Tensor:
+        """(N, H, W) slot-attention foreground (1 - background row), no gradient.
+
+        attn0: (K, s*s) attention of view 0 from the forward pass; views 1+
+        are encoded here, for this target only.
+        """
+        with torch.no_grad():
+            attn = attn0[None]
+            if images.shape[0] > 1:
+                _, attn_rest, _ = self.slot_attention(self.encode(images[1:]))
+                attn = torch.cat([attn, attn_rest])
+            side = self.input_size
+            bg = attn[:, 0] / attn.sum(1)  # (N, s*s)
+            fg = (1.0 - bg).view(-1, 1, side, side)
+            fg = F.interpolate(
+                fg, size=self.image_size, mode="bilinear", align_corners=False
+            )
+        return fg[:, 0].clamp(0.0, 1.0)
 
     def forward(
         self, images: torch.Tensor, cam2world: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
-        Only views[0] is encoded."""
-        tokens = self.encode(images)
-        obj_slots, attn = self.slot_attention(tokens)
+        Only views[0] is encoded (in training with fg_from_attention, views
+        1+ also are, for the attn_fg target only)."""
+        tokens = self.encode(images[0:1])
+        obj_slots, attn, bg_slot = self.slot_attention(tokens)
         obj_slots, attn = obj_slots.squeeze(0), attn.squeeze(0)  # (K-1, C), (K, N)
 
         # Object Gaussians (view-0 azimuth frame), with attention-anchored frames.
@@ -248,6 +298,12 @@ class GSODModel(nn.Module):
                 frame.ray = None
         if self.canonical_azimuth:
             obj_gaussians = yaw_to_world(obj_gaussians, view_yaw(cam2world[0]))
+        if self.training and self.opacity_floor > 0:
+            floor = self.opacity_floor
+            obj_gaussians = {
+                **obj_gaussians,
+                "opacity": floor + (1.0 - floor) * obj_gaussians["opacity"],
+            }
 
         # Static background Gaussians (world frame) + object Gaussians.
         bg_gaussians = self.background()
@@ -294,7 +350,19 @@ class GSODModel(nn.Module):
                 self.near,
             )["rgb"]
 
+        # fg_from_attention: aux_rgb (3, a, a) and aux_masks (K, a, a) of
+        # view 0, a = aux2d_size (mask 0 = background latent); in training
+        # also attn_fg (N, H, W).
+        extra: dict[str, torch.Tensor] = {}
+        if self.aux_decoder is not None:
+            extra["aux_rgb"], extra["aux_masks"] = self.aux_decoder(
+                torch.cat([bg_slot[0], obj_slots])
+            )
+            if self.training:
+                extra["attn_fg"] = self.attention_foreground(images, attn)
+
         return {
+            **extra,
             "rgb": rendered["rgb"],
             "slot_alpha": alpha,  # Gaussian weights only
             "slot_alpha_full": alpha_full,  # uncovered share added to slot 0

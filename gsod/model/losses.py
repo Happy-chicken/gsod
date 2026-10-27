@@ -6,6 +6,7 @@
           + fg_cov    * BCE_bal(fg_share, F)         all views, from residual_start
           + bg_attn   * BCE(attn_bg, 1 - F)          view 0, from residual_start
           + fg_render * CE(render_fg | attn_fg)      view 0
+          + aux2d     * MSE(aux_rgb, image)          view 0, fg_source="attention"
 
 F, the foreground target (background_residual_target)
     Per pixel of every view: does the image differ from what the background
@@ -19,6 +20,19 @@ F, the foreground target (background_residual_target)
     error over a background the shell already fits, so their opacity is
     driven to 0, the attention hands every token to the background and the
     slots collapse to one point (observed when F was removed).
+
+Attention foreground (fg_source = "attention")
+    Replaces F by the model's attn_fg: per view, 1 - the background row of
+    that view's slot attention, from attn_fg_start on (no gradient). The slot
+    attention is then trained by aux2d instead of bg_attn (which would
+    supervise the attention with itself and is skipped), and before
+    attn_fg_start the model's opacity floor keeps the object Gaussians from
+    dying.
+
+aux2d -- "the slots reconstruct view 0 in 2D"
+    The 2D auxiliary decoder's reconstruction of view 0 from [background
+    latent; object slots] against the image area-downsampled to its size;
+    MSE, as in Slot Attention. Needs no foreground target.
 
 Reconstruction (L1_w, SSIM)
     L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
@@ -202,8 +216,12 @@ class GSODLoss(nn.Module):
         """outputs: model output; images: (V,3,H,W); step: training step
         (None = all terms active). Returns (total, per-term values for logging)."""
         cfg = self.cfg
+        from_attention = "aux_rgb" in outputs
         fg_target = None
-        if step is None or step >= cfg.residual_start:
+        if from_attention:
+            if step is None or step >= cfg.attn_fg_start:
+                fg_target = outputs["attn_fg"]
+        elif step is None or step >= cfg.residual_start:
             fg_target = background_residual_target(outputs, images, cfg.residual_tau)
         weight = None if fg_target is None else 1.0 + FG_RECON_WEIGHT * fg_target
 
@@ -223,12 +241,16 @@ class GSODLoss(nn.Module):
             if cfg.fg_cov > 0:
                 terms["fg_cov"] = fg_coverage_loss(outputs, fg_target)
                 weights["fg_cov"] = cfg.fg_cov
-            if cfg.bg_attn > 0:
+            if cfg.bg_attn > 0 and not from_attention:
                 terms["bg_attn"] = bg_attention_loss(outputs, fg_target)
                 weights["bg_attn"] = cfg.bg_attn
         if cfg.fg_render > 0:
             terms["fg_render"] = fg_render_loss(outputs)
             weights["fg_render"] = cfg.fg_render
+        if from_attention and cfg.aux2d > 0:
+            aux = outputs["aux_rgb"]
+            terms["aux2d"] = F.mse_loss(aux, _to_tokens(images[0], aux.shape[-1]))
+            weights["aux2d"] = cfg.aux2d
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

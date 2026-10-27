@@ -92,6 +92,10 @@ def train(
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order].to(device), cams[order].to(device)
 
+        if cfg.fg_source == "attention":
+            model.opacity_floor = cfg.opacity_floor * max(
+                0.0, 1.0 - step / cfg.opacity_floor_steps
+            )
         out_dict = model(images, cams)
         loss, terms = criterion(out_dict, images, step)
 
@@ -165,6 +169,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--bg-gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
+    parser.add_argument(
+        "--fg-source",
+        choices=["residual", "attention"],
+        default=None,
+        help="foreground target: background residual F or slot attention",
+    )
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
 
@@ -194,6 +204,7 @@ def main() -> None:
         "gaussians_per_slot",
         "bg_gaussians_per_slot",
         "decoder_hidden_dim",
+        "fg_source",
     ]
     values = {
         field: getattr(args, field)

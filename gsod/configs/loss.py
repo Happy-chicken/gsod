@@ -24,3 +24,10 @@ class LossConfig:
     residual_start: int = 0
     # Colour difference (max over RGB, in [0, 1]) that counts as foreground in F.
     residual_tau: float = 0.1
+    # fg_source = "attention" only (bg_attn and residual_* are then unused):
+    # 2D auxiliary reconstruction of view 0 from the slots,
+    aux2d: float = 1.0
+    # step from which the attention foreground is the target of fg_cov and
+    # of the object-pixel weighting of the L1 terms (the slot attention needs
+    # the auxiliary decoder to find the objects first).
+    attn_fg_start: int = 5_000
