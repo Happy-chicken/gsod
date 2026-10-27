@@ -1,4 +1,4 @@
-"""2D auxiliary decoder (fg_source = "attention").
+"""2D auxiliary decoder.
 
 A spatial broadcast decoder (Watters et al. 2019; the decoder of the original
 Slot Attention): every latent is tiled over a small grid, a Fourier encoding
@@ -8,9 +8,9 @@ the mask-weighted sum of the colours.
 
 It reconstructs view 0 at a low resolution from [background latent; object
 slots]. This trains the encoder and slot attention with a pure image
-reconstruction signal that needs no foreground target F, which is what lets
-the slot attention's own foreground (1 - background row) replace F as the
-target of the 3D losses. It is used in training only; the 3D model does not
+reconstruction signal that needs no foreground target, which is what lets
+the slot attention's own foreground (1 - background row) be the target of
+the 3D losses. It is used in training only; the 3D model does not
 read its output.
 """
 

@@ -22,16 +22,15 @@ modified.
 Everything that is rendered comes from Gaussians: there is no constant colour
 fill; a pixel no Gaussian covers renders black.
 
-Foreground source (fg_from_attention, config fg_source = "attention")
----------------------------------------------------------------------
-The default losses use F, the background residual (losses.py). With
-fg_from_attention the slot attention is trained by a 2D auxiliary decoder
-(aux_decoder.py) instead, and its own foreground (1 - background row) is the
-target: in training the model also outputs ``attn_fg`` for every view (views
-1+ are encoded with no gradient, for the target only) and the object
-Gaussians get an opacity floor (``opacity_floor``, set by train.py) so they
-stay alive until the attention has found the objects. Inference still
-encodes view 0 only.
+Training signals
+----------------
+The slot attention is trained by a 2D auxiliary decoder (aux_decoder.py) that
+reconstructs view 0 from the slots; its own foreground (1 - background row)
+is the foreground target of the 3D losses (losses.py). In training the model
+therefore also outputs ``attn_fg`` for every view (views 1+ are encoded with
+no gradient, for the target only), and the object Gaussians get an opacity
+floor (``opacity_floor``, set by train.py) so they stay alive until the
+attention has found the objects. Inference encodes view 0 only.
 """
 
 from __future__ import annotations
@@ -165,7 +164,6 @@ class GSODModel(nn.Module):
         canonical_azimuth: bool = True,
         anchor_frames: bool = True,
         decoder_cls: type[nn.Module] = AttentionDecoder,
-        fg_from_attention: bool = False,
         aux2d_size: int = 32,
     ):
         """num_slots: K, background included (K-1 object slots).
@@ -174,8 +172,7 @@ class GSODModel(nn.Module):
         object-frame priors and the background-shell radius.
         decoder_cls: object decoder class (AttentionDecoder, SharedMLPDecoder,
         PerSlotMLPDecoder), built with the common decoder signature.
-        fg_from_attention: train with the 2D auxiliary decoder (of size
-        aux2d_size) and the attention foreground instead of F.
+        aux2d_size: side of the 2D auxiliary reconstruction of view 0.
         Object slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
@@ -219,27 +216,20 @@ class GSODModel(nn.Module):
         self.background = BackgroundShell(
             n_gaussians=bg_gaussians_per_slot, radius=radius
         )
-        self.fg_from_attention = bool(fg_from_attention)
-        self.aux_decoder = (
-            SpatialBroadcastDecoder(z_dim, size=aux2d_size)
-            if self.fg_from_attention
-            else None
-        )
+        self.aux_decoder = SpatialBroadcastDecoder(z_dim, size=aux2d_size)
         # Minimum opacity of object Gaussians in training (o -> f + (1 - f) o);
         # set per step by train.py, 0 = off.
         self.opacity_floor = 0.0
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks for checkpoint.save_networks / load_networks."""
-        nets = {
+        return {
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
             "Decoder": self.decoder,
             "Background": self.background,
+            "AuxDecoder": self.aux_decoder,
         }
-        if self.aux_decoder is not None:
-            nets["AuxDecoder"] = self.aux_decoder
-        return nets
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         """images: (N,3,H,W) -> (N, s*s, C) encoder tokens, s = input_size."""
@@ -275,8 +265,8 @@ class GSODModel(nn.Module):
         self, images: torch.Tensor, cam2world: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
-        Only views[0] is encoded (in training with fg_from_attention, views
-        1+ also are, for the attn_fg target only)."""
+        Only views[0] is encoded (in training views 1+ also are, for the
+        attn_fg target only)."""
         tokens = self.encode(images[0:1])
         obj_slots, attn, bg_slot = self.slot_attention(tokens)
         obj_slots, attn = obj_slots.squeeze(0), attn.squeeze(0)  # (K-1, C), (K, N)
@@ -338,28 +328,12 @@ class GSODModel(nn.Module):
         alpha_full = torch.cat([alpha[:, :1] + empty, alpha[:, 1:]], dim=1)
         mask_idx = alpha_full.argmax(dim=1)
 
-        # Every view rendered with the background alone: the reference for
-        # the foreground target F in losses.py, which takes no gradient.
-        with torch.no_grad():
-            bg_rgb = self.splat(
-                bg_gaussians,
-                slot_probs[:n_bg],
-                cam2world,
-                self.image_size,
-                self.focal_ratio,
-                self.near,
-            )["rgb"]
-
-        # fg_from_attention: aux_rgb (3, a, a) and aux_masks (K, a, a) of
-        # view 0, a = aux2d_size (mask 0 = background latent); in training
-        # also attn_fg (N, H, W).
-        extra: dict[str, torch.Tensor] = {}
-        if self.aux_decoder is not None:
-            extra["aux_rgb"], extra["aux_masks"] = self.aux_decoder(
-                torch.cat([bg_slot[0], obj_slots])
-            )
-            if self.training:
-                extra["attn_fg"] = self.attention_foreground(images, attn)
+        # 2D reconstruction of view 0, a = aux2d_size (mask 0 = background latent).
+        aux_rgb, aux_masks = self.aux_decoder(torch.cat([bg_slot[0], obj_slots]))
+        # Foreground target of every view (N, H, W), training only.
+        extra = {}
+        if self.training:
+            extra["attn_fg"] = self.attention_foreground(images, attn)
 
         return {
             **extra,
@@ -371,6 +345,7 @@ class GSODModel(nn.Module):
             "slots": obj_slots,  # (K-1, C) object slots
             "slot_ids": slot_ids,
             "gaussians": gaussians,  # world frame, background first
-            "bg_rgb": bg_rgb,  # (N, 3, H, W) background-only render
             "frame_centre": frame_centre,  # (K-1, 3) object frames, view-0 azimuth frame
+            "aux_rgb": aux_rgb,  # (3, a, a)
+            "aux_masks": aux_masks,  # (K, a, a)
         }

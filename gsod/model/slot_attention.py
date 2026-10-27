@@ -149,7 +149,7 @@ class SlotAttention(nn.Module):
 
         # Background latent: values averaged under the final background row.
         # Not a slot (it is never refined); only the 2D auxiliary decoder
-        # (fg_source = "attention") reads it.
+        # reads it.
         attn_bg = attn[:, :1, :]
         bg_slot = torch.einsum(
             "bjd,bij->bid", v, attn_bg / attn_bg.sum(dim=-1, keepdim=True)

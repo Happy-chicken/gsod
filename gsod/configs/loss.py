@@ -12,22 +12,14 @@ class LossConfig:
     ssim: float = 0.2
     # L1 on view 0, the encoded view.
     view0: float = 1.0
-    # fg_cov: object slots must draw the object pixels (target F), all views.
+    # fg_cov: object slots must draw the object pixels (target: the slot
+    # attention's foreground, see model/losses.py), all views.
     fg_cov: float = 0.1
-    # bg_attn: slot attention hands the background pixels to the background.
-    bg_attn: float = 0.1
     # fg_render: each object is drawn by the slot that attends to it.
     fg_render: float = 0.05
-    # Step from which F is used: fg_cov, bg_attn and the object-pixel
-    # weighting of the L1 terms. 0 = from the start, which works when the
-    # background shell starts close to the data background (Primordia).
-    residual_start: int = 0
-    # Colour difference (max over RGB, in [0, 1]) that counts as foreground in F.
-    residual_tau: float = 0.1
-    # fg_source = "attention" only (bg_attn and residual_* are then unused):
-    # 2D auxiliary reconstruction of view 0 from the slots,
+    # aux2d: 2D auxiliary reconstruction of view 0 from the slots.
     aux2d: float = 1.0
-    # step from which the attention foreground is the target of fg_cov and
-    # of the object-pixel weighting of the L1 terms (the slot attention needs
-    # the auxiliary decoder to find the objects first).
+    # Step from which the attention foreground is the target of fg_cov and of
+    # the object-pixel weighting of the L1 terms (the slot attention needs the
+    # auxiliary decoder to find the objects first).
     attn_fg_start: int = 5_000

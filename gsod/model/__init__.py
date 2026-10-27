@@ -56,7 +56,6 @@ def build_model(
         # and uses the profile's scene_prior instead.
         scene_config=meta.get("config", cfg.scene_prior),
         decoder_cls=decoder_cls,
-        fg_from_attention=cfg.fg_source == "attention",
         aux2d_size=cfg.aux2d_size,
     )
 
