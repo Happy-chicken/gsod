@@ -1,21 +1,22 @@
-"""Slot attention over object slots, with a learned background query.
+"""Slot attention with a background slot and K object slots.
 
-Only objects get slots. The background (a uniform colour in the data, drawn by
-GSODModel's static BackgroundShell) is not a slot: it has no latent and is not
-updated. It is represented in the attention by one learned query vector, so
-background tokens have somewhere to go instead of being spread over the
-object slots:
+The background has its own slot, as in uORF (Yu et al., ICLR 2022): it
+competes with the object slots for the tokens like any slot, but has its own
+parameters (initial query, query projection, GRU, residual MLP), so which
+slot is the background is fixed by construction:
 
-    attention row 0     learned background query (fixed, input-independent)
-    attention rows 1..K object slots (learned initial queries, iteratively refined)
+    attention row 0     background slot
+    attention rows 1..K object slots
 
 The softmax over rows 0..K makes every token choose between "background" and
-one of the objects.
+one of the objects. The background slot conditions the colours of
+GSODModel's BackgroundShell; the object slots are decoded into Gaussians.
 
 Slot initialisation: BO-QSA (Jia et al., ICLR 2023, "Improving Object-centric
-Learning with Query Optimization"). Every object slot has its own learned
-initial query. The refinement iterations run on detached slots, and the
-gradient of the last iteration is passed straight through to the queries.
+Learning with Query Optimization"). Every slot, the background included, has
+its own learned initial query. The refinement iterations run on detached
+slots, and the gradient of the last iteration is passed straight through to
+the queries.
 Learned queries trained without this scheme (plain QSA) are worse than random
 initialisation in the paper's ablation; the detach + straight-through pair is
 what makes them work.
@@ -46,7 +47,8 @@ from torch.nn import init
 
 
 class SlotAttention(nn.Module):
-    """BxNxC tokens -> (BxKxC object slots, Bx(1+K)xN attention)."""
+    """BxNxC tokens -> (BxKxD object slots, Bx1xD background slot,
+    Bx(1+K)xN attention)."""
 
     def __init__(
         self,
@@ -69,8 +71,9 @@ class SlotAttention(nn.Module):
         # BO-QSA: one learned initial query per object slot.
         self.slot_queries = nn.Parameter(torch.empty(1, num_slots, slot_dim))
         init.xavier_uniform_(self.slot_queries)
-        # Background: one learned query in key space (not a slot).
-        self.bg_query = nn.Parameter(torch.randn(1, 1, slot_dim) * slot_dim**-0.5)
+        # Background slot: its own initial query.
+        self.bg_query = nn.Parameter(torch.empty(1, 1, slot_dim))
+        init.xavier_uniform_(self.bg_query)
 
         self.to_k = nn.Linear(in_dim, slot_dim, bias=False)
         self.to_v = nn.Linear(in_dim, slot_dim, bias=False)
@@ -78,14 +81,14 @@ class SlotAttention(nn.Module):
             nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False)
         )
         self.gru = nn.GRUCell(slot_dim, slot_dim)
-
         hidden_dim = max(slot_dim, hidden_dim)
-        self.to_res = nn.Sequential(
-            nn.LayerNorm(slot_dim),
-            nn.Linear(slot_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, slot_dim),
+        self.to_res = self._residual_mlp(slot_dim, hidden_dim)
+        # The background slot's own query projection, GRU and residual MLP.
+        self.to_q_bg = nn.Sequential(
+            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False)
         )
+        self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
+        self.to_res_bg = self._residual_mlp(slot_dim, hidden_dim)
         # Soft position embedding + feature MLP (Locatello et al. 2020).
         self.pos_proj = nn.Linear(4, in_dim)
         self.feat_mlp = nn.Sequential(
@@ -95,6 +98,15 @@ class SlotAttention(nn.Module):
             nn.Linear(in_dim, in_dim),
         )
         self.norm_feat = nn.LayerNorm(in_dim)
+
+    @staticmethod
+    def _residual_mlp(dim: int, hidden_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, dim),
+        )
 
     @staticmethod
     def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
@@ -121,30 +133,32 @@ class SlotAttention(nn.Module):
     def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
         slots_init = self.slot_queries.expand(b, -1, -1)
-        slots = slots_init
+        bg_init = self.bg_query.expand(b, -1, -1)
+        slots, bg = slots_init, bg_init
 
         k, v = self.project_inputs(feat)
-        dots_bg = torch.einsum("bid,bjd->bij", self.bg_query.expand(b, -1, -1), k) * self.scale
 
         attn = None
         for it in range(self.iters):
             # BO-QSA: earlier iterations are not back-propagated; the last one
             # passes its gradient straight through to the initial queries.
-            slots = slots.detach()
+            slots, bg = slots.detach(), bg.detach()
             if it == self.iters - 1:
                 slots = slots + slots_init - slots_init.detach()
-            slots_prev = slots
-            q = self.to_q(slots)
+                bg = bg + bg_init - bg_init.detach()
+            slots_prev, bg_prev = slots, bg
+            q = torch.cat([self.to_q_bg(bg), self.to_q(slots)], dim=1)
             dots = torch.einsum("bid,bjd->bij", q, k) * self.scale
-            attn = torch.cat([dots_bg, dots], dim=1).softmax(dim=1) + self.eps
-            attn_obj = attn[:, 1:, :]
-            attn_w = attn_obj / attn_obj.sum(dim=-1, keepdim=True)
-            updates = torch.einsum("bjd,bij->bid", v, attn_w)
+            attn = dots.softmax(dim=1) + self.eps
+            attn_w = attn / attn.sum(dim=-1, keepdim=True)
+            updates = torch.einsum("bjd,bij->bid", v, attn_w)  # (b, 1+K, D)
 
             slots = self.gru(
-                updates.reshape(-1, self.slot_dim),
+                updates[:, 1:].reshape(-1, self.slot_dim),
                 slots_prev.reshape(-1, self.slot_dim),
             ).reshape(b, -1, self.slot_dim)
             slots = slots + self.to_res(slots)
+            bg = self.gru_bg(updates[:, 0], bg_prev[:, 0])[:, None]
+            bg = bg + self.to_res_bg(bg)
 
-        return slots, attn
+        return slots, bg, attn
