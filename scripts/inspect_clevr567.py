@@ -7,7 +7,8 @@
 Reports the image size, the camera convention (OpenCV: the cam2world third
 column points at the scene centre), the camera distance range next to the
 config's scene_prior["distance_range"], and, for a few *_mask.png files, the
-grey values and which one the loader treats as background.
+grey values and which one the loader treats as background (the most
+frequent one).
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ def main() -> None:
     for path in sorted(args.root.glob("*_mask.png"))[: args.masks]:
         gray = np.asarray(Image.open(path).convert("L"), dtype=np.int64)
         values, counts = np.unique(gray, return_counts=True)
-        bg = values[min(1, len(values) - 1)]
+        bg = values[counts.argmax()]
         share = ", ".join(f"{v}:{c / gray.size:.2f}" for v, c in zip(values, counts))
         print(f"{path.name}: grey value:share {share}  -> background {bg}")
 

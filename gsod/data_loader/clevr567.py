@@ -67,15 +67,18 @@ def _load_rgb(path: Path, size: tuple[int, int]) -> torch.Tensor:
 def _load_mask(path: Path, size: tuple[int, int]) -> torch.Tensor:
     """uORF mask PNG -> (H, W) int64 labels, 0 = background, i > 0 = objects.
 
-    The masks are flat colours. As in uORF's MultiscenesDataset, they are
-    compared in grayscale: every distinct grey value is one region and the
-    background is the second-darkest value (uORF's greyscale_dict[1]).
+    The masks are flat colours, compared in grayscale as in uORF: every
+    distinct grey value is one region. The background is the most frequent
+    value (~75-85% of every CLEVR-567 view). uORF takes the second-darkest
+    value instead, which only holds while the darkest object colour (blue,
+    grey 29) is visible; in a view where it is occluded that rule labels the
+    background as an object and an object as background.
     """
     mask = Image.open(path).convert("L").resize((size[1], size[0]), Image.NEAREST)
     gray = np.asarray(mask, dtype=np.int64)
-    values, labels = np.unique(gray, return_inverse=True)
+    values, labels, counts = np.unique(gray, return_inverse=True, return_counts=True)
     labels = labels.reshape(gray.shape) + 1
-    labels[gray == values[min(1, len(values) - 1)]] = 0
+    labels[gray == values[counts.argmax()]] = 0
     return torch.from_numpy(labels)
 
 
