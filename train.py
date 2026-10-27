@@ -92,9 +92,6 @@ def train(
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order].to(device), cams[order].to(device)
 
-        model.opacity_floor = cfg.opacity_floor * max(
-            0.0, 1.0 - step / cfg.opacity_floor_steps
-        )
         out_dict = model(images, cams)
         loss, terms = criterion(out_dict, images, step)
 

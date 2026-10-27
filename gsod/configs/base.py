@@ -34,13 +34,6 @@ class BaseConfig:
     decoder_hidden_dim: int = 128
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
-    # Side of the 2D auxiliary reconstruction of view 0 that trains the slot
-    # attention (see model/gsod.py, model/losses.py).
-    aux2d_size: int = 32
-    # Opacity floor of object Gaussians in training, decaying linearly from
-    # opacity_floor to 0 over the first opacity_floor_steps steps.
-    opacity_floor: float = 0.2
-    opacity_floor_steps: int = 5_000
 
     # --- optimisation ----------------------------------------------------------
     # Number of optimisation steps; each step trains on one scene.

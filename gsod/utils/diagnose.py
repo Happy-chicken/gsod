@@ -25,7 +25,7 @@ pass before training starts.
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
                       key scores; one block per view: view 0 (images, masks
-                      and fg target; slot attention; rendered slot weights), then
+                      and F; slot attention; rendered slot weights), then
                       view 1 (images and masks; rendered slot weights). Each
                       slot tile has its mask colour and share of the image
                       (bg = background). Needs Pillow.
@@ -75,16 +75,18 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
     """Run the model on one scene and return everything as numpy arrays."""
     import torch
 
+    from gsod.model.losses import background_residual_target
+
     images = item["images"].to(device)
     cams = item["cam2world"].to(device)
     devices = [device] if getattr(device, "type", "") == "cuda" else []
     with torch.no_grad(), torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         result = model(images, cams)
-        # Foreground target of view 0, as the losses compute it.
-        fg_target = model.attention_foreground(images[:1], result["attn"])[0]
+        # Foreground target F of view 0, as the losses compute it.
+        fg_target = background_residual_target(result, images)[0]
         # View-0 tokens: encoder output and the keys slot attention compares.
-        tokens = model.encode(images[:1])
+        tokens = model.encode(images)
         keys, _ = model.slot_attention.project_inputs(tokens)
 
     def np_(x):
@@ -349,7 +351,7 @@ def _rgb(chw: np.ndarray) -> np.ndarray:
 def _pca_rgb(feat: np.ndarray, rec: dict, size: tuple[int, int]) -> np.ndarray:
     """First 3 principal components of view-0 token features as RGB.
 
-    PCA is fitted on object tokens only (GT, else fg target > 0.5), otherwise the
+    PCA is fitted on object tokens only (GT, else F > 0.5), otherwise the
     background, ~80% of the tokens, takes the main components; each component
     is stretched over its 1-99% range on those tokens; background is dimmed.
     """
@@ -390,7 +392,7 @@ _TEXT = {
     "gt": "GT mask",
     "mask": "render mask",
     "attn_mask": "attention mask",
-    "fg_target": "fg target: 1 - attn bg",
+    "fg_target": "F: differs from bg",
     "pca_enc": "features (PCA)",
     "pca_key": "keys (PCA)",
     "slot": "{slot} {share:.0%}",
@@ -433,8 +435,7 @@ def make_grid(
 ) -> np.ndarray:
     """Diagnostic sheet: one block per view, a caption under every tile.
 
-    View 0  images: input, render, GT mask, render mask, attention mask,
-            foreground target (1 - attention background row),
+    View 0  images: input, render, GT mask, render mask, attention mask, F,
             PCA of the encoder features and of the attention keys
             slot attention per slot (bg = background query)
             rendered weight per slot
