@@ -1,4 +1,4 @@
-"""Cross-attention Gaussian decoder for object slots.
+"""Cross-attention Gaussian decoder for slots.
 
     Q: G learned Gaussian queries, shared by all slots and independent of the
        input. Query i stands for "Gaussian i" of a slot.
@@ -7,8 +7,7 @@
        one Gaussian.
 
 The slot decides what is drawn (only through K/V); the query decides which
-Gaussian of the slot is produced. The background is not decoded here (see
-gsod.model.background.BackgroundShell).
+Gaussian of the slot is produced.
 """
 
 from __future__ import annotations
@@ -69,7 +68,7 @@ class AttentionDecoder(nn.Module):
         return q + self.ffn(self.norm_ff(q))
 
     def forward(self, slots: torch.Tensor):
-        """slots: (K, C) object slots."""
+        """slots: (K, C) slots."""
         K = slots.shape[0]
         assert K >= 1
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))

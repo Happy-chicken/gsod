@@ -1,12 +1,10 @@
-"""MLP decoders for object slots.
+"""MLP decoders for slots.
 
 Two minimal variants:
 
-* ``PerSlotMLPDecoder``: one MLP per object slot (not permutation-equivariant;
+* ``PerSlotMLPDecoder``: one MLP per slot (not permutation-equivariant;
   kept for comparison).
-* ``SharedMLPDecoder``: one MLP shared by all object slots.
-
-The background is not decoded here (see gsod.model.background.BackgroundShell).
+* ``SharedMLPDecoder``: one MLP shared by all slots.
 
 An optional ``SlotFrame`` plugin interprets the first three raw values as
 slot-frame offsets; by default they are absolute centres.
@@ -50,7 +48,7 @@ class Decoder(nn.Module):
         hidden_dim: int = 128,
         frame: SlotFrame | None = None,
     ):
-        """Common decoder signature. n_slots: number of object slots."""
+        """Common decoder signature. n_slots: number of slots."""
         super().__init__()
         assert n_slots >= 1, "n_slots must be at least 1"
         self.n_slots = int(n_slots)
@@ -65,12 +63,12 @@ class Decoder(nn.Module):
 
     def _check(self, slots: torch.Tensor) -> None:
         assert slots.shape[0] == self.n_slots, (
-            f"decoder built for {self.n_slots} object slots, got {slots.shape[0]}"
+            f"decoder built for {self.n_slots} slots, got {slots.shape[0]}"
         )
 
 
 class PerSlotMLPDecoder(Decoder):
-    """One independent MLP per object slot."""
+    """One independent MLP per slot."""
 
     def __init__(
         self, n_slots, z_dim, gaussians_per_slot=512, hidden_dim=128, frame=None
@@ -96,7 +94,7 @@ class PerSlotMLPDecoder(Decoder):
 
 
 class SharedMLPDecoder(Decoder):
-    """One MLP shared by all object slots."""
+    """One MLP shared by all slots."""
 
     def __init__(
         self, n_slots, z_dim, gaussians_per_slot=512, hidden_dim=128, frame=None

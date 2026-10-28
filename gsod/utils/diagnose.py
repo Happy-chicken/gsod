@@ -3,12 +3,13 @@
 Answers, per scene and on average:
 
 1. Initialisation   -- are the Gaussians of a slot spread out, or one point?
-2. Slot attention   -- are the foreground slot latents distinct? Does the
-                       attention map separate objects (attn FG-ARI, dominance)?
+2. Slot attention   -- are the slot latents distinct? Does one slot take the
+                       whole image? Does the attention map separate objects
+                       (attn FG-ARI, dominance)?
 3. Decoder          -- does the rendered slot partition follow the attention,
                        or do several slots redundantly draw the same object
                        (render dominance, attn/render ARI)?
-4. Frames           -- are foreground frame centres distinct?
+4. Frames           -- are the frame centres of the drawing slots distinct?
 5. Features         -- can the encoder features / attention keys separate the
                        objects at all (k-means FG-ARI)? High while the
                        attention FG-ARI is low: the slot competition fails;
@@ -24,11 +25,11 @@ pass before training starts.
 
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
-                      key scores; one block per view: view 0 (images and
-                      masks; slot attention; rendered slot weights), then
-                      view 1 (images and masks; rendered slot weights). Each
-                      slot tile has its mask colour and share of the image
-                      (bg = background). Needs Pillow.
+                      key scores; one block per view: view 0 (images, masks
+                      and the 2D reconstruction; slot attention; rendered
+                      slot weights), then view 1 (images and masks; rendered
+                      slot weights). Each slot tile has its mask colour and
+                      share of the image. Needs Pillow.
     summary.json      per-scene and mean statistics plus verdicts
 """
 
@@ -42,7 +43,8 @@ import numpy as np
 from gsod.utils.metrics import ari, fg_ari, upsample_labels
 from gsod.utils.png import save_png
 
-# Same colours as evaluate.py: slot 0 dark gray, slot k -> PALETTE[(k-1) % 8].
+# Same colours as evaluate.py: GT background (label 0) dark gray, GT object i
+# PALETTE[(i-1) % 8]; predicted slot k PALETTE[k % 8] (no slot is special).
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
 PALETTE = np.array(
     [
@@ -60,11 +62,12 @@ PALETTE = np.array(
 
 # Verdict thresholds (heuristics; tune once you have a working run to compare).
 SPREAD_COLLAPSED = 0.05  # mean distance of a slot's Gaussians to their mean
-SLOT_COS_COLLAPSED = 0.95  # mean pairwise cosine of foreground slot latents
-DOMINANCE_GOOD = 0.8  # share of the strongest fg slot on object pixels
+SLOT_COS_COLLAPSED = 0.95  # mean pairwise cosine of slot latents
+SLOT_TAKES_ALL = 0.9  # attention share of the largest slot
+DOMINANCE_GOOD = 0.8  # share of the strongest slot on object pixels
 DOMINANCE_BAD = 0.6
 ARI_GOOD = 0.7
-CENTRE_COLLAPSED = 0.05  # min pairwise distance of active fg frame centres
+CENTRE_COLLAPSED = 0.05  # min pairwise distance of active frame centres
 ACTIVE_OPACITY = 0.05
 
 
@@ -82,7 +85,7 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         torch.manual_seed(seed)
         result = model(images, cams)
         # View-0 tokens: encoder output and the keys slot attention compares.
-        tokens = model.encode(images)
+        tokens = model.encode(images[:1])
         keys, _ = model.slot_attention.project_inputs(tokens)
 
     def np_(x):
@@ -94,17 +97,20 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
     return {
         "target": np_(images),
         "rgb": np_(result["rgb"].clamp(0, 1)),
-        "alpha": np_(result["slot_alpha_full"]),  # (N, K, H, W)
+        "alpha": np_(result["slot_alpha"]),  # (N, K, H, W)
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (N, H, W)
         "attn": np_(result["attn"]).reshape(-1, side, side),  # (K, s, s)
-        "slots": np_(result["slots"]),  # (K-1, C) object slots
-        # Object frames as used in the forward pass: (K-1, 3) or None.
+        "slots": np_(result["slots"]),  # (K, C) view-0 slots
+        # Frames as used in the forward pass: (K, 3) or None.
         "centre": np_(result["frame_centre"]),
         "mu": np_(g["mu"]),
         "scale": np_(g["scale"]),
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
+        # 2D reconstruction of view 0 and its slot alphas.
+        "aux_rgb": np_(result["aux_rgb"][0]),  # (3, a, a)
+        "aux_alpha": np_(result["aux_alpha"][0]),  # (K, a, a)
         "feat_enc": np_(tokens[0]),  # (s*s, C) encoder features, view 0
         "feat_key": np_(keys[0]),  # (s*s, D) attention keys, view 0
     }
@@ -179,23 +185,20 @@ def feature_fg_ari(feat: np.ndarray, labels: np.ndarray) -> float:
 
 
 def analyse(rec: dict) -> dict:
-    n_slots = rec["alpha"].shape[1]  # K, background included
+    n_slots = rec["alpha"].shape[1]  # K
     size = rec["mask_idx"].shape[1:]
     gt = rec["gt"]
     alpha0 = rec["alpha"][0]
     attn = np.stack([upsample_labels(a, size) for a in rec["attn"]])  # nearest
     attn_lab = attn.argmax(0)
 
-    # Object pixels: GT if available, else pixels mostly covered by fg slots.
-    if gt is not None:
-        obj = gt[0] > 0
-    else:
-        obj = alpha0[1:].sum(0) > 0.3
+    # Object pixels: GT if available, else all pixels.
+    obj = gt[0] > 0 if gt is not None else np.ones(size, dtype=bool)
 
-    fg = rec["slots"]  # object slot latents
-    fg_n = fg / (np.linalg.norm(fg, axis=1, keepdims=True) + 1e-8)
-    cos = fg_n @ fg_n.T
-    off = cos[~np.eye(len(fg), dtype=bool)] if len(fg) > 1 else np.array([np.nan])
+    z = rec["slots"]
+    z_n = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-8)
+    cos = z_n @ z_n.T
+    off = cos[~np.eye(len(z), dtype=bool)]
 
     # Gaussians per slot.
     per_slot = []
@@ -212,29 +215,27 @@ def analyse(rec: dict) -> dict:
                 "coverage_view0": float(alpha0[k].mean()),
                 "render_share_view0": float((rec["mask_idx"][0] == k).mean()),
                 "attn_share": float(rec["attn"][k].mean()),
-                "bg_on_objects": float(alpha0[k][obj].mean())
-                if (k == 0 and obj.any())
-                else None,
             }
         )
 
-    # Frame centres of foreground slots that actually draw something.
+    # Frame centres of the slots that actually draw something.
     centre_min_dist = float("nan")
     if rec["centre"] is not None:
-        active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
-        c = rec["centre"][[k - 1 for k in active]]  # frames are object slots 1..K-1
+        active = [k for k in range(n_slots) if per_slot[k]["coverage_view0"] > 0.005]
+        c = rec["centre"][active]
         if len(c) > 1:
             d = np.linalg.norm(c[:, None] - c[None], axis=-1)
             centre_min_dist = float(d[~np.eye(len(c), dtype=bool)].min())
 
     out = {
-        "fg_slot_cos_mean": float(np.nanmean(off)),
-        "fg_slot_cos_max": float(np.nanmax(off)),
-        "attn_dominance": _dominance(attn[1:], obj),
-        "render_dominance": _dominance(alpha0[1:], obj),
-        # On object pixels only: on all pixels the shared background dominates.
+        "slot_cos_mean": float(np.mean(off)),
+        "slot_cos_max": float(np.max(off)),
+        "attn_max_share": float(max(p["attn_share"] for p in per_slot)),
+        "attn_dominance": _dominance(attn, obj),
+        "render_dominance": _dominance(alpha0, obj),
+        # On object pixels: on all pixels the background slots dominate.
         "attn_render_ari": ari(attn_lab, rec["mask_idx"][0], mask=obj),
-        "fg_centre_min_dist": centre_min_dist,
+        "centre_min_dist": centre_min_dist,
         "per_slot": per_slot,
     }
     if gt is not None:
@@ -254,16 +255,21 @@ def verdicts(mean: dict) -> list[str]:
     msgs = []
     g = lambda key: mean.get(key, float("nan"))  # noqa: E731
 
-    if g("fg_spread_min") < SPREAD_COLLAPSED:
+    if g("spread_min") < SPREAD_COLLAPSED:
         msgs.append(
-            "[init] some fg slot has all Gaussians at one point "
-            f"(min spread {g('fg_spread_min'):.3f}); check offset-bias / query-bias init."
+            "[init] some slot has all Gaussians at one point "
+            f"(min spread {g('spread_min'):.3f}); check offset-bias / query-bias init."
         )
-    if g("fg_slot_cos_mean") > SLOT_COS_COLLAPSED:
+    if g("slot_cos_mean") > SLOT_COS_COLLAPSED:
         msgs.append(
-            f"[slot attention] fg slot latents nearly identical (mean cos "
-            f"{g('fg_slot_cos_mean'):.3f}); slots never separate. Try soft position "
+            f"[slot attention] slot latents nearly identical (mean cos "
+            f"{g('slot_cos_mean'):.3f}); slots never separate. Try soft position "
             "embedding + feature MLP, longer training / LR warmup."
+        )
+    if g("attn_max_share") > SLOT_TAKES_ALL:
+        msgs.append(
+            f"[slot attention] one slot takes {g('attn_max_share'):.0%} of the "
+            "image; the decomposition has not started (check the aux2d loss)."
         )
     attn_ok = g("attn_dominance") > DOMINANCE_GOOD or g("attn_fg_ari") > ARI_GOOD
     render_bad = (
@@ -273,10 +279,10 @@ def verdicts(mean: dict) -> list[str]:
         redundant = g("attn_dominance") - g("render_dominance") > 0.1
         cause = (
             "several slots redraw the same object (render dominance well below "
-            "attention's); use the fg_render loss."
+            "attention's); raise the render_attn loss."
             if redundant
             else "slots draw their own objects, but the render is soft or misplaced "
-            "(edges / thin parts lost to the background); see bg_on_objects."
+            "(edges / thin parts lost to the background slots)."
         )
         msgs.append(
             "[decoder] render segments worse than attention "
@@ -290,15 +296,10 @@ def verdicts(mean: dict) -> list[str]:
             f"{g('attn_dominance'):.2f}, attn FG-ARI {g('attn_fg_ari'):.2f}); fix this "
             "before the decoder."
         )
-    if g("fg_centre_min_dist") < CENTRE_COLLAPSED:
+    if g("centre_min_dist") < CENTRE_COLLAPSED:
         msgs.append(
-            f"[frame] two active fg frames share a centre (min dist "
-            f"{g('fg_centre_min_dist'):.3f}); slots stack on the same object."
-        )
-    if g("bg_on_objects") > 0.3:
-        msgs.append(
-            f"[background] bg slot holds {g('bg_on_objects'):.2f} alpha on object "
-            "pixels; it is explaining objects."
+            f"[frame] two active frames share a centre (min dist "
+            f"{g('centre_min_dist'):.3f}); slots stack on the same object."
         )
     if (
         g("render_fg_ari_view0") > ARI_GOOD
@@ -329,13 +330,16 @@ def verdicts(mean: dict) -> list[str]:
 # ----------------------------------------------------------------------------
 # 3. Visualise
 # ----------------------------------------------------------------------------
-def _colorize(labels: np.ndarray, background=MASK_BG) -> np.ndarray:
+def _colorize(labels: np.ndarray, background: np.ndarray | None = None) -> np.ndarray:
+    """Labels -> RGB. With a background colour, label 0 is the GT background
+    and label i is object i; without one, every label is a slot."""
     out = np.empty(labels.shape + (3,), dtype=np.uint8)
-    out[...] = background
+    shift = 1 if background is not None else 0
     for k in np.unique(labels):
-        if k == 0:
-            continue
-        out[labels == k] = PALETTE[(int(k) - 1) % len(PALETTE)]
+        k = int(k)
+        out[labels == k] = (
+            background if k == 0 and shift else PALETTE[(k - shift) % len(PALETTE)]
+        )
     return out
 
 
@@ -346,18 +350,14 @@ def _rgb(chw: np.ndarray) -> np.ndarray:
 def _pca_rgb(feat: np.ndarray, rec: dict, size: tuple[int, int]) -> np.ndarray:
     """First 3 principal components of view-0 token features as RGB.
 
-    PCA is fitted on object tokens only (GT, else attention background
-    row < 0.5), otherwise the
-    background, ~80% of the tokens, takes the main components; each component
-    is stretched over its 1-99% range on those tokens; background is dimmed.
+    PCA is fitted on GT object tokens only (all tokens without GT), otherwise
+    the background, ~80% of the tokens, takes the main components; each
+    component is stretched over its 1-99% range on those tokens; the
+    background is dimmed.
     """
     side = rec["attn"].shape[-1]
     labels = _token_labels(rec)
-    obj = (
-        labels > 0
-        if labels is not None
-        else rec["attn"][0] < 0.5
-    ).ravel()
+    obj = (labels > 0).ravel() if labels is not None else np.ones(side * side, bool)
     if obj.sum() < 3:
         obj = np.ones_like(obj)
     x = feat - feat[obj].mean(0)
@@ -370,6 +370,11 @@ def _pca_rgb(feat: np.ndarray, rec: dict, size: tuple[int, int]) -> np.ndarray:
     rows = (np.arange(size[0]) * side) // size[0]
     cols = (np.arange(size[1]) * side) // size[1]
     return (rgb[rows[:, None], cols[None, :]] * 255 + 0.5).astype(np.uint8)
+
+
+def _up(maps: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """(C, h, w) -> (C, H, W), nearest."""
+    return np.stack([upsample_labels(m, size) for m in maps])
 
 
 def _gray(hw: np.ndarray) -> np.ndarray:
@@ -388,6 +393,8 @@ _TEXT = {
     "gt": "GT mask",
     "mask": "render mask",
     "attn_mask": "attention mask",
+    "aux_rgb": "2D recon",
+    "aux_mask": "2D slot mask",
     "pca_enc": "features (PCA)",
     "pca_key": "keys (PCA)",
     "slot": "{slot} {share:.0%}",
@@ -415,11 +422,11 @@ def _txt(key: str, **fmt) -> str:
 
 
 def _slot_name(k: int) -> str:
-    return "bg" if k == 0 else f"s{k}"
+    return f"s{k}"
 
 
 def _slot_color(k: int) -> np.ndarray:
-    return MASK_BG if k == 0 else PALETTE[(k - 1) % len(PALETTE)]
+    return PALETTE[k % len(PALETTE)]
 
 
 def make_grid(
@@ -431,15 +438,16 @@ def make_grid(
     """Diagnostic sheet: one block per view, a caption under every tile.
 
     View 0  images: input, render, GT mask, render mask, attention mask,
-            PCA of the encoder features and of the attention keys
-            slot attention per slot (bg = background query)
+            2D reconstruction and its slot mask, PCA of the encoder
+            features and of the attention keys
+            slot attention per slot
             rendered weight per slot
     View 1  images: input, render, GT mask, render mask (novel view)
             rendered weight per slot
     View 0 is the encoded input; view 1 is a novel view the encoder never
     sees, so it tests the 3D. Slot attention: share of each token given to
     the slot. Rendered slot weight: share of each pixel drawn by the slot's
-    Gaussians (bg includes uncovered pixels). Grey tiles: white = 1 (all of
+    Gaussians (uncovered pixels: 0 for every slot). Grey tiles: white = 1 (all of
     the token / pixel), black = 0. Slot captions carry the slot's mask colour
     and its share of the image (the tile mean), so empty slots read 0%.
     Captions are English.
@@ -462,7 +470,7 @@ def make_grid(
         return [
             (_rgb(rec["target"][v]), _txt("image"), None),
             (_rgb(rec["rgb"][v]), _txt("render"), None),
-            (_colorize(gt[v]) if gt is not None else blank, _txt("gt"), None),
+            (_colorize(gt[v], MASK_BG) if gt is not None else blank, _txt("gt"), None),
             (_colorize(rec["mask_idx"][v]), _txt("mask"), None),
         ]
 
@@ -482,6 +490,12 @@ def make_grid(
                     image_tiles(0)
                     + [
                         (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
+                        (_rgb(_up(rec["aux_rgb"], size)), _txt("aux_rgb"), None),
+                        (
+                            _colorize(_up(rec["aux_alpha"], size).argmax(0)),
+                            _txt("aux_mask"),
+                            None,
+                        ),
                         (_pca_rgb(rec["feat_enc"], rec, size), _txt("pca_enc"), None),
                         (_pca_rgb(rec["feat_key"], rec, size), _txt("pca_key"), None),
                     ],
@@ -567,11 +581,8 @@ def make_grid(
 def summarize(per_scene: list[dict]) -> dict:
     keys = [k for k, v in per_scene[0].items() if isinstance(v, float)]
     mean = {k: float(np.nanmean([s[k] for s in per_scene])) for k in keys}
-    fg_spreads = [p["spread"] for s in per_scene for p in s["per_slot"][1:]]
-    bg_obj = [s["per_slot"][0]["bg_on_objects"] for s in per_scene]
-    bg_obj = [x for x in bg_obj if x is not None]
-    mean["fg_spread_min"] = float(np.min(fg_spreads)) if fg_spreads else float("nan")
-    mean["bg_on_objects"] = float(np.mean(bg_obj)) if bg_obj else float("nan")
+    spreads = [p["spread"] for s in per_scene for p in s["per_slot"]]
+    mean["spread_min"] = float(np.min(spreads))
     return mean
 
 
@@ -585,7 +596,7 @@ def _title(stats: dict) -> str:
         f"render v0 {fmt(g('render_fg_ari_view0'))}, "
         f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
         f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
-        f"bg on objects {fmt(stats['per_slot'][0]['bg_on_objects'])} | "
+        f"largest slot {fmt(g('attn_max_share'))} | "
         f"keys k-means FG-ARI {fmt(g('feat_key_fg_ari'))}"
     )
 
@@ -621,7 +632,8 @@ def diagnose(
 
     print(f"[diagnose] {len(per_scene)} scenes -> {out}")
     for key in (
-        "fg_slot_cos_mean",
+        "slot_cos_mean",
+        "attn_max_share",
         "attn_dominance",
         "render_dominance",
         "feat_enc_fg_ari",
@@ -630,9 +642,8 @@ def diagnose(
         "render_fg_ari_view0",
         "render_fg_ari_novel",
         "attn_render_ari",
-        "fg_centre_min_dist",
-        "fg_spread_min",
-        "bg_on_objects",
+        "centre_min_dist",
+        "spread_min",
     ):
         if key in mean:
             print(f"  {key:22s} {mean[key]:.3f}")

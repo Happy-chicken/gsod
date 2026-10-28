@@ -12,11 +12,7 @@ class LossConfig:
     ssim: float = 0.2
     # L1 on view 0, the encoded view.
     view0: float = 1.0
-    # attn_render: the slot attention follows the rendered slot partition
-    # (after discovery).
-    attn_render: float = 0.1
-    # fg_render: each object is drawn by the slot that attends to it (scaled
-    # by the anchor weight).
-    fg_render: float = 0.05
-    # spread: a slot's Gaussians do not shrink to a point.
-    spread: float = 0.1
+    # aux2d: 2D reconstruction of every encoded view from its slots (MSE).
+    aux2d: float = 1.0
+    # render_attn: the rendered slot split of view 0 follows the attention.
+    render_attn: float = 0.05

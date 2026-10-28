@@ -1,4 +1,4 @@
-"""Gaussian decoders for object slots.
+"""Gaussian decoders for slots.
 
 Two families:
 

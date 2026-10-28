@@ -23,9 +23,9 @@ from gsod.model.gsod import GSODModel
 from gsod.utils.metrics import SquaredError, ari, fg_ari, upsample_labels
 from gsod.utils.png import save_png
 
-# Full masks show slot 0 as dark gray; foreground-only masks show it as black.
+# GT masks show the background (label 0) dark gray, object i palette[i - 1];
+# predicted masks give slot k palette[k % len(palette)] (no slot is special).
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
-# Slot k >= 1 gets palette[(k - 1) % len(palette)].
 PALETTE = np.array(
     [
         [230, 25, 75],
@@ -143,10 +143,9 @@ def render_scenes(
 
     Per view:
       view{v}_target.png / view{v}_render.png
-      view{v}_mask.png      full slot partition; background slot dark gray
-      view{v}_fg_mask.png   foreground slots only; background black
+      view{v}_mask.png      slot partition (argmax slot per pixel)
       view{v}_gt_mask.png   ground truth (if the loader provides masks)
-      view{v}_slot{k}.png   alpha of foreground slot k, grayscale (white = 1)
+      view{v}_slot{k}.png   alpha of slot k, grayscale (white = 1)
     Per scene:
       attn_mask.png         slot-attention argmax on view 0 (same colours)
     """
@@ -163,18 +162,17 @@ def render_scenes(
         for v in range(mask_idx.shape[0]):
             save_png(scene_dir / f"view{v}_target.png", _to_uint8(item["images"][v]))
             save_png(scene_dir / f"view{v}_render.png", _to_uint8(result["rgb"][v]))
-            save_png(scene_dir / f"view{v}_mask.png", _colorize(mask_idx[v], MASK_BG))
-            save_png(scene_dir / f"view{v}_fg_mask.png", _colorize(mask_idx[v]))
+            save_png(scene_dir / f"view{v}_mask.png", _colorize(mask_idx[v]))
             if gt is not None:
                 save_png(
                     scene_dir / f"view{v}_gt_mask.png",
                     _colorize(gt[v].cpu().numpy().astype(np.int64), MASK_BG),
                 )
-            for k in range(1, alpha.shape[1]):
+            for k in range(alpha.shape[1]):
                 gray = (alpha[v, k].clamp(0.0, 1.0) * 255.0 + 0.5).cpu().numpy()
                 save_png(scene_dir / f"view{v}_slot{k}.png", gray.astype(np.uint8))
         attn = attn_labels(result, model, mask_idx.shape[1:])
-        save_png(scene_dir / "attn_mask.png", _colorize(attn, MASK_BG))
+        save_png(scene_dir / "attn_mask.png", _colorize(attn))
     model.train(was_training)
 
 
@@ -183,11 +181,14 @@ def _to_uint8(chw: torch.Tensor) -> np.ndarray:
     return (hwc * 255.0 + 0.5).astype(np.uint8)
 
 
-def _colorize(mask_idx: np.ndarray, background=(0, 0, 0)) -> np.ndarray:
-    out = np.empty(mask_idx.shape + (3,), dtype=np.uint8)
-    out[...] = background
-    for k in np.unique(mask_idx):
-        if k == 0:
-            continue
-        out[mask_idx == k] = PALETTE[(int(k) - 1) % len(PALETTE)]
+def _colorize(labels: np.ndarray, background: np.ndarray | None = None) -> np.ndarray:
+    """Labels -> RGB. With a background colour, label 0 is the GT background
+    and label i is object i; without one, every label is a slot."""
+    out = np.empty(labels.shape + (3,), dtype=np.uint8)
+    shift = 1 if background is not None else 0
+    for k in np.unique(labels):
+        k = int(k)
+        out[labels == k] = (
+            background if k == 0 and shift else PALETTE[(k - shift) % len(PALETTE)]
+        )
     return out
