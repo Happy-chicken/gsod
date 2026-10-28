@@ -43,8 +43,8 @@ import numpy as np
 from gsod.utils.metrics import ari, fg_ari, upsample_labels
 from gsod.utils.png import save_png
 
-# Same colours as evaluate.py: GT background (label 0) dark gray, GT object i
-# PALETTE[(i-1) % 8]; predicted slot k PALETTE[k % 8] (no slot is special).
+# Same colours as evaluate.py: label / slot 0 (background) dark gray,
+# k >= 1 PALETTE[(k-1) % 8].
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
 PALETTE = np.array(
     [
@@ -62,9 +62,10 @@ PALETTE = np.array(
 
 # Verdict thresholds (heuristics; tune once you have a working run to compare).
 SPREAD_COLLAPSED = 0.05  # mean distance of a slot's Gaussians to their mean
-SLOT_COS_COLLAPSED = 0.95  # mean pairwise cosine of slot latents
-SLOT_TAKES_ALL = 0.9  # attention share of the largest slot
-DOMINANCE_GOOD = 0.8  # share of the strongest slot on object pixels
+SLOT_COS_COLLAPSED = 0.95  # mean pairwise cosine of object-slot latents
+SLOT_TAKES_ALL = 0.5  # attention share of the largest object slot
+BG_ON_OBJECTS = 0.3  # background slot's share of the object pixels
+DOMINANCE_GOOD = 0.8  # share of the strongest object slot on object pixels
 DOMINANCE_BAD = 0.6
 ARI_GOOD = 0.7
 CENTRE_COLLAPSED = 0.05  # min pairwise distance of active frame centres
@@ -185,17 +186,17 @@ def feature_fg_ari(feat: np.ndarray, labels: np.ndarray) -> float:
 
 
 def analyse(rec: dict) -> dict:
-    n_slots = rec["alpha"].shape[1]  # K
+    n_slots = rec["alpha"].shape[1]  # K, slot 0 = background
     size = rec["mask_idx"].shape[1:]
     gt = rec["gt"]
     alpha0 = rec["alpha"][0]
     attn = np.stack([upsample_labels(a, size) for a in rec["attn"]])  # nearest
     attn_lab = attn.argmax(0)
 
-    # Object pixels: GT if available, else all pixels.
-    obj = gt[0] > 0 if gt is not None else np.ones(size, dtype=bool)
+    # Object pixels: GT if available, else what the attention gives to objects.
+    obj = gt[0] > 0 if gt is not None else attn[0] < 0.5
 
-    z = rec["slots"]
+    z = rec["slots"][1:]  # object slots
     z_n = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-8)
     cos = z_n @ z_n.T
     off = cos[~np.eye(len(z), dtype=bool)]
@@ -218,10 +219,10 @@ def analyse(rec: dict) -> dict:
             }
         )
 
-    # Frame centres of the slots that actually draw something.
+    # Frame centres of the object slots that actually draw something.
     centre_min_dist = float("nan")
     if rec["centre"] is not None:
-        active = [k for k in range(n_slots) if per_slot[k]["coverage_view0"] > 0.005]
+        active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
         c = rec["centre"][active]
         if len(c) > 1:
             d = np.linalg.norm(c[:, None] - c[None], axis=-1)
@@ -230,10 +231,11 @@ def analyse(rec: dict) -> dict:
     out = {
         "slot_cos_mean": float(np.mean(off)),
         "slot_cos_max": float(np.max(off)),
-        "attn_max_share": float(max(p["attn_share"] for p in per_slot)),
-        "attn_dominance": _dominance(attn, obj),
-        "render_dominance": _dominance(alpha0, obj),
-        # On object pixels: on all pixels the background slots dominate.
+        "attn_obj_max_share": float(max(p["attn_share"] for p in per_slot[1:])),
+        "bg_on_objects": float(alpha0[0][obj].mean()) if obj.any() else float("nan"),
+        "attn_dominance": _dominance(attn[1:], obj),
+        "render_dominance": _dominance(alpha0[1:], obj),
+        # On object pixels: on all pixels the background slot dominates.
         "attn_render_ari": ari(attn_lab, rec["mask_idx"][0], mask=obj),
         "centre_min_dist": centre_min_dist,
         "per_slot": per_slot,
@@ -257,19 +259,24 @@ def verdicts(mean: dict) -> list[str]:
 
     if g("spread_min") < SPREAD_COLLAPSED:
         msgs.append(
-            "[init] some slot has all Gaussians at one point "
+            "[init] some object slot has all Gaussians at one point "
             f"(min spread {g('spread_min'):.3f}); check offset-bias / query-bias init."
         )
     if g("slot_cos_mean") > SLOT_COS_COLLAPSED:
         msgs.append(
-            f"[slot attention] slot latents nearly identical (mean cos "
+            f"[slot attention] object slot latents nearly identical (mean cos "
             f"{g('slot_cos_mean'):.3f}); slots never separate. Try soft position "
             "embedding + feature MLP, longer training / LR warmup."
         )
-    if g("attn_max_share") > SLOT_TAKES_ALL:
+    if g("attn_obj_max_share") > SLOT_TAKES_ALL:
         msgs.append(
-            f"[slot attention] one slot takes {g('attn_max_share'):.0%} of the "
-            "image; the decomposition has not started (check the aux2d loss)."
+            f"[slot attention] one object slot takes {g('attn_obj_max_share'):.0%} "
+            "of the image; it is drawing the background or several objects."
+        )
+    if g("bg_on_objects") > BG_ON_OBJECTS:
+        msgs.append(
+            f"[background] the background slot draws {g('bg_on_objects'):.0%} of "
+            "the object pixels; it is explaining objects."
         )
     attn_ok = g("attn_dominance") > DOMINANCE_GOOD or g("attn_fg_ari") > ARI_GOOD
     render_bad = (
@@ -282,7 +289,7 @@ def verdicts(mean: dict) -> list[str]:
             "attention's); their frames overlap (see centre_min_dist)."
             if redundant
             else "slots draw their own objects, but the render is soft or misplaced "
-            "(edges / thin parts lost to the background slots)."
+            "(edges / thin parts lost to the background slot)."
         )
         msgs.append(
             "[decoder] render segments worse than attention "
@@ -330,16 +337,14 @@ def verdicts(mean: dict) -> list[str]:
 # ----------------------------------------------------------------------------
 # 3. Visualise
 # ----------------------------------------------------------------------------
-def _colorize(labels: np.ndarray, background: np.ndarray | None = None) -> np.ndarray:
-    """Labels -> RGB. With a background colour, label 0 is the GT background
-    and label i is object i; without one, every label is a slot."""
+def _colorize(labels: np.ndarray, background=MASK_BG) -> np.ndarray:
+    """Labels -> RGB: 0 (background) dark gray, k -> PALETTE[(k - 1) % 8]."""
     out = np.empty(labels.shape + (3,), dtype=np.uint8)
-    shift = 1 if background is not None else 0
+    out[...] = background
     for k in np.unique(labels):
-        k = int(k)
-        out[labels == k] = (
-            background if k == 0 and shift else PALETTE[(k - shift) % len(PALETTE)]
-        )
+        if k == 0:
+            continue
+        out[labels == k] = PALETTE[(int(k) - 1) % len(PALETTE)]
     return out
 
 
@@ -350,14 +355,14 @@ def _rgb(chw: np.ndarray) -> np.ndarray:
 def _pca_rgb(feat: np.ndarray, rec: dict, size: tuple[int, int]) -> np.ndarray:
     """First 3 principal components of view-0 token features as RGB.
 
-    PCA is fitted on GT object tokens only (all tokens without GT), otherwise
-    the background, ~80% of the tokens, takes the main components; each
-    component is stretched over its 1-99% range on those tokens; the
-    background is dimmed.
+    PCA is fitted on object tokens only (GT, else the tokens the attention
+    gives to object slots), otherwise the background, ~80% of the tokens,
+    takes the main components; each component is stretched over its 1-99%
+    range on those tokens; the background is dimmed.
     """
     side = rec["attn"].shape[-1]
     labels = _token_labels(rec)
-    obj = (labels > 0).ravel() if labels is not None else np.ones(side * side, bool)
+    obj = (labels > 0 if labels is not None else rec["attn"][0] < 0.5).ravel()
     if obj.sum() < 3:
         obj = np.ones_like(obj)
     x = feat - feat[obj].mean(0)
@@ -422,11 +427,11 @@ def _txt(key: str, **fmt) -> str:
 
 
 def _slot_name(k: int) -> str:
-    return f"s{k}"
+    return "bg" if k == 0 else f"s{k}"
 
 
 def _slot_color(k: int) -> np.ndarray:
-    return PALETTE[k % len(PALETTE)]
+    return MASK_BG if k == 0 else PALETTE[(k - 1) % len(PALETTE)]
 
 
 def make_grid(
@@ -440,7 +445,7 @@ def make_grid(
     View 0  images: input, render, GT mask, render mask, attention mask,
             2D reconstruction and its slot mask, PCA of the encoder
             features and of the attention keys
-            slot attention per slot
+            slot attention per slot (bg = background slot)
             rendered weight per slot
     View 1  images: input, render, GT mask, render mask (novel view)
             rendered weight per slot
@@ -470,7 +475,7 @@ def make_grid(
         return [
             (_rgb(rec["target"][v]), _txt("image"), None),
             (_rgb(rec["rgb"][v]), _txt("render"), None),
-            (_colorize(gt[v], MASK_BG) if gt is not None else blank, _txt("gt"), None),
+            (_colorize(gt[v]) if gt is not None else blank, _txt("gt"), None),
             (_colorize(rec["mask_idx"][v]), _txt("mask"), None),
         ]
 
@@ -581,7 +586,7 @@ def make_grid(
 def summarize(per_scene: list[dict]) -> dict:
     keys = [k for k, v in per_scene[0].items() if isinstance(v, float)]
     mean = {k: float(np.nanmean([s[k] for s in per_scene])) for k in keys}
-    spreads = [p["spread"] for s in per_scene for p in s["per_slot"]]
+    spreads = [p["spread"] for s in per_scene for p in s["per_slot"][1:]]
     mean["spread_min"] = float(np.min(spreads))
     return mean
 
@@ -596,7 +601,7 @@ def _title(stats: dict) -> str:
         f"render v0 {fmt(g('render_fg_ari_view0'))}, "
         f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
         f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
-        f"largest slot {fmt(g('attn_max_share'))} | "
+        f"bg on objects {fmt(g('bg_on_objects'))} | "
         f"keys k-means FG-ARI {fmt(g('feat_key_fg_ari'))}"
     )
 
@@ -633,7 +638,8 @@ def diagnose(
     print(f"[diagnose] {len(per_scene)} scenes -> {out}")
     for key in (
         "slot_cos_mean",
-        "attn_max_share",
+        "attn_obj_max_share",
+        "bg_on_objects",
         "attn_dominance",
         "render_dominance",
         "feat_enc_fg_ari",

@@ -4,8 +4,9 @@ The head turns per-Gaussian features into the common output interface:
 
     mu / scale / quat / opacity / rgb
 
-Every slot is decoded the same way; there is no separate background model.
-Slot ids are 0..K-1.
+GSODModel uses two decoders with this head: one for the object slots and one
+for the background slot, which differ in their SlotFrame bounds. Slot ids
+here are local to the decoder, 0..K-1 over the slots it decodes.
 
 By default the first three values are absolute centres. An optional
 ``SlotFrame`` plugin interprets them as offsets inside a per-slot box in the
@@ -70,21 +71,18 @@ class SlotFrame(nn.Module):
 
     Everything is predicted from the slot latent alone: centre xy, softly
     bounded to [-fg_xy, fg_xy]; centre z in [fg_z[0], fg_z[1]]; extent in
-    [fg_extent[0], fg_extent[1]], log-uniform in
-    the predicted value and initialised at fg_extent_init. Gaussian centres:
-    centre + extent * tanh(offset).
+    [fg_extent[0], fg_extent[1]], log-uniform in the predicted value and
+    initialised at fg_extent_init. Gaussian centres: centre + extent *
+    tanh(offset).
 
-    Not tying the frame to anything else (e.g. the attention) means any slot
-    can put its Gaussians anywhere, so the rendering loss can move any slot
-    onto any object; where a slot is must be carried by its latent.
+    Not tying the frame to anything else (e.g. the attention) means the
+    rendering loss can move a slot onto any object within its bounds; where
+    a slot is must be carried by its latent.
 
-    The extent range spans an object (~0.1) up to the reach of the scene
-    (beyond the cameras), so the same slot model can draw a small object or
-    the background around the cameras; the log scale keeps the small end as
-    finely controllable as the large one.
-
-    Defaults match ``SceneGenConfig`` defaults; use ``from_scene_config`` to
-    derive them from a dataset's meta.json.
+    The bounds are the structural prior (uORF's locality): object frames are
+    object-sized and inside the placement area, so the floor and everything
+    far away can only be drawn by the background slot, whose frame spans the
+    scene out beyond the cameras (``from_scene_config(..., background=True)``).
     """
 
     def __init__(
@@ -94,7 +92,7 @@ class SlotFrame(nn.Module):
         *,
         fg_xy: float = 2.1,
         fg_z: tuple[float, float] = (0.0, 0.8),
-        fg_extent: tuple[float, float] = (0.1, 20.0),
+        fg_extent: tuple[float, float] = (0.1, 0.75),
         fg_extent_init: float = 0.5,
     ):
         super().__init__()
@@ -115,21 +113,31 @@ class SlotFrame(nn.Module):
             )
 
     @classmethod
-    def from_scene_config(cls, z_dim: int, gen: dict, **kwargs) -> "SlotFrame":
-        """Priors from a SceneGenConfig dict (meta.json["config"])."""
+    def from_scene_config(
+        cls, z_dim: int, gen: dict, background: bool = False, **kwargs
+    ) -> "SlotFrame":
+        """Priors from a SceneGenConfig dict (meta.json["config"]).
+
+        Object frames: up to an object's size (tanh rarely reaches 1, so the
+        extent must exceed the half size). Background frame: from the scene's
+        size out beyond the farthest camera, so it can surround every view.
+        """
         r_max = float(gen["radius_range"][1])
-        place = float(gen["placement_radius"])
+        fg_xy = float(gen["placement_radius"]) + 0.3
         floor_z = float(gen.get("floor_z", 0.0))
-        # Beyond the farthest camera, so a slot can surround every view.
-        reach = 3.0 * (
-            float(gen["distance_range"][1]) + float(gen.get("target_height", 0.4))
-        )
+        if background:
+            reach = 3.0 * (
+                float(gen["distance_range"][1]) + float(gen.get("target_height", 0.4))
+            )
+            extent, extent_init = (fg_xy, reach), math.sqrt(fg_xy * reach)
+        else:
+            extent, extent_init = (0.1, 1.35 * r_max), min(0.5, 1.2 * r_max)
         return cls(
             z_dim,
-            fg_xy=place + 0.3,
+            fg_xy=fg_xy,
             fg_z=(floor_z, floor_z + r_max + 0.25),
-            fg_extent=(0.1, reach),
-            fg_extent_init=min(0.5, 1.2 * r_max),
+            fg_extent=extent,
+            fg_extent_init=extent_init,
             **kwargs,
         )
 

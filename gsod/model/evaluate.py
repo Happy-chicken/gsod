@@ -23,8 +23,7 @@ from gsod.model.gsod import GSODModel
 from gsod.utils.metrics import SquaredError, ari, fg_ari, upsample_labels
 from gsod.utils.png import save_png
 
-# GT masks show the background (label 0) dark gray, object i palette[i - 1];
-# predicted masks give slot k palette[k % len(palette)] (no slot is special).
+# Masks show label / slot 0 (background) dark gray, k >= 1 palette[k - 1].
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
 PALETTE = np.array(
     [
@@ -143,7 +142,8 @@ def render_scenes(
 
     Per view:
       view{v}_target.png / view{v}_render.png
-      view{v}_mask.png      slot partition (argmax slot per pixel)
+      view{v}_mask.png      slot partition (argmax slot per pixel; background
+                            slot dark gray)
       view{v}_gt_mask.png   ground truth (if the loader provides masks)
       view{v}_slot{k}.png   alpha of slot k, grayscale (white = 1)
     Per scene:
@@ -166,7 +166,7 @@ def render_scenes(
             if gt is not None:
                 save_png(
                     scene_dir / f"view{v}_gt_mask.png",
-                    _colorize(gt[v].cpu().numpy().astype(np.int64), MASK_BG),
+                    _colorize(gt[v].cpu().numpy().astype(np.int64)),
                 )
             for k in range(alpha.shape[1]):
                 gray = (alpha[v, k].clamp(0.0, 1.0) * 255.0 + 0.5).cpu().numpy()
@@ -181,14 +181,12 @@ def _to_uint8(chw: torch.Tensor) -> np.ndarray:
     return (hwc * 255.0 + 0.5).astype(np.uint8)
 
 
-def _colorize(labels: np.ndarray, background: np.ndarray | None = None) -> np.ndarray:
-    """Labels -> RGB. With a background colour, label 0 is the GT background
-    and label i is object i; without one, every label is a slot."""
+def _colorize(labels: np.ndarray, background=MASK_BG) -> np.ndarray:
+    """Labels -> RGB: 0 (background) dark gray, k -> PALETTE[(k - 1) % 8]."""
     out = np.empty(labels.shape + (3,), dtype=np.uint8)
-    shift = 1 if background is not None else 0
+    out[...] = background
     for k in np.unique(labels):
-        k = int(k)
-        out[labels == k] = (
-            background if k == 0 and shift else PALETTE[(k - shift) % len(PALETTE)]
-        )
+        if k == 0:
+            continue
+        out[labels == k] = PALETTE[(int(k) - 1) % len(PALETTE)]
     return out

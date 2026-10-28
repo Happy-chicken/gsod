@@ -48,6 +48,7 @@ def build_model(
         num_slots=cfg.num_slots,
         attn_iter=cfg.attn_iter,
         gaussians_per_slot=cfg.gaussians_per_slot,
+        bg_gaussians_per_slot=cfg.bg_gaussians_per_slot,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         aux2d_size=cfg.aux2d_size,
         focal_ratio=tuple(meta["focal_ratio"]),
