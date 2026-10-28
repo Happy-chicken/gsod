@@ -3,7 +3,7 @@
     total = l1    * L1(render, image)               novel views 1..V-1
           + ssim  * (1 - SSIM(render, image))       novel views 1..V-1
           + view0 * L1(render, image)               view 0 (the encoded view)
-          + aux2d * L1(2D recon, image)             each encoded view
+          + aux2d * L1(2D recon, image)             view 0
 
 Every term reaches every module that produced it (end to end); the 3D and
 the 2D reconstruction share the encoder and the slot attention.
@@ -14,8 +14,8 @@ the 2D reconstruction share the encoder and the slot attention.
     decomposition that is consistent across views.
 
 aux2d -- "the slots reconstruct their image in 2D"
-    The spatial broadcast decoder's reconstruction of each encoded view from
-    that view's K slots, against the image area-downsampled to its size. K
+    The spatial broadcast decoder's reconstruction of view 0 from its K
+    slots, against the image area-downsampled to its size. K
     slots of equal capacity: drawing one part each costs less than one slot
     drawing everything, which is what makes slot attention decompose a scene
     (Slot Attention). L1 like the 3D term, so both send gradients of the
@@ -90,9 +90,8 @@ class GSODLoss(nn.Module):
             terms["view0"] = F.l1_loss(outputs["rgb"][:1], images[:1])
             weights["view0"] = cfg.view0
         if cfg.aux2d > 0:
-            aux = outputs["aux_rgb"]  # (E, 3, a, a), views 0..E-1
-            side = aux.shape[-1]
-            target2d = F.interpolate(images[: aux.shape[0]], size=side, mode="area")
+            aux = outputs["aux_rgb"]  # (1, 3, a, a), view 0
+            target2d = F.interpolate(images[:1], size=aux.shape[-1], mode="area")
             terms["aux2d"] = F.l1_loss(aux, target2d)
             weights["aux2d"] = cfg.aux2d
 

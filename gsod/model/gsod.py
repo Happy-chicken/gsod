@@ -1,9 +1,9 @@
 """Slot model: encoder -> slot attention -> Gaussian decoder -> splatting.
 
-encoded views -> Encoder -> tokens -> SlotAttention -> K slots per view
-    each encoded view's slots -> 2D spatial broadcast decoder (training signal)
-    view 0's slots            -> Gaussian decoder -> Gaussians (view-0 azimuth
-                                 frame -> world) -> splatting into every view
+views[0] -> Encoder -> tokens -> SlotAttention -> K slots
+    slots -> 2D spatial broadcast decoder -> view 0 in 2D (training signal)
+    slots -> Gaussian decoder -> Gaussians (view-0 azimuth frame -> world)
+          -> splatting into every view
 
 All K slots are interchangeable: there is no background slot, background
 model or foreground target. Which slots draw the background (one or several)
@@ -11,11 +11,7 @@ is decided by the slot competition, driven by reconstruction alone (2D and
 multi-view 3D). FG-ARI ignores the GT background, so it does not matter how
 the background is split.
 
-In training the first aux2d_views views are encoded, each on its own, and
-the 2D decoder reconstructs each from its own slots (1 = view 0 only, the
-encoder then sees exactly what it sees at inference; more views give the
-decomposition more images per scene). The 3D model only uses view 0's
-slots, and inference encodes view 0 only.
+Only views[0] is encoded, in training as at inference.
 
 Training objective: reconstruction only (losses.py). Every gradient reaches
 every module; the 2D and the 3D reconstruction share the encoder and the
@@ -119,7 +115,6 @@ class GSODModel(nn.Module):
         gaussians_per_slot: int = 512,
         decoder_hidden_dim: int = 128,
         aux2d_size: int = 64,
-        aux2d_views: int = 1,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
         scene_config: dict | None = None,
@@ -127,8 +122,7 @@ class GSODModel(nn.Module):
         decoder_cls: type[nn.Module] = AttentionDecoder,
     ):
         """num_slots: K, all interchangeable.
-        aux2d_size: side of the 2D reconstruction of each encoded view.
-        aux2d_views: views encoded in training (view 0 first).
+        aux2d_size: side of the 2D reconstruction of view 0.
         scene_config: the SceneGenConfig dict from meta.json; sets the frame
         priors (scene size and reach).
         decoder_cls: Gaussian decoder class (AttentionDecoder, SharedMLPDecoder,
@@ -148,8 +142,6 @@ class GSODModel(nn.Module):
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
         self.aux_decoder = SpatialBroadcastDecoder(z_dim, size=aux2d_size)
-        assert aux2d_views >= 1, "view 0 must be encoded"
-        self.aux2d_views = aux2d_views
         frame = (
             SlotFrame.from_scene_config(z_dim, scene_config)
             if scene_config is not None
@@ -185,12 +177,10 @@ class GSODModel(nn.Module):
         self, images: torch.Tensor, cam2world: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
-        Training encodes views[:aux2d_views] (for the 2D reconstruction);
-        evaluation encodes views[0] only. The 3D model uses views[0]'s slots."""
-        encoded = images[: self.aux2d_views] if self.training else images[0:1]
-        slots_all, attn_all = self.slot_attention(self.encode(encoded))
-        aux_rgb, aux_alpha = self.aux_decoder(slots_all)
-        slots, attn = slots_all[0], attn_all[0]  # (K, C), (K, s*s)
+        Only views[0] is encoded."""
+        slots, attn = self.slot_attention(self.encode(images[0:1]))
+        aux_rgb, aux_alpha = self.aux_decoder(slots)
+        slots, attn = slots[0], attn[0]  # (K, C), (K, s*s)
 
         # Gaussians (view-0 azimuth frame).
         gaussians, slot_probs = self.decoder(slots)
@@ -223,6 +213,6 @@ class GSODModel(nn.Module):
             "slot_ids": slot_probs.argmax(-1),  # (M,) slot of each Gaussian
             "gaussians": gaussians,  # world frame
             "frame_centre": frame_centre,  # (K, 3) frames, view-0 azimuth frame
-            "aux_rgb": aux_rgb,  # (E, 3, a, a) 2D recon of the E encoded views
-            "aux_alpha": aux_alpha,  # (E, K, a, a)
+            "aux_rgb": aux_rgb,  # (1, 3, a, a) 2D reconstruction of view 0
+            "aux_alpha": aux_alpha,  # (1, K, a, a)
         }

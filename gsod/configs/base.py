@@ -30,24 +30,19 @@ class BaseConfig:
     gaussians_per_slot: int = 512
     # Hidden width of the decoder (MLP width, or attention width d_model).
     decoder_hidden_dim: int = 128
-    # Side of the 2D reconstruction of each encoded view (model/aux_decoder.py).
+    # Side of the 2D reconstruction of view 0 (model/aux_decoder.py).
     aux2d_size: int = 64
-    # Views encoded in training for the 2D reconstruction (view 0 first);
-    # 1 = the encoder sees one image, as at inference.
-    aux2d_views: int = 1
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
 
     # --- optimisation ----------------------------------------------------------
-    # Number of optimisation steps (scenes_per_step scenes each).
+    # Number of optimisation steps; each step trains on one scene.
     steps: int = 10_000
     # Adam learning rate: linear warm-up over lr_warmup_steps, then halved
     # every lr_half_life steps (Slot Attention's schedule).
     lr: float = 3e-4
     lr_warmup_steps: int = 5_000
     lr_half_life: int = 100_000
-    # Scenes whose gradients are accumulated per optimisation step.
-    scenes_per_step: int = 1
     # Gradient-norm clipping (0 = off).
     grad_clip: float = 1.0
     # Seed for torch, scene/view sampling, and model initialisation.
