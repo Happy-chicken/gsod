@@ -32,6 +32,9 @@ class BaseConfig:
     decoder_hidden_dim: int = 128
     # Side of the 2D reconstruction of each encoded view (model/aux_decoder.py).
     aux2d_size: int = 64
+    # Views encoded in training for the 2D reconstruction (view 0 first);
+    # 1 = the encoder sees one image, as at inference.
+    aux2d_views: int = 1
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
 
@@ -44,7 +47,7 @@ class BaseConfig:
     lr_warmup_steps: int = 5_000
     lr_half_life: int = 100_000
     # Scenes whose gradients are accumulated per optimisation step.
-    scenes_per_step: int = 4
+    scenes_per_step: int = 1
     # Gradient-norm clipping (0 = off).
     grad_clip: float = 1.0
     # Seed for torch, scene/view sampling, and model initialisation.

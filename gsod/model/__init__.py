@@ -50,6 +50,7 @@ def build_model(
         gaussians_per_slot=cfg.gaussians_per_slot,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         aux2d_size=cfg.aux2d_size,
+        aux2d_views=cfg.aux2d_views,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
         # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none

@@ -3,7 +3,7 @@
     total = l1    * L1(render, image)               novel views 1..V-1
           + ssim  * (1 - SSIM(render, image))       novel views 1..V-1
           + view0 * L1(render, image)               view 0 (the encoded view)
-          + aux2d * L1(2D recon, image)             every encoded view
+          + aux2d * L1(2D recon, image)             each encoded view
 
 Every term reaches every module that produced it (end to end); the 3D and
 the 2D reconstruction share the encoder and the slot attention.

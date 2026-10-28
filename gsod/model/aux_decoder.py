@@ -9,7 +9,7 @@ alpha-weighted sum of the colours.
 Reconstructing the image through K slots of equal capacity is what makes
 slot attention decompose a scene without any target: one slot drawing the
 whole image costs more error than several slots drawing one part each.
-GSODModel applies it to every encoded view; the 3D model does not read it.
+GSODModel applies it to each encoded view; the 3D model does not read it.
 """
 
 from __future__ import annotations

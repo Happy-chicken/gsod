@@ -165,6 +165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--scenes-per-step", type=int, default=None)
+    parser.add_argument("--aux2d-views", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
@@ -194,6 +195,7 @@ def main() -> None:
         "steps",
         "lr",
         "scenes_per_step",
+        "aux2d_views",
         "seed",
         "num_workers",
         "eval_every",
