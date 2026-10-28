@@ -15,6 +15,11 @@ Examples
 
     # untrained model: checks the initialisation only
     python scripts/run_diagnose.py --init
+
+    # a discovery-phase checkpoint as it was trained (position prior on,
+    # widened frames); the opacity floor is training-only and stays off
+    python scripts/run_diagnose.py --dataset clevr567 --suffix iter_5000 \
+        --anchor-weight 0
 """
 
 from __future__ import annotations
@@ -58,6 +63,12 @@ def main() -> None:
     parser.add_argument("--n-scenes", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--anchor-weight",
+        type=float,
+        default=1.0,
+        help="discovery schedule to diagnose at: 0 = discovery phase, 1 = trained",
+    )
     args = parser.parse_args()
 
     cfg = config_for(args.dataset)
@@ -89,7 +100,10 @@ def main() -> None:
                     f"[warn] {name}: missing {status.missing_keys}, "
                     f"unexpected {status.unexpected_keys}"
                 )
-        out = Path(args.out or Path(ckpt) / "diagnose")
+        name = "diagnose"
+        if args.anchor_weight < 1.0:
+            name += f"_anchor{args.anchor_weight:g}"
+        out = Path(args.out or Path(ckpt) / name)
 
     dataset = make_dataset(
         data_root,
@@ -104,7 +118,11 @@ def main() -> None:
     )
     if cfg.dataset_mode == "primordia":
         dataset = WithGTMasks(dataset, data_root)
-    print(f"{args.dataset} {split} split: {data_root} ({len(dataset)} scenes)")
+    model.anchor_weight = args.anchor_weight
+    print(
+        f"{args.dataset} {split} split: {data_root} ({len(dataset)} scenes), "
+        f"anchor weight {args.anchor_weight:g}"
+    )
     diagnose(model, dataset, device, out, n_scenes=args.n_scenes, seed=args.seed)
 
 
