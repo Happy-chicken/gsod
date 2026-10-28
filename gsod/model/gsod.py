@@ -16,14 +16,18 @@ reconstructs each from its own slots (4 images of decomposition signal per
 scene instead of 1). The 3D model only uses view 0's slots, and inference
 encodes view 0 only.
 
+Training objective: reconstruction only (losses.py). Every gradient reaches
+every module; the 2D and the 3D reconstruction share the encoder and the
+slot attention.
+
 Frames
 ------
 Only views[0] is decoded into 3D and the camera azimuth is uniform over 360
 deg, so the image alone does not say where things are in *world* xy.
 Gaussians are therefore predicted in the azimuth frame of view 0 (yaw-rotated
-so view 0 looks along +x; uORF's nss2cam0), centred on the ray through each
-slot's attention centroid, and rotated into the world before splatting.
-Cameras are never modified.
+so view 0 looks along +x; uORF's nss2cam0), each slot's frame from its latent
+alone (SlotFrame), and rotated into the world before splatting. Cameras are
+never modified.
 
 Everything that is rendered comes from Gaussians: there is no constant colour
 fill; a pixel no Gaussian covers renders black.
@@ -102,45 +106,6 @@ def yaw_to_world(
     }
 
 
-def attention_rays(
-    attn: torch.Tensor,
-    cam2world0: torch.Tensor,
-    image_size: tuple[int, int],
-    focal_ratio: tuple[float, float],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Ray of view 0 through each slot's attention centroid.
-
-    attn: (K, s*s) view-0 slot attention.
-    Returns (origin (3,), directions (K, 3)) in the view-0 azimuth frame,
-    differentiable in attn. The azimuth frame is a rotation about +z, so
-    heights are world heights; SlotFrame intersects each ray with the height
-    it predicts for that slot.
-    """
-    side = int(round(attn.shape[1] ** 0.5))
-    h, w = image_size
-    weights = attn / attn.sum(dim=-1, keepdim=True)
-    idx = torch.arange(side, device=attn.device, dtype=attn.dtype)
-    # Token centres in image pixel coordinates (pixel centres at integers,
-    # matching the dataset; F.interpolate with align_corners=False).
-    u = (idx + 0.5) * w / side - 0.5
-    v = (idx + 0.5) * h / side - 0.5
-    vv, uu = torch.meshgrid(v, u, indexing="ij")
-    u_bar = (weights * uu.reshape(-1)).sum(-1)
-    v_bar = (weights * vv.reshape(-1)).sum(-1)
-
-    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
-    cx, cy = (w - 1.0) / 2.0, (h - 1.0) / 2.0
-    d_cam = torch.stack(
-        [(u_bar - cx) / fx, (v_bar - cy) / fy, torch.ones_like(u_bar)], -1
-    )
-    c2w = cam2world0.to(attn.dtype)
-    to_azimuth = _yaw_matrix(-view_yaw(cam2world0)).to(attn.dtype)
-    # World ray o + t * R d_cam, rotated into the azimuth frame.
-    origin = to_azimuth @ c2w[:3, 3]
-    directions = d_cam @ (to_azimuth @ c2w[:3, :3]).T
-    return origin, directions
-
-
 class GSODModel(nn.Module):
     def __init__(
         self,
@@ -157,7 +122,6 @@ class GSODModel(nn.Module):
         near: float = 0.1,
         scene_config: dict | None = None,
         canonical_azimuth: bool = True,
-        anchor_frames: bool = True,
         decoder_cls: type[nn.Module] = AttentionDecoder,
     ):
         """num_slots: K, all interchangeable.
@@ -175,9 +139,6 @@ class GSODModel(nn.Module):
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
         self.canonical_azimuth = bool(canonical_azimuth)
-        # Frame centres follow the slot-attention centroids (requires
-        # canonical_azimuth, as the rays are in that frame).
-        self.anchor_frames = bool(anchor_frames) and self.canonical_azimuth
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -226,21 +187,13 @@ class GSODModel(nn.Module):
         aux_rgb, aux_alpha = self.aux_decoder(slots_all)
         slots, attn = slots_all[0], attn_all[0]  # (K, C), (K, s*s)
 
-        # Gaussians (view-0 azimuth frame), with attention-anchored frames.
+        # Gaussians (view-0 azimuth frame).
+        gaussians, slot_probs = self.decoder(slots)
         frame = getattr(getattr(self.decoder, "head", None), "frame", None)
-        if frame is not None and self.anchor_frames:
-            frame.ray = attention_rays(
-                attn, cam2world[0], self.image_size, self.focal_ratio
-            )
         frame_centre = None
-        try:
-            gaussians, slot_probs = self.decoder(slots)
-            if frame is not None:
-                with torch.no_grad():  # frames actually used, for diagnostics
-                    frame_centre = frame(slots)[0]
-        finally:
-            if frame is not None:
-                frame.ray = None
+        if frame is not None:
+            with torch.no_grad():  # for diagnostics
+                frame_centre = frame(slots)[0]
         if self.canonical_azimuth:
             gaussians = yaw_to_world(gaussians, view_yaw(cam2world[0]))
 

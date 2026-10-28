@@ -1,28 +1,25 @@
-"""Training losses: reconstruction only, no masks or foreground targets.
+"""Training loss: one reconstruction objective, no masks or targets.
 
-    total = l1          * L1(render, image)               novel views 1..V-1
-          + ssim        * (1 - SSIM(render, image))       novel views 1..V-1
-          + view0       * L1(render, image)               view 0 (the encoded view)
-          + aux2d       * MSE(2D recon, image)            every encoded view
-          + render_attn * CE(render split | attention)    view 0
+    total = l1    * L1(render, image)               novel views 1..V-1
+          + ssim  * (1 - SSIM(render, image))       novel views 1..V-1
+          + view0 * L1(render, image)               view 0 (the encoded view)
+          + aux2d * L1(2D recon, image)             every encoded view
+
+Every term reaches every module that produced it (end to end); the 3D and
+the 2D reconstruction share the encoder and the slot attention.
+
+3D reconstruction (L1, SSIM)
+    L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
+    a structure term, as in 3DGS. The novel views carry the 3D signal: a
+    decomposition that is consistent across views.
 
 aux2d -- "the slots reconstruct their image in 2D"
     The spatial broadcast decoder's reconstruction of each encoded view from
-    that view's K slots, against the image area-downsampled to its size; MSE,
-    as in Slot Attention. This is what makes the slot attention decompose the
-    scene: K slots of equal capacity, so drawing one part each costs less
-    than one slot drawing everything.
-
-Reconstruction (L1, SSIM)
-    L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
-    a structure term, as in 3DGS. The novel views carry the 3D signal.
-
-render_attn -- "each slot draws what it attends to"
-    Per token of view 0, the rendered split among the slots should follow the
-    slot attention (attention detached, so only the 3D decoder learns).
-    Removes renders where several slots redraw one thing, and keeps the 3D
-    partition aligned with the 2D one. A small epsilon in the normalisation
-    keeps uncovered tokens at a uniform split with a usable gradient.
+    that view's K slots, against the image area-downsampled to its size. K
+    slots of equal capacity: drawing one part each costs less than one slot
+    drawing everything, which is what makes slot attention decompose a scene
+    (Slot Attention). L1 like the 3D term, so both send gradients of the
+    same size into the shared modules and neither drowns the other.
 """
 
 from __future__ import annotations
@@ -72,16 +69,6 @@ def _to_tokens(maps: torch.Tensor, side: int) -> torch.Tensor:
     return F.interpolate(maps[None], size=(side, side), mode="area")[0]
 
 
-def render_attn_loss(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
-    """render_attn: view-0 rendered slot split follows the slot attention."""
-    attn = outputs["attn"].detach()  # (K, s*s)
-    side = int(round(attn.shape[1] ** 0.5))
-    attn = attn / attn.sum(0, keepdim=True)
-    alpha = _to_tokens(outputs["slot_alpha"][0], side).flatten(1) + _EPS
-    render = alpha / alpha.sum(0, keepdim=True)
-    return -(attn * torch.log(render)).sum(0).mean()
-
-
 class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
@@ -106,11 +93,8 @@ class GSODLoss(nn.Module):
             aux = outputs["aux_rgb"]  # (E, 3, a, a), views 0..E-1
             side = aux.shape[-1]
             target2d = F.interpolate(images[: aux.shape[0]], size=side, mode="area")
-            terms["aux2d"] = F.mse_loss(aux, target2d)
+            terms["aux2d"] = F.l1_loss(aux, target2d)
             weights["aux2d"] = cfg.aux2d
-        if cfg.render_attn > 0:
-            terms["render_attn"] = render_attn_loss(outputs)
-            weights["render_attn"] = cfg.render_attn
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

@@ -279,7 +279,7 @@ def verdicts(mean: dict) -> list[str]:
         redundant = g("attn_dominance") - g("render_dominance") > 0.1
         cause = (
             "several slots redraw the same object (render dominance well below "
-            "attention's); raise the render_attn loss."
+            "attention's); their frames overlap (see centre_min_dist)."
             if redundant
             else "slots draw their own objects, but the render is soft or misplaced "
             "(edges / thin parts lost to the background slots)."

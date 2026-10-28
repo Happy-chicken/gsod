@@ -68,14 +68,15 @@ def _logit(p: float) -> float:
 class SlotFrame(nn.Module):
     """slot latent -> (centre, extent), bounded by dataset priors.
 
-    centre z in [fg_z[0], fg_z[1]] is predicted first. With a ray per slot
-    (``self.ray``, set by GSODModel from the attention centroid), centre xy is
-    where that ray reaches height z, plus a learned residual of at most
-    anchor_residual; so the centre stays on the line of sight of what the slot
-    attends to, whatever height is predicted. centre xy is softly bounded to
-    [-fg_xy, fg_xy]. extent in [fg_extent[0], fg_extent[1]], log-uniform in
+    Everything is predicted from the slot latent alone: centre xy, softly
+    bounded to [-fg_xy, fg_xy]; centre z in [fg_z[0], fg_z[1]]; extent in
+    [fg_extent[0], fg_extent[1]], log-uniform in
     the predicted value and initialised at fg_extent_init. Gaussian centres:
     centre + extent * tanh(offset).
+
+    Not tying the frame to anything else (e.g. the attention) means any slot
+    can put its Gaussians anywhere, so the rendering loss can move any slot
+    onto any object; where a slot is must be carried by its latent.
 
     The extent range spans an object (~0.1) up to the reach of the scene
     (beyond the cameras), so the same slot model can draw a small object or
@@ -95,16 +96,8 @@ class SlotFrame(nn.Module):
         fg_z: tuple[float, float] = (0.0, 0.8),
         fg_extent: tuple[float, float] = (0.1, 20.0),
         fg_extent_init: float = 0.5,
-        anchor_residual: float = 0.5,
     ):
         super().__init__()
-        # How far the learned residual may move a frame centre in xy away
-        # from the point where the slot's ray reaches the predicted height.
-        self.anchor_residual = float(anchor_residual)
-        # Set by GSODModel for the current forward pass: rays through the
-        # attention centroids in the view-0 azimuth frame, (origin (3,),
-        # directions (K, 3)); None falls back to free centres.
-        self.ray: tuple[torch.Tensor, torch.Tensor] | None = None
         self.fg_xy = float(fg_xy)
         self.fg_z = (float(fg_z[0]), float(fg_z[1]))
         self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
@@ -145,21 +138,7 @@ class SlotFrame(nn.Module):
         out = self.fg(slots)
         z_lo, z_hi = self.fg_z
         z = z_lo + (z_hi - z_lo) * torch.sigmoid(out[:, 2:3])
-        if self.ray is not None:
-            # Centre = where the attention-centroid ray reaches height z, plus
-            # a bounded residual. Slots attending to different objects get
-            # different frames; the rendering loss reaches the attention maps
-            # through the ray and the predicted height through t.
-            origin, direction = self.ray
-            # Rays at or above the horizon never come down to z; keep them
-            # finite (the xy bound below then clamps the result).
-            dz = direction[:, 2:3].clamp(max=-1e-2)
-            t = ((z - origin[2]) / dz).clamp(min=0.0)
-            xy = origin[0:2] + t * direction[:, 0:2]
-            xy = xy + self.anchor_residual * torch.tanh(out[:, 0:2])
-        else:
-            xy = out[:, 0:2]
-        xy = self.fg_xy * torch.tanh(xy / self.fg_xy)
+        xy = self.fg_xy * torch.tanh(out[:, 0:2] / self.fg_xy)
         log_lo, log_hi = math.log(self.fg_extent[0]), math.log(self.fg_extent[1])
         extent = torch.exp(log_lo + (log_hi - log_lo) * torch.sigmoid(out[:, 3:6]))
         return torch.cat([xy, z], dim=-1), extent

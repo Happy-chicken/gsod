@@ -36,10 +36,17 @@ class BaseConfig:
     near: float = 0.1
 
     # --- optimisation ----------------------------------------------------------
-    # Number of optimisation steps; each step trains on one scene.
+    # Number of optimisation steps (scenes_per_step scenes each).
     steps: int = 10_000
-    # Adam learning rate.
+    # Adam learning rate: linear warm-up over lr_warmup_steps, then halved
+    # every lr_half_life steps (Slot Attention's schedule).
     lr: float = 3e-4
+    lr_warmup_steps: int = 5_000
+    lr_half_life: int = 100_000
+    # Scenes whose gradients are accumulated per optimisation step.
+    scenes_per_step: int = 4
+    # Gradient-norm clipping (0 = off).
+    grad_clip: float = 1.0
     # Seed for torch, scene/view sampling, and model initialisation.
     seed: int = 0
     # Print a training log line every N steps.

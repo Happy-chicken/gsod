@@ -39,7 +39,7 @@ def train(
     *,
     resume: str | None = None,
 ) -> None:
-    """Train one scene per step and render the views the encoder did not see."""
+    """Train on scenes_per_step scenes per step; the losses render every view."""
     out = Path(cfg.out_dir)
     dataset_kwargs = dict(
         dataset_mode=cfg.dataset_mode,
@@ -86,20 +86,24 @@ def train(
     last_step = start_step
     for step in range(start_step + 1, cfg.steps + 1):
         last_step = step
-        item = next(batches)
-        images, cams = item["images"], item["cam2world"]
-        ref = rng.randrange(images.shape[0])
-        order = [ref] + [i for i in range(images.shape[0]) if i != ref]
-        images, cams = images[order].to(device), cams[order].to(device)
-
-        out_dict = model(images, cams)
-        loss, terms = criterion(out_dict, images)
-
+        for group in opt.param_groups:
+            group["lr"] = _learning_rate(cfg, step)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        # Accumulate the gradients of scenes_per_step scenes.
+        for _ in range(cfg.scenes_per_step):
+            item = next(batches)
+            images, cams = item["images"], item["cam2world"]
+            ref = rng.randrange(images.shape[0])
+            order = [ref] + [i for i in range(images.shape[0]) if i != ref]
+            images, cams = images[order].to(device), cams[order].to(device)
+
+            loss, terms = criterion(model(images, cams), images)
+            (loss / cfg.scenes_per_step).backward()
+            for name, value in terms.items():
+                running[name] = running.get(name, 0.0) + value / cfg.scenes_per_step
+        if cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
-        for name, value in terms.items():
-            running[name] = running.get(name, 0.0) + value
 
         if step % cfg.log_every == 0:
             parts = " ".join(f"{k} {v / cfg.log_every:.4f}" for k, v in running.items())
@@ -122,6 +126,12 @@ def train(
 
     _save(out, "latest", model, opt, last_step, best_psnr)
     print(f"done, wrote {out}/latest_*.pth")
+
+
+def _learning_rate(cfg: BaseConfig, step: int) -> float:
+    """Linear warm-up to cfg.lr, then halved every cfg.lr_half_life steps."""
+    warmup = min(1.0, step / max(1, cfg.lr_warmup_steps))
+    return cfg.lr * warmup * 0.5 ** (step / cfg.lr_half_life)
 
 
 def _forever(loader: DataLoader):
@@ -154,6 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default=None, help="checkpoint directory")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--scenes-per-step", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
@@ -182,6 +193,7 @@ def main() -> None:
     fields = [
         "steps",
         "lr",
+        "scenes_per_step",
         "seed",
         "num_workers",
         "eval_every",
