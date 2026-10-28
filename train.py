@@ -92,7 +92,7 @@ def train(
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order].to(device), cams[order].to(device)
 
-        # Discovery schedule: 0 while the frames tile the scene, then up to 1.
+        # Discovery schedule: 0 while the position prior is on, then up to 1.
         anchor = min(
             1.0,
             max(0.0, (step - cfg.discovery_steps) / max(1, cfg.anchor_blend_steps)),

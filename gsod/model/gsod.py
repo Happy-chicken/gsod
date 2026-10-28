@@ -22,13 +22,14 @@ modified.
 Discovery
 ---------
 No foreground target is given. Early in training (``anchor_weight`` < 1, set
-by train.py) object frames are not anchored to the attention but spread
-over the scene from per-slot position priors (SlotFrame), and object
-Gaussians get an opacity floor (``opacity_floor``): the multi-view
-reconstruction then pulls them onto the objects, and the attention learns
-from the rendered slot partition (losses.py). Then the frames move over to
-the attention anchors. ``anchor_weight`` = 1 and no floor is the trained
-model.
+by train.py) each object slot's attention is biased towards its own part of
+the image (SlotAttention's position prior, weight 1 - anchor_weight), its
+frame on the ray through that part is widened (SlotFrame), and object
+Gaussians get an opacity floor (``opacity_floor``). A slot therefore sees
+the content of its part of the image and draws it there; the multi-view
+reconstruction pulls its Gaussians onto the objects, and the attention
+learns from the rendered slot partition (losses.py) while the bias fades.
+``anchor_weight`` = 1 and no floor is the trained model.
 
 Everything that is rendered comes from Gaussians: there is no constant colour
 fill; a pixel no Gaussian covers renders black.
@@ -243,7 +244,9 @@ class GSODModel(nn.Module):
         """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
         Only views[0] is encoded."""
         tokens = self.encode(images)
-        obj_slots, attn = self.slot_attention(tokens)
+        obj_slots, attn = self.slot_attention(
+            tokens, position_weight=1.0 - self.anchor_weight
+        )
         obj_slots, attn = obj_slots.squeeze(0), attn.squeeze(0)  # (K-1, C), (K, N)
 
         # Object Gaussians (view-0 azimuth frame), with attention-anchored frames.

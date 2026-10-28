@@ -7,9 +7,10 @@
           + fg_render   * CE(render_fg | attn_fg) * w     view 0, w = anchor weight
           + spread      * hinge(MIN_SPREAD - std(offset)) object Gaussians
 
-Discovery (see gsod.py / SlotFrame): at first the object frames ignore the
-attention and tile the scene, so every object pixel is within reach of some
-object slot. The background shell is the same in every scene, so it cannot
+Discovery (see gsod.py): at first each object slot's attention is biased
+towards its own part of the image and its Gaussians sit, in a widened frame,
+on the ray through that part, so every object pixel is seen and within reach
+of some object slot. The background shell is the same in every scene, so it cannot
 draw the objects: the multi-view reconstruction moves object Gaussians onto
 the objects and fades them where the shell already fits, and the rendered
 slot partition becomes a background/object segmentation without any target.

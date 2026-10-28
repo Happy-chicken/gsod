@@ -66,14 +66,6 @@ def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
 
 
-def _sunflower(n: int, radius: float) -> torch.Tensor:
-    """(n, 2) points spread evenly over a disc of the given radius."""
-    i = torch.arange(n, dtype=torch.float32) + 0.5
-    r = radius * torch.sqrt(i / n)
-    theta = math.pi * (3.0 - math.sqrt(5.0)) * i
-    return torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
-
-
 class SlotFrame(nn.Module):
     """object-slot latent -> (centre, extent), bounded by dataset priors.
 
@@ -86,15 +78,12 @@ class SlotFrame(nn.Module):
     fg_extent_init. Gaussian centres: centre + extent * tanh(offset).
 
     Discovery (``self.anchor_weight`` < 1, set by GSODModel): early in
-    training the attention does not know the objects yet, so frames anchored
-    to it never reach them. Every slot then also has a free frame: centred
-    at its own learned position prior (spread over the scene at init, so the
-    slots start in different places and differ even when their latents do
-    not) plus a residual of at most one discovery region, with an extent of
-    one region (fg_xy / sqrt(K) in xy, so the slots tile the scene). The frame
-    used is (1 - w) * free + w * anchored, w = anchor_weight: at w = 0 every
-    object pixel is within reach of some slot, and the multi-view
-    reconstruction alone pulls Gaussians onto the objects.
+    training a slot's attention covers a whole part of the image (the slot
+    attention's position prior), and the depth along its ray is still a
+    guess, so the extent is widened to one discovery region (fg_xy / sqrt(K)
+    in xy, the full height range in z): extent = (1 - w) * region + w *
+    predicted, w = anchor_weight. Whatever the slot sees is then within reach
+    of its Gaussians.
 
     Defaults match ``SceneGenConfig`` defaults; use ``from_scene_config`` to
     derive them from a dataset's meta.json.
@@ -112,7 +101,7 @@ class SlotFrame(nn.Module):
         anchor_residual: float = 0.5,
         n_slots: int = 1,
     ):
-        """n_slots: number of object slots (one position prior each)."""
+        """n_slots: number of object slots (sets the discovery region size)."""
         super().__init__()
         # How far the learned residual may move a frame centre in xy away
         # from the point where the slot's ray reaches the predicted height.
@@ -121,19 +110,18 @@ class SlotFrame(nn.Module):
         # attention centroids in the view-0 azimuth frame, (origin (3,),
         # directions (K, 3)); None falls back to free centres.
         self.ray: tuple[torch.Tensor, torch.Tensor] | None = None
-        # Weight of the anchored frame vs the free discovery frame; set by
-        # GSODModel, 1 = anchored only (the trained model).
+        # Discovery blend of the extent; set by GSODModel, 1 = predicted extent
+        # only (the trained model).
         self.anchor_weight = 1.0
         self.fg_xy = float(fg_xy)
         self.fg_z = (float(fg_z[0]), float(fg_z[1]))
         self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
-        # Discovery: one region per slot, centred at a learned position prior.
-        self.region = self.fg_xy / math.sqrt(n_slots)
-        self.position_prior = nn.Parameter(_sunflower(n_slots, 0.75 * self.fg_xy))
+        # Discovery extent: one region per slot.
+        region = self.fg_xy / math.sqrt(n_slots)
         half_height = 0.5 * (self.fg_z[1] - self.fg_z[0])
         self.register_buffer(
             "region_extent",
-            torch.tensor([self.region, self.region, half_height]),
+            torch.tensor([region, region, half_height]),
             persistent=False,
         )
 
@@ -172,24 +160,8 @@ class SlotFrame(nn.Module):
         extent = e_lo + (e_hi - e_lo) * torch.sigmoid(out[:, 3:6])
         w = self.anchor_weight
         if w < 1.0:
-            free_xy = self.position_prior + self.region * torch.tanh(out[:, 0:2])
-            free_xy = self.fg_xy * torch.tanh(free_xy / self.fg_xy)
-            free = torch.cat([free_xy, z], dim=-1)
-            free_extent = self.region_extent.to(extent.dtype).expand_as(extent)
-            if w <= 0.0:
-                return free, free_extent
-            anchored, extent = self._anchored(out, z, extent)
-            return (
-                (1.0 - w) * free + w * anchored,
-                (1.0 - w) * free_extent + w * extent,
-            )
-        return self._anchored(out, z, extent)
-
-    def _anchored(
-        self, out: torch.Tensor, z: torch.Tensor, extent: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Centre on the attention-centroid ray (or the free prediction without
-        a ray), softly bounded to the scene."""
+            region = self.region_extent.to(extent.dtype).expand_as(extent)
+            extent = (1.0 - w) * region + w * extent
         if self.ray is not None:
             # Centre = where the attention-centroid ray reaches height z, plus
             # a bounded residual. Slots attending to different objects get
