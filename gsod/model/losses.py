@@ -1,20 +1,48 @@
 """Training losses.
 
-    total = l1        * L1(render, image)            novel views 1..V-1
+    total = l1        * L1_w(render, image)          novel views 1..V-1
           + ssim      * (1 - SSIM(render, image))    novel views 1..V-1
-          + view0     * L1(render, image)            view 0 (the encoded view)
+          + view0     * L1_w(render, image)          view 0 (the encoded view)
+          + fg_cov    * BCE_bal(fg_share, F)         all views, from residual_start
+          + bg_attn   * BCE(attn_bg, 1 - F)          view 0, from residual_start
           + fg_render * CE(render_fg | attn_fg)      view 0
 
-No foreground target: which pixels are background is learned, as in uORF.
-The background slot colours the far-away background shell, which cannot
-reproduce a near object in every view (background.py), so the novel-view
-reconstruction is what keeps objects out of the background slot. The model's
-opacity floor keeps object Gaussians alive until they reach the objects.
+F, the foreground target (background_residual_target)
+    Per pixel of every view: does the image differ from what the background
+    Gaussians alone render there? F ~ 1 on objects, ~ 0 elsewhere, no
+    gradient. It does not depend on how well the objects are rendered yet, so
+    it cannot reinforce a wrong render. It needs the background to be close
+    to the data background; residual_start can delay it until then.
 
-Reconstruction (L1, SSIM)
+    F is what keeps the objects alive: with reconstruction alone, object
+    Gaussians placed before slot attention has found the objects only add
+    error over a background the shell already fits, so their opacity is
+    driven to 0, the attention hands every token to the background and the
+    slots collapse to one point (observed when F was removed).
+
+Reconstruction (L1_w, SSIM)
     L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
-    a structure term, as in 3DGS. The novel views carry the 3D signal; view 0
-    is the encoded view, kept so its render matches the input.
+    a structure term, as in 3DGS. Objects cover ~12% of the pixels, so a plain
+    mean lets the easy background dominate and object edges stay soft. With F
+    the L1 terms weight each pixel by 1 + FG_RECON_WEIGHT * F (object pixels
+    FG_RECON_WEIGHT + 1 times a background pixel); before that they are
+    plain means.
+
+fg_cov -- "objects must be drawn by object slots", in every view
+    Per pixel, the share of the rendered alpha that belongs to object slots
+    should equal F. Applied to all views: in the novel views it constrains each
+    object's silhouette, so Gaussians smeared along the view-0 ray land on
+    background pixels and are penalised. Balanced: the BCE is averaged over
+    object pixels and over background pixels separately, so errors on the
+    few object pixels (semi-transparent objects) are not diluted. Prevents the
+    "everything is background" solution where object opacity dies.
+
+bg_attn -- "slot attention must hand background pixels to the background"
+    Per token of view 0, the background row of the slot attention should
+    equal 1 - F. The background shell needs nothing from attention, so
+    without this nothing stops one object slot from attending to the whole
+    image. Only the bg/fg split is supervised; object slots still compete
+    freely for the object pixels.
 
 fg_render -- "each object is drawn by the slot that attends to it"
     On pixels the attention gives to objects, the rendered split among object
@@ -31,6 +59,8 @@ from torch import nn
 from gsod.configs.loss import LossConfig
 
 _EPS = 1e-6
+# Extra L1 weight on object pixels (weight = 1 + FG_RECON_WEIGHT * F).
+FG_RECON_WEIGHT = 3.0
 
 
 def _gaussian_window(
@@ -85,6 +115,64 @@ def render_grid(outputs: dict[str, torch.Tensor], side: int) -> torch.Tensor:
     return alpha / alpha.sum(0, keepdim=True).clamp_min(_EPS)
 
 
+def background_residual_target(
+    outputs: dict[str, torch.Tensor],
+    images: torch.Tensor,
+    tau: float = 0.1,
+    softness: float = 0.02,
+) -> torch.Tensor:
+    """F: (V, H, W) soft foreground target for every view, in [0, 1], no gradient.
+
+    Max-channel |image - background-only render| through a soft step at tau.
+    On the generated data every object pixel differs from the background by
+    >= 0.18, so tau = 0.1 separates them cleanly.
+    """
+    diff = (images - outputs["bg_rgb"]).abs().amax(dim=1)
+    return torch.sigmoid((diff - tau) / softness).detach()
+
+
+def weighted_l1(
+    pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor | None
+) -> torch.Tensor:
+    """Mean absolute error over (V, 3, H, W); per-pixel weights (V, H, W) or None."""
+    err = (pred - target).abs().mean(dim=1)  # (V, H, W)
+    if weight is None:
+        return err.mean()
+    return (weight * err).sum() / weight.sum().clamp_min(_EPS)
+
+
+def fg_coverage_loss(
+    outputs: dict[str, torch.Tensor], fg_target: torch.Tensor
+) -> torch.Tensor:
+    """fg_cov: rendered object-slot share matches F in every view (balanced BCE).
+
+    fg_target: (V, H, W). The per-pixel BCE is averaged over object pixels and
+    over background pixels separately (soft weights F and 1 - F), then the two
+    means are averaged.
+    """
+    alpha = outputs["slot_alpha_full"]  # (V, K, H, W)
+    fg_share = alpha[:, 1:].sum(1) / alpha.sum(1).clamp_min(_EPS)
+    bce = F.binary_cross_entropy(
+        fg_share.clamp(_EPS, 1.0 - _EPS), fg_target, reduction="none"
+    )
+    on_obj = (bce * fg_target).sum() / fg_target.sum().clamp_min(_EPS)
+    on_bg = (bce * (1.0 - fg_target)).sum() / (1.0 - fg_target).sum().clamp_min(_EPS)
+    return 0.5 * (on_obj + on_bg)
+
+
+def bg_attention_loss(
+    outputs: dict[str, torch.Tensor], fg_target: torch.Tensor
+) -> torch.Tensor:
+    """bg_attn: background row of the slot attention matches 1 - F (per token BCE).
+
+    fg_target: (V, H, W); only view 0 is used (attention exists for view 0 only).
+    """
+    attn = attn_grid(outputs)
+    target = _to_tokens(fg_target[:1], attn.shape[-1])[0]
+    pred = attn[0].clamp(_EPS, 1.0 - _EPS)
+    return F.binary_cross_entropy(pred, 1.0 - target)
+
+
 def fg_render_loss(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
     """fg_render: rendered split among object slots follows the attention split."""
     attn = attn_grid(outputs)
@@ -109,19 +197,35 @@ class GSODLoss(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         images: torch.Tensor,
+        step: int | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """outputs: model output; images: (V,3,H,W). Returns (total, per-term
-        values for logging)."""
+        """outputs: model output; images: (V,3,H,W); step: training step
+        (None = all terms active). Returns (total, per-term values for logging)."""
         cfg = self.cfg
+        fg_target = None
+        if step is None or step >= cfg.residual_start:
+            fg_target = background_residual_target(outputs, images, cfg.residual_tau)
+        weight = None if fg_target is None else 1.0 + FG_RECON_WEIGHT * fg_target
+
         rendered, target = outputs["rgb"][1:], images[1:]
         terms: dict[str, torch.Tensor] = {
-            "l1": F.l1_loss(rendered, target),
+            "l1": weighted_l1(rendered, target, None if weight is None else weight[1:]),
             "ssim": 1.0 - ssim(rendered, target),
         }
         weights = {"l1": cfg.l1, "ssim": cfg.ssim}
         if cfg.view0 > 0:
-            terms["view0"] = F.l1_loss(outputs["rgb"][:1], images[:1])
+            terms["view0"] = weighted_l1(
+                outputs["rgb"][:1], images[:1], None if weight is None else weight[:1]
+            )
             weights["view0"] = cfg.view0
+
+        if fg_target is not None:
+            if cfg.fg_cov > 0:
+                terms["fg_cov"] = fg_coverage_loss(outputs, fg_target)
+                weights["fg_cov"] = cfg.fg_cov
+            if cfg.bg_attn > 0:
+                terms["bg_attn"] = bg_attention_loss(outputs, fg_target)
+                weights["bg_attn"] = cfg.bg_attn
         if cfg.fg_render > 0:
             terms["fg_render"] = fg_render_loss(outputs)
             weights["fg_render"] = cfg.fg_render

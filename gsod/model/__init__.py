@@ -55,7 +55,6 @@ def build_model(
         # and uses the profile's scene_prior instead.
         scene_config=meta.get("config", cfg.scene_prior),
         decoder_cls=decoder_cls,
-        bg_cond_hidden=cfg.bg_cond_hidden,
     )
 
 

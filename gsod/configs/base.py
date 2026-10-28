@@ -34,12 +34,6 @@ class BaseConfig:
     decoder_hidden_dim: int = 128
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
-    # Width of the background shell's colour MLP (background slot -> colours).
-    bg_cond_hidden: int = 64
-    # Opacity floor of object Gaussians in training, decaying linearly from
-    # opacity_floor to 0 over the first opacity_floor_steps steps.
-    opacity_floor: float = 0.2
-    opacity_floor_steps: int = 10_000
 
     # --- optimisation ----------------------------------------------------------
     # Number of optimisation steps; each step trains on one scene.
