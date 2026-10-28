@@ -34,6 +34,13 @@ class BaseConfig:
     decoder_hidden_dim: int = 128
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
+    # Discovery (model/gsod.py): object frames tile the scene for the first
+    # discovery_steps steps, then move over to the attention anchors over
+    # anchor_blend_steps; object Gaussians get an opacity floor that fades
+    # out with the same blend.
+    discovery_steps: int = 5_000
+    anchor_blend_steps: int = 5_000
+    opacity_floor: float = 0.2
 
     # --- optimisation ----------------------------------------------------------
     # Number of optimisation steps; each step trains on one scene.

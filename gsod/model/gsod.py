@@ -19,6 +19,17 @@ along +x; uORF's nss2cam0) and rotated into the world before splatting. The
 background shell is static and lives in the world frame. Cameras are never
 modified.
 
+Discovery
+---------
+No foreground target is given. Early in training (``anchor_weight`` < 1, set
+by train.py) object frames are not anchored to the attention but spread
+over the scene from per-slot position priors (SlotFrame), and object
+Gaussians get an opacity floor (``opacity_floor``): the multi-view
+reconstruction then pulls them onto the objects, and the attention learns
+from the rendered slot partition (losses.py). Then the frames move over to
+the attention anchors. ``anchor_weight`` = 1 and no floor is the trained
+model.
+
 Everything that is rendered comes from Gaussians: there is no constant colour
 fill; a pixel no Gaussian covers renders black.
 """
@@ -182,9 +193,9 @@ class GSODModel(nn.Module):
             iters=attn_iter,
         )
         frame = (
-            SlotFrame.from_scene_config(z_dim, scene_config)
+            SlotFrame.from_scene_config(z_dim, scene_config, n_slots=num_slots - 1)
             if scene_config is not None
-            else SlotFrame(z_dim)
+            else SlotFrame(z_dim, n_slots=num_slots - 1)
         )
         self.decoder = decoder_cls(
             n_slots=num_slots - 1,
@@ -203,6 +214,10 @@ class GSODModel(nn.Module):
         self.background = BackgroundShell(
             n_gaussians=bg_gaussians_per_slot, radius=radius
         )
+        # Discovery schedule, set per step by train.py (see the module
+        # docstring); these defaults are the trained model.
+        self.anchor_weight = 1.0
+        self.opacity_floor = 0.0
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks for checkpoint.save_networks / load_networks."""
@@ -233,6 +248,8 @@ class GSODModel(nn.Module):
 
         # Object Gaussians (view-0 azimuth frame), with attention-anchored frames.
         frame = getattr(getattr(self.decoder, "head", None), "frame", None)
+        if frame is not None:
+            frame.anchor_weight = self.anchor_weight
         if frame is not None and self.anchor_frames:
             frame.ray = attention_rays(
                 attn[1:], cam2world[0], self.image_size, self.focal_ratio
@@ -248,6 +265,12 @@ class GSODModel(nn.Module):
                 frame.ray = None
         if self.canonical_azimuth:
             obj_gaussians = yaw_to_world(obj_gaussians, view_yaw(cam2world[0]))
+        if self.training and self.opacity_floor > 0:
+            floor = self.opacity_floor
+            obj_gaussians = {
+                **obj_gaussians,
+                "opacity": floor + (1.0 - floor) * obj_gaussians["opacity"],
+            }
 
         # Static background Gaussians (world frame) + object Gaussians.
         bg_gaussians = self.background()
@@ -282,18 +305,6 @@ class GSODModel(nn.Module):
         alpha_full = torch.cat([alpha[:, :1] + empty, alpha[:, 1:]], dim=1)
         mask_idx = alpha_full.argmax(dim=1)
 
-        # Every view rendered with the background alone: the reference for
-        # the foreground target F in losses.py, which takes no gradient.
-        with torch.no_grad():
-            bg_rgb = self.splat(
-                bg_gaussians,
-                slot_probs[:n_bg],
-                cam2world,
-                self.image_size,
-                self.focal_ratio,
-                self.near,
-            )["rgb"]
-
         return {
             "rgb": rendered["rgb"],
             "slot_alpha": alpha,  # Gaussian weights only
@@ -303,6 +314,7 @@ class GSODModel(nn.Module):
             "slots": obj_slots,  # (K-1, C) object slots
             "slot_ids": slot_ids,
             "gaussians": gaussians,  # world frame, background first
-            "bg_rgb": bg_rgb,  # (N, 3, H, W) background-only render
+            # (M, 3) object Gaussians' positions in their frames, or None
+            "obj_offset": obj_gaussians.get("offset"),
             "frame_centre": frame_centre,  # (K-1, 3) object frames, view-0 azimuth frame
         }

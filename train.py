@@ -92,8 +92,20 @@ def train(
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order].to(device), cams[order].to(device)
 
+        # Discovery schedule: 0 while the frames tile the scene, then up to 1.
+        anchor = min(
+            1.0,
+            max(0.0, (step - cfg.discovery_steps) / max(1, cfg.anchor_blend_steps)),
+        )
+        model.anchor_weight = anchor
+        model.opacity_floor = cfg.opacity_floor * (1.0 - anchor)
         out_dict = model(images, cams)
-        loss, terms = criterion(out_dict, images, step)
+        loss, terms = criterion(
+            out_dict,
+            images,
+            anchor_weight=anchor,
+            discovering=step <= cfg.discovery_steps,
+        )
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -112,7 +124,8 @@ def train(
                 f"step {step} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f} "
                 f"fg_ari {metrics['fg_ari']:.3f} attn_fg_ari {metrics['attn_fg_ari']:.3f}"
             )
-            if metrics["psnr"] > best_psnr:
+            # Only fully anchored models: checkpoints load with anchor weight 1.
+            if anchor >= 1.0 and metrics["psnr"] > best_psnr:
                 best_psnr = metrics["psnr"]
                 _save(out, "best", model, opt, step, best_psnr)
                 print(f"step {step} new best psnr {best_psnr:.2f}")

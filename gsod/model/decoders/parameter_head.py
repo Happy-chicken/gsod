@@ -66,6 +66,14 @@ def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
 
 
+def _sunflower(n: int, radius: float) -> torch.Tensor:
+    """(n, 2) points spread evenly over a disc of the given radius."""
+    i = torch.arange(n, dtype=torch.float32) + 0.5
+    r = radius * torch.sqrt(i / n)
+    theta = math.pi * (3.0 - math.sqrt(5.0)) * i
+    return torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
+
+
 class SlotFrame(nn.Module):
     """object-slot latent -> (centre, extent), bounded by dataset priors.
 
@@ -76,6 +84,17 @@ class SlotFrame(nn.Module):
     attends to, whatever height is predicted. centre xy is softly bounded to
     [-fg_xy, fg_xy]. extent in [fg_extent[0], fg_extent[1]], initialised at
     fg_extent_init. Gaussian centres: centre + extent * tanh(offset).
+
+    Discovery (``self.anchor_weight`` < 1, set by GSODModel): early in
+    training the attention does not know the objects yet, so frames anchored
+    to it never reach them. Every slot then also has a free frame: centred
+    at its own learned position prior (spread over the scene at init, so the
+    slots start in different places and differ even when their latents do
+    not) plus a residual of at most one discovery region, with an extent of
+    one region (fg_xy / sqrt(K) in xy, so the slots tile the scene). The frame
+    used is (1 - w) * free + w * anchored, w = anchor_weight: at w = 0 every
+    object pixel is within reach of some slot, and the multi-view
+    reconstruction alone pulls Gaussians onto the objects.
 
     Defaults match ``SceneGenConfig`` defaults; use ``from_scene_config`` to
     derive them from a dataset's meta.json.
@@ -91,7 +110,9 @@ class SlotFrame(nn.Module):
         fg_extent: tuple[float, float] = (0.1, 0.75),
         fg_extent_init: float = 0.5,
         anchor_residual: float = 0.5,
+        n_slots: int = 1,
     ):
+        """n_slots: number of object slots (one position prior each)."""
         super().__init__()
         # How far the learned residual may move a frame centre in xy away
         # from the point where the slot's ray reaches the predicted height.
@@ -100,9 +121,21 @@ class SlotFrame(nn.Module):
         # attention centroids in the view-0 azimuth frame, (origin (3,),
         # directions (K, 3)); None falls back to free centres.
         self.ray: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Weight of the anchored frame vs the free discovery frame; set by
+        # GSODModel, 1 = anchored only (the trained model).
+        self.anchor_weight = 1.0
         self.fg_xy = float(fg_xy)
         self.fg_z = (float(fg_z[0]), float(fg_z[1]))
         self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
+        # Discovery: one region per slot, centred at a learned position prior.
+        self.region = self.fg_xy / math.sqrt(n_slots)
+        self.position_prior = nn.Parameter(_sunflower(n_slots, 0.75 * self.fg_xy))
+        half_height = 0.5 * (self.fg_z[1] - self.fg_z[0])
+        self.register_buffer(
+            "region_extent",
+            torch.tensor([self.region, self.region, half_height]),
+            persistent=False,
+        )
 
         self.fg = nn.Sequential(
             nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 6)
@@ -135,6 +168,28 @@ class SlotFrame(nn.Module):
         out = self.fg(slots)
         z_lo, z_hi = self.fg_z
         z = z_lo + (z_hi - z_lo) * torch.sigmoid(out[:, 2:3])
+        e_lo, e_hi = self.fg_extent
+        extent = e_lo + (e_hi - e_lo) * torch.sigmoid(out[:, 3:6])
+        w = self.anchor_weight
+        if w < 1.0:
+            free_xy = self.position_prior + self.region * torch.tanh(out[:, 0:2])
+            free_xy = self.fg_xy * torch.tanh(free_xy / self.fg_xy)
+            free = torch.cat([free_xy, z], dim=-1)
+            free_extent = self.region_extent.to(extent.dtype).expand_as(extent)
+            if w <= 0.0:
+                return free, free_extent
+            anchored, extent = self._anchored(out, z, extent)
+            return (
+                (1.0 - w) * free + w * anchored,
+                (1.0 - w) * free_extent + w * extent,
+            )
+        return self._anchored(out, z, extent)
+
+    def _anchored(
+        self, out: torch.Tensor, z: torch.Tensor, extent: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Centre on the attention-centroid ray (or the free prediction without
+        a ray), softly bounded to the scene."""
         if self.ray is not None:
             # Centre = where the attention-centroid ray reaches height z, plus
             # a bounded residual. Slots attending to different objects get
@@ -150,8 +205,6 @@ class SlotFrame(nn.Module):
         else:
             xy = out[:, 0:2]
         xy = self.fg_xy * torch.tanh(xy / self.fg_xy)
-        e_lo, e_hi = self.fg_extent
-        extent = e_lo + (e_hi - e_lo) * torch.sigmoid(out[:, 3:6])
         return torch.cat([xy, z], dim=-1), extent
 
 
@@ -191,6 +244,8 @@ class GaussianParameterHead(nn.Module):
         """raw: (M, in_dim); slots: (K, C) object slots; slot_ids: (M,) in 0..K-1.
 
         Returns the Gaussian dict and (M, K) one-hot object-slot probabilities.
+        With a frame the dict also holds "offset" (M, 3), each Gaussian's
+        position inside its frame in [-1, 1] (for the spread loss).
         """
         raw = self.project(raw)
         if raw.dim() == 3:
@@ -204,7 +259,8 @@ class GaussianParameterHead(nn.Module):
         else:
             centre, extent = self.frame(slots)
             c, e = centre[slot_ids], extent[slot_ids]
-            mu = c + e * torch.tanh(raw[:, 0:3])
+            offset = torch.tanh(raw[:, 0:3])
+            mu = c + e * offset
             rel_scale = self.frame_scale_min + (
                 self.frame_scale_max - self.frame_scale_min
             ) * torch.sigmoid(raw[:, 3:6])
@@ -216,5 +272,7 @@ class GaussianParameterHead(nn.Module):
             "opacity": torch.sigmoid(raw[:, 10]),
             "rgb": torch.sigmoid(raw[:, 11:14]),
         }
+        if self.frame is not None:
+            gaussians["offset"] = offset
         slot_probs = F.one_hot(slot_ids, slots.shape[0]).to(dtype=slots.dtype)
         return gaussians, slot_probs
