@@ -1,8 +1,14 @@
-"""Cross-attention Gaussian decoder for slots.
+"""Attention Gaussian decoder for slots (one transformer decoder block).
 
     Q: G learned Gaussian queries, shared by all slots and independent of the
        input. Query i stands for "Gaussian i" of a slot.
-    K/V: n_tokens tokens per slot, linear projections of that slot's latent.
+    cross-attention: K/V are n_tokens tokens per slot, linear projections of
+       that slot's latent.
+    self-attention: then the queries of one slot attend to each other, so
+       its Gaussians can share out the object (coverage, no duplicates)
+       instead of each being decoded on its own. It comes after the
+       cross-attention: before it the queries are the same for every input.
+       Slots never see each other here.
     output: one feature per (slot, query) -> GaussianParameterHead (MLP) ->
        one Gaussian.
 
@@ -51,6 +57,13 @@ class AttentionDecoder(nn.Module):
         self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
         self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_self = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        # Zero output projection: the block starts as the plain cross-attention
+        # decoder (same initial spread of the Gaussians) and learns how much
+        # the queries should exchange.
+        nn.init.zeros_(self.self_attn.out_proj.weight)
+        nn.init.zeros_(self.self_attn.out_proj.bias)
         self.norm_ff = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
@@ -60,7 +73,10 @@ class AttentionDecoder(nn.Module):
         self.head = GaussianParameterHead(frame, in_dim=d_model, hidden_dim=d_model)
 
     def _attend(self, q, k, v):
+        """q: (K, G, d) queries, k / v: (K, n_tokens, d); batched over slots."""
         q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
+        x = self.norm_self(q)
+        q = q + self.self_attn(x, x, x, need_weights=False)[0]
         return q + self.ffn(self.norm_ff(q))
 
     def forward(self, slots: torch.Tensor):
