@@ -1,26 +1,20 @@
-"""Shared GS slot model: encoder, slot attention, selectable Gaussian decoder.
+"""Shared GS slot model: encoder, slot attention, pixel Gaussians mixed over slots.
 
 The gsplat splatter lives in ``gsod/utils/splatter.py``. ``build_model`` is
 kept here as the package-level factory, so callers can use::
 
     from gsod.model import GSODModel, build_model, load_networks
-
-The decoder is chosen by passing its class, e.g.
-``build_model(cfg, meta, decoder_cls=SharedMLPDecoder)``.
 """
 
 from __future__ import annotations
 
-from torch import nn
-
 from gsod.configs import BaseConfig
-from gsod.model.aux_decoder import SpatialBroadcastDecoder
 from gsod.model.decoders import (
     AttentionDecoder,
-    SharedMLPDecoder,
     GaussianParameterHead,
-    PerSlotMLPDecoder,
+    PixelGeometry,
     SlotFrame,
+    SlotMixer,
 )
 from gsod.model.checkpoint import load_networks, save_networks
 from gsod.model.encoder import Encoder
@@ -29,16 +23,8 @@ from gsod.model.slot_attention import SlotAttention
 from gsod.utils.splatter import GsplatSplatter
 
 
-def build_model(
-    cfg: BaseConfig,
-    meta: dict,
-    decoder_cls: type[nn.Module] = AttentionDecoder,
-) -> GSODModel:
-    """Build a GSODModel from a config profile and dataset metadata.
-
-    decoder_cls: ``AttentionDecoder``, ``SharedMLPDecoder`` or
-    ``PerSlotMLPDecoder`` (any class with the common decoder signature).
-    """
+def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
+    """Build a GSODModel from a config profile and dataset metadata."""
     height, width = meta["image_size"]
     return GSODModel(
         splat=GsplatSplatter(),
@@ -47,29 +33,26 @@ def build_model(
         z_dim=cfg.z_dim,
         num_slots=cfg.num_slots,
         attn_iter=cfg.attn_iter,
-        gaussians_per_slot=cfg.gaussians_per_slot,
-        bg_gaussians_per_slot=cfg.bg_gaussians_per_slot,
+        gaussians_per_pixel=cfg.gaussians_per_pixel,
+        bg_gaussians=cfg.bg_gaussians,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
-        aux2d_size=cfg.aux2d_size,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
         # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none
         # and uses the profile's scene_prior instead.
         scene_config=meta.get("config", cfg.scene_prior),
-        decoder_cls=decoder_cls,
     )
 
 
 __all__ = [
     "Encoder",
     "SlotAttention",
-    "PerSlotMLPDecoder",
-    "SharedMLPDecoder",
     "AttentionDecoder",
     "GaussianParameterHead",
+    "PixelGeometry",
     "SlotFrame",
+    "SlotMixer",
     "GSODModel",
-    "SpatialBroadcastDecoder",
     "build_model",
     "save_networks",
     "load_networks",

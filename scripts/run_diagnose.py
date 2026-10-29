@@ -13,7 +13,7 @@ Examples
     python scripts/run_diagnose.py --checkpoint checkpoints/primordia_20261022_143000 \
         --split test --n-scenes 16
 
-    # untrained model: checks the initialisation only
+    # untrained model: a baseline for the trained runs
     python scripts/run_diagnose.py --init
 """
 
