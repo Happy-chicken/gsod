@@ -31,6 +31,14 @@ from gsod.model.evaluate import evaluate
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 
+# Coarse-to-fine schedule, as fractions of the run (cfg.steps): the 2D
+# decomposition forms first; then the object frames move onto the rays
+# through the 2D masks (anchor weight 0 -> 1 over ANCHOR_RAMP) and the
+# consistency loss comes in with them; late in the run the consistency loss
+# fades out (CONSISTENCY_FADE) so the 3D reconstruction refines the result.
+ANCHOR_RAMP = (0.2, 0.4)
+CONSISTENCY_FADE = (0.6, 1.0)
+
 
 def train(
     model: GSODModel,
@@ -94,7 +102,10 @@ def train(
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order].to(device), cams[order].to(device)
 
-        loss, terms = criterion(model(images, cams), images)
+        anchor, consistency = _coarse_to_fine(step, cfg.steps)
+        model.anchor_weight = anchor
+        model.render_detached = consistency > 0
+        loss, terms = criterion(model(images, cams), images, consistency)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         for name, value in terms.items():
@@ -114,7 +125,8 @@ def train(
                 f"step {step} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f} "
                 f"fg_ari {metrics['fg_ari']:.3f} attn_fg_ari {metrics['attn_fg_ari']:.3f}"
             )
-            if metrics["psnr"] > best_psnr:
+            # Only fully anchored models: checkpoints load with anchor weight 1.
+            if anchor >= 1.0 and metrics["psnr"] > best_psnr:
                 best_psnr = metrics["psnr"]
                 _save(out, "best", model, opt, step, best_psnr)
                 print(f"step {step} new best psnr {best_psnr:.2f}")
@@ -124,6 +136,17 @@ def train(
 
     _save(out, "latest", model, opt, last_step, best_psnr)
     print(f"done, wrote {out}/latest_*.pth")
+
+
+def _coarse_to_fine(step: int, steps: int) -> tuple[float, float]:
+    """(anchor weight, consistency scale) at this step (see ANCHOR_RAMP)."""
+    t = step / steps
+
+    def ramp(start: float, end: float) -> float:
+        return min(1.0, max(0.0, (t - start) / (end - start)))
+
+    anchor = ramp(*ANCHOR_RAMP)
+    return anchor, anchor * (1.0 - ramp(*CONSISTENCY_FADE))
 
 
 def _learning_rate(cfg: BaseConfig, step: int) -> float:
@@ -170,8 +193,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-dim", type=int, default=None)
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
-    parser.add_argument("--gaussians-per-pixel", type=int, default=None)
-    parser.add_argument("--bg-gaussians", type=int, default=None)
+    parser.add_argument("--gaussians-per-slot", type=int, default=None)
+    parser.add_argument("--bg-gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
@@ -199,8 +222,8 @@ def main() -> None:
         "z_dim",
         "num_slots",
         "attn_iter",
-        "gaussians_per_pixel",
-        "bg_gaussians",
+        "gaussians_per_slot",
+        "bg_gaussians_per_slot",
         "decoder_hidden_dim",
     ]
     values = {
