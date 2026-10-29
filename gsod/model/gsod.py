@@ -4,15 +4,16 @@ views[0] -> Encoder -> tokens -> SlotAttention -> K slots (0 = background)
     background slot -> background decoder: floor layer + far shell
     object slots    -> object decoder: Gaussians anywhere in the object box
     each slot's Gaussians (view-0 azimuth frame -> world) -> splatted on its
-        own into every view -> composited by a soft z-buffer over the slots
+        own into every view -> the slots alpha-composited as layers in a
+        soft depth order
 
 The slots compete in the 3D render itself, with no 2D decoder and no masks:
 
-  * one share of each pixel: the compositing weights w_k(p) of the slots sum
-    to one (softmax over slots of log alpha_k - depth_k / tau), and the
-    image is sum_k w_k colour_k. The reconstruction gradient moves w towards
-    the slot whose colour fits the pixel, as in Slot Attention's decoder;
-    w_k is also slot k's mask, in every view.
+  * one share of each pixel: the slots' compositing weights w_k(p) sum to
+    the pixel's coverage (``composite``), so a slot gains a pixel only from
+    the slots it hides or that hide it, and the reconstruction gradient
+    moves the pixel to the slot whose colour fits; w_k is also slot k's
+    mask, in every view.
   * every slot can reach every object: object Gaussians start spread over
     the whole object box (no per-slot frame).
   * limited capacity: the background cannot enter the object box and has a
@@ -116,32 +117,35 @@ def yaw_to_world(
 
 
 def composite(
-    layers: list[dict[str, torch.Tensor]], far: float, tau: float
+    layers: list[dict[str, torch.Tensor]], tau: float, far: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Soft z-buffer over slots.
+    """Alpha compositing of the slots as layers, in a soft depth order.
 
     layers: per slot, the splatter output (V, C, H, W): accumulated "rgb"
     and "depth", and "alpha". Slot k sits at its expected depth d_k (pulled
-    to the far depth where it is transparent) and gets the weight
-    w_k = alpha_k e_k / sum_j alpha_j e_j, e_k = exp(-d_k / tau); the image
-    is sum_k w_k * colour_k = sum_k rgb_k e_k / sum_j alpha_j e_j, with the
-    accumulated rgb_k, so no colour is divided by its own (possibly tiny)
-    alpha and no log alpha appears: both blew the gradients up for nearly
-    transparent slots. Returns (image (V, 3, H, W), weights (V, K, H, W),
-    summing to one over the slots).
+    to the far depth where it is nearly transparent). Slot j is in front of
+    k with probability sigmoid((d_k - d_j) / tau) and then hides alpha_j of
+    it:
+
+        T_k   = prod_{j != k} (1 - alpha_j * sigmoid((d_k - d_j) / tau))
+        image = sum_k T_k * rgb_k          (rgb_k already carries alpha_k)
+        w_k   = T_k * alpha_k              slot k's share of the pixel
+
+    A faint slot hides little, however close it is, and there is no
+    division by a slot's alpha and no log in the image. Returns (image
+    (V, 3, H, W), weights (V, K, H, W), summing to the pixel's coverage).
     """
     rgb = torch.stack([layer["rgb"] for layer in layers], 1)  # (V, K, 3, H, W)
     alpha = torch.stack([layer["alpha"] for layer in layers], 1)  # (V, K, 1, H, W)
     acc_depth = torch.stack([layer["depth"] for layer in layers], 1)
-    # Detached denominator: alpha gets its gradient from the weights only.
-    depth = (acc_depth + _ALPHA_EPS * far) / (alpha + _ALPHA_EPS).detach()
-    logits = -depth / tau
-    # Per-pixel shift for exp, from the strongest slot; it cancels out.
-    shift = (torch.log(alpha + 1e-6) + logits).amax(1, keepdim=True).detach()
-    e = torch.exp(logits - shift)
-    norm = (alpha * e).sum(1) + 1e-6  # (V, 1, H, W)
-    image = (rgb * e).sum(1) / norm
-    weights = alpha * e / norm[:, None]
+    depth = (acc_depth + _ALPHA_EPS * far) / (alpha + _ALPHA_EPS)
+    # [v, j, k] = d_k - d_j: j in front of k.
+    front = torch.sigmoid((depth[:, None] - depth[:, :, None]) / tau)
+    not_self = 1.0 - torch.eye(alpha.shape[1], device=alpha.device, dtype=alpha.dtype)
+    front = front * not_self[None, :, :, None, None, None]
+    transmittance = (1.0 - alpha[:, :, None] * front).prod(1)  # (V, K, 1, H, W)
+    image = (transmittance * rgb).sum(1)
+    weights = transmittance * alpha
     return image, weights[:, :, 0]
 
 
@@ -194,8 +198,9 @@ class GSODModel(nn.Module):
             decoder_hidden_dim,
             BackgroundHead(decoder_hidden_dim, bounds, bg_gaussians_per_slot),
         )
-        # Soft z-buffer: depth differences of a fraction of an object decide
-        # who is in front; transparent parts count as this far.
+        # Soft depth order of the slot layers: depth differences of a
+        # fraction of an object decide who is in front; nearly transparent
+        # parts count as this far.
         self.depth_tau = bounds.r_max / 4.0
         self.far = bounds.reach + float(scene_config["distance_range"][1])
         # Compactness: an object slot's Gaussians within this distance of
@@ -257,7 +262,7 @@ class GSODModel(nn.Module):
             self.splat(g, cam2world, self.image_size, self.focal_ratio, self.near)
             for g in per_slot
         ]
-        image, weights = composite(layers, self.far, self.depth_tau)
+        image, weights = composite(layers, self.depth_tau, self.far)
 
         gaussians = {name: torch.cat([g[name] for g in per_slot]) for name in bg}
         slot_ids = torch.cat(
@@ -268,7 +273,7 @@ class GSODModel(nn.Module):
         )
         return {
             "rgb": image,
-            "slot_alpha": weights,  # (N, K, H, W), sums to one over slots
+            "slot_alpha": weights,  # (N, K, H, W), sums to the coverage
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": attn,  # (K, s*s) view-0 slot attention; row 0 = background
             "slots": slots,  # (K, C) view-0 slots; 0 = background

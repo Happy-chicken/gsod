@@ -12,9 +12,9 @@ Every term reaches every module that produced it (end to end).
 
 Reconstruction
     L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
-    a structure term, as in 3DGS. The image is the slots' soft z-buffer
-    composite (gsod.py), so these terms are also the slots' competition for
-    the pixels. The novel views carry the 3D signal.
+    a structure term, as in 3DGS. The image is the slots' layered composite
+    (gsod.py), so these terms are also the slots' competition for the
+    pixels. The novel views carry the 3D signal.
 
 appearance -- "one slot, one colour"
     Mean |per-Gaussian colour residual| of the object Gaussians (logit units,

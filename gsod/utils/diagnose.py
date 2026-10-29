@@ -464,7 +464,7 @@ def make_grid(
     View 0 is the encoded input; view 1 is a novel view the encoder never
     sees, so it tests the 3D. Slot attention: share of each token given to
     the slot. Rendered slot weight: the slot's compositing weight per pixel
-    (the weights sum to one over the slots). Grey tiles: white = 1 (all of
+    (the weights sum to the pixel's coverage). Grey tiles: white = 1 (all of
     the token / pixel), black = 0. Slot captions carry the slot's mask colour
     and its share of the image (the tile mean), so empty slots read 0%.
     Captions are English.
