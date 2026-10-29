@@ -106,7 +106,10 @@ def train(
         for name, value in terms.items():
             running[name] = running.get(name, 0.0) + value
         if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # Logged before clipping: a norm far above grad_clip means the
+            # clipping scales every other gradient down to almost nothing.
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            running["grad_norm"] = running.get("grad_norm", 0.0) + float(norm)
         opt.step()
 
         if step % cfg.log_every == 0:

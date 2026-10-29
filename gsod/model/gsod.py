@@ -54,8 +54,7 @@ from gsod.model.slot_attention import SlotAttention
 
 Splatter = Callable[..., dict[str, torch.Tensor]]
 
-# Floor on alpha in the compositing logits and colours: keeps log finite and
-# leaves a nearly transparent slot a gradient.
+# A slot's transparent part counts as this much of a layer at the far depth.
 _ALPHA_EPS = 1e-3
 
 
@@ -122,15 +121,27 @@ def composite(
     """Soft z-buffer over slots.
 
     layers: per slot, the splatter output (V, C, H, W): accumulated "rgb"
-    and "depth", and "alpha". A slot's transparent part counts as being at
-    the far depth, so an empty slot never wins. Returns (image (V, 3, H, W),
-    weights (V, K, H, W), summing to one over the slots).
+    and "depth", and "alpha". Slot k sits at its expected depth d_k (pulled
+    to the far depth where it is transparent) and gets the weight
+    w_k = alpha_k e_k / sum_j alpha_j e_j, e_k = exp(-d_k / tau); the image
+    is sum_k w_k * colour_k = sum_k rgb_k e_k / sum_j alpha_j e_j, with the
+    accumulated rgb_k, so no colour is divided by its own (possibly tiny)
+    alpha and no log alpha appears: both blew the gradients up for nearly
+    transparent slots. Returns (image (V, 3, H, W), weights (V, K, H, W),
+    summing to one over the slots).
     """
     rgb = torch.stack([layer["rgb"] for layer in layers], 1)  # (V, K, 3, H, W)
     alpha = torch.stack([layer["alpha"] for layer in layers], 1)  # (V, K, 1, H, W)
-    depth = torch.stack([layer["depth"] for layer in layers], 1) + (1.0 - alpha) * far
-    weights = (torch.log(alpha + _ALPHA_EPS) - depth / tau).softmax(1)
-    image = (weights * rgb / (alpha + _ALPHA_EPS)).sum(1)
+    acc_depth = torch.stack([layer["depth"] for layer in layers], 1)
+    # Detached denominator: alpha gets its gradient from the weights only.
+    depth = (acc_depth + _ALPHA_EPS * far) / (alpha + _ALPHA_EPS).detach()
+    logits = -depth / tau
+    # Per-pixel shift for exp, from the strongest slot; it cancels out.
+    shift = (torch.log(alpha + 1e-6) + logits).amax(1, keepdim=True).detach()
+    e = torch.exp(logits - shift)
+    norm = (alpha * e).sum(1) + 1e-6  # (V, 1, H, W)
+    image = (rgb * e).sum(1) / norm
+    weights = alpha * e / norm[:, None]
     return image, weights[:, :, 0]
 
 
