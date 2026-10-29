@@ -102,7 +102,7 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (N, H, W)
         "attn": np_(result["attn"]).reshape(-1, side, side),  # (K, s, s)
         "slots": np_(result["slots"]),  # (K, C) view-0 slots
-        # Frames as used in the forward pass: (K, 3) or None.
+        # Frames as used in the forward pass: (K, 3).
         "centre": np_(result["frame_centre"]),
         "mu": np_(g["mu"]),
         "scale": np_(g["scale"]),
@@ -221,12 +221,11 @@ def analyse(rec: dict) -> dict:
 
     # Frame centres of the object slots that actually draw something.
     centre_min_dist = float("nan")
-    if rec["centre"] is not None:
-        active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
+    active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
+    if len(active) > 1:
         c = rec["centre"][active]
-        if len(c) > 1:
-            d = np.linalg.norm(c[:, None] - c[None], axis=-1)
-            centre_min_dist = float(d[~np.eye(len(c), dtype=bool)].min())
+        d = np.linalg.norm(c[:, None] - c[None], axis=-1)
+        centre_min_dist = float(d[~np.eye(len(c), dtype=bool)].min())
 
     out = {
         "slot_cos_mean": float(np.mean(off)),

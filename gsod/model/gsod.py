@@ -177,7 +177,6 @@ class GSODModel(nn.Module):
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
         scene_config: dict | None = None,
-        canonical_azimuth: bool = True,
         decoder_cls: type[nn.Module] = AttentionDecoder,
     ):
         """num_slots: K, the background slot included.
@@ -196,7 +195,6 @@ class GSODModel(nn.Module):
         self.num_slots = num_slots
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
-        self.canonical_azimuth = bool(canonical_azimuth)
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -247,33 +245,25 @@ class GSODModel(nn.Module):
     def _decode(
         self,
         slots: torch.Tensor,
-        rays: tuple[torch.Tensor, torch.Tensor] | None,
+        rays: tuple[torch.Tensor, torch.Tensor],
         cam2world0: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots: (K, C), 0 = background; rays: view-0 rays of the object
-        slots or None. Returns (world-frame Gaussians, background first;
-        (M,) slot ids; (K, 3) frame centres in the view-0 azimuth frame, for
-        diagnostics, or None)."""
-        frames = [
-            getattr(getattr(d, "head", None), "frame", None)
-            for d in (self.bg_decoder, self.decoder)
-        ]
-        obj_frame = frames[1]
-        if obj_frame is not None:
-            obj_frame.ray = rays
-            obj_frame.anchor_weight = self.anchor_weight
-        frame_centre = None
+        slots. Returns (world-frame Gaussians, background first; (M,) slot
+        ids; (K, 3) frame centres in the view-0 azimuth frame, for
+        diagnostics)."""
+        bg_frame, obj_frame = self.bg_decoder.head.frame, self.decoder.head.frame
+        obj_frame.ray = rays
+        obj_frame.anchor_weight = self.anchor_weight
         try:
             bg_gaussians, _ = self.bg_decoder(slots[:1])
             obj_gaussians, obj_probs = self.decoder(slots[1:])
-            if None not in frames:
-                with torch.no_grad():  # frames actually used
-                    frame_centre = torch.cat(
-                        [frames[0](slots[:1])[0], frames[1](slots[1:])[0]]
-                    )
+            with torch.no_grad():  # the frames as used above
+                frame_centre = torch.cat(
+                    [bg_frame(slots[:1])[0], obj_frame(slots[1:])[0]]
+                )
         finally:
-            if obj_frame is not None:
-                obj_frame.ray = None
+            obj_frame.ray = None
         gaussians = {
             name: torch.cat([bg_gaussians[name], obj_gaussians[name]])
             for name in bg_gaussians
@@ -282,9 +272,7 @@ class GSODModel(nn.Module):
         slot_ids = torch.cat(
             [obj_probs.new_zeros(n_bg, dtype=torch.long), obj_probs.argmax(-1) + 1]
         )
-        if self.canonical_azimuth:
-            gaussians = yaw_to_world(gaussians, view_yaw(cam2world0))
-        return gaussians, slot_ids, frame_centre
+        return yaw_to_world(gaussians, view_yaw(cam2world0)), slot_ids, frame_centre
 
     def _render(
         self,
@@ -313,15 +301,8 @@ class GSODModel(nn.Module):
 
         # Gaussians (view-0 azimuth frame -> world), background first. Object
         # frames are anchored to the rays through their 2D masks' centroids.
-        rays = (
-            mask_rays(
-                aux_alpha[0, 1:].detach(),
-                cam2world[0],
-                self.image_size,
-                self.focal_ratio,
-            )
-            if self.canonical_azimuth
-            else None
+        rays = mask_rays(
+            aux_alpha[0, 1:].detach(), cam2world[0], self.image_size, self.focal_ratio
         )
         gaussians, slot_ids, frame_centre = self._decode(slots, rays, cam2world[0])
         rendered = self._render(gaussians, slot_ids, cam2world)

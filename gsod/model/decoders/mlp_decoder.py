@@ -6,8 +6,7 @@ Two minimal variants:
   kept for comparison).
 * ``SharedMLPDecoder``: one MLP shared by all slots.
 
-An optional ``SlotFrame`` plugin interprets the first three raw values as
-slot-frame offsets; by default they are absolute centres.
+The first three raw values are offsets inside each slot's ``SlotFrame``.
 """
 
 from __future__ import annotations
@@ -44,9 +43,9 @@ class Decoder(nn.Module):
         self,
         n_slots: int,
         z_dim: int,
-        gaussians_per_slot: int = 512,
-        hidden_dim: int = 128,
-        frame: SlotFrame | None = None,
+        gaussians_per_slot: int,
+        hidden_dim: int,
+        frame: SlotFrame,
     ):
         """Common decoder signature. n_slots: number of slots."""
         super().__init__()
@@ -55,7 +54,7 @@ class Decoder(nn.Module):
         self.z_dim = int(z_dim)
         self.hidden_dim = int(hidden_dim)
         self.n_gaussians = int(gaussians_per_slot)
-        self.head = GaussianParameterHead(frame=frame)
+        self.head = GaussianParameterHead(frame)
 
     def _pack(self, raw: torch.Tensor, slots: torch.Tensor):
         ids = torch.arange(self.n_slots, device=slots.device)
@@ -70,9 +69,7 @@ class Decoder(nn.Module):
 class PerSlotMLPDecoder(Decoder):
     """One independent MLP per slot."""
 
-    def __init__(
-        self, n_slots, z_dim, gaussians_per_slot=512, hidden_dim=128, frame=None
-    ):
+    def __init__(self, n_slots, z_dim, gaussians_per_slot, hidden_dim, frame):
         super().__init__(n_slots, z_dim, gaussians_per_slot, hidden_dim, frame)
         self.mlps = nn.ModuleList(
             [
@@ -96,9 +93,7 @@ class PerSlotMLPDecoder(Decoder):
 class SharedMLPDecoder(Decoder):
     """One MLP shared by all slots."""
 
-    def __init__(
-        self, n_slots, z_dim, gaussians_per_slot=512, hidden_dim=128, frame=None
-    ):
+    def __init__(self, n_slots, z_dim, gaussians_per_slot, hidden_dim, frame):
         super().__init__(n_slots, z_dim, gaussians_per_slot, hidden_dim, frame)
         self.fg_mlp = _make_mlp(z_dim, hidden_dim, self.n_gaussians)
 

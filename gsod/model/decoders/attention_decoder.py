@@ -23,9 +23,9 @@ class AttentionDecoder(nn.Module):
         self,
         n_slots: int,
         z_dim: int,
-        gaussians_per_slot: int = 512,
-        hidden_dim: int = 128,
-        frame: SlotFrame | None = None,
+        gaussians_per_slot: int,
+        hidden_dim: int,
+        frame: SlotFrame,
         *,
         n_heads: int = 4,
         n_tokens: int = 8,
@@ -59,9 +59,7 @@ class AttentionDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(2 * d_model, d_model),
         )
-        self.head = GaussianParameterHead(
-            in_dim=d_model, hidden_dim=d_model, frame=frame
-        )
+        self.head = GaussianParameterHead(frame, in_dim=d_model, hidden_dim=d_model)
 
     def _attend(self, q, k, v):
         q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]

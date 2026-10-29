@@ -8,9 +8,9 @@ GSODModel uses two decoders with this head: one for the object slots and one
 for the background slot, which differ in their SlotFrame bounds. Slot ids
 here are local to the decoder, 0..K-1 over the slots it decodes.
 
-By default the first three values are absolute centres. An optional
-``SlotFrame`` plugin interprets them as offsets inside a per-slot box in the
-*azimuth frame of the input view* (yaw-rotated so view 0 looks along +x).
+The first three values are offsets inside each slot's box (``SlotFrame``)
+in the *azimuth frame of the input view* (yaw-rotated so view 0 looks along
++x).
 """
 
 from __future__ import annotations
@@ -191,9 +191,9 @@ class GaussianParameterHead(nn.Module):
 
     def __init__(
         self,
+        frame: SlotFrame,
         in_dim: int = PARAMS_PER_GAUSSIAN,
         hidden_dim: int = 128,
-        frame: SlotFrame | None = None,
         frame_scale_min: float = 0.05,
         frame_scale_max: float = 0.5,
     ):
@@ -224,20 +224,14 @@ class GaussianParameterHead(nn.Module):
         assert raw.shape[-1] == PARAMS_PER_GAUSSIAN
         assert raw.shape[0] == slot_ids.shape[0]
 
-        if self.frame is None:
-            mu = raw[:, 0:3]
-            scale = torch.exp(raw[:, 3:6].clamp(-7.0, 0.0))
-        else:
-            centre, extent = self.frame(slots)
-            c, e = centre[slot_ids], extent[slot_ids]
-            mu = c + e * torch.tanh(raw[:, 0:3])
-            rel_scale = self.frame_scale_min + (
-                self.frame_scale_max - self.frame_scale_min
-            ) * torch.sigmoid(raw[:, 3:6])
-            scale = e * rel_scale
+        centre, extent = self.frame(slots)
+        c, e = centre[slot_ids], extent[slot_ids]
+        rel_scale = self.frame_scale_min + (
+            self.frame_scale_max - self.frame_scale_min
+        ) * torch.sigmoid(raw[:, 3:6])
         gaussians = {
-            "mu": mu,
-            "scale": scale,
+            "mu": c + e * torch.tanh(raw[:, 0:3]),
+            "scale": e * rel_scale,
             "quat": F.normalize(raw[:, 6:10], dim=-1),
             "opacity": torch.sigmoid(raw[:, 10]),
             "rgb": torch.sigmoid(raw[:, 11:14]),
