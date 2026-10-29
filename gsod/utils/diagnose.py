@@ -8,8 +8,10 @@ Answers, per scene and on average:
                        (attn FG-ARI, dominance)?
 3. Decoder          -- does the rendered slot partition follow the attention,
                        or do several slots redundantly draw the same object
-                       (render dominance, attn/render ARI)?
-4. Frames           -- are the frame centres of the drawing slots distinct?
+                       (render dominance, attn/render ARI)? Is every object
+                       owned by some slot (object recall)?
+4. Slot centres     -- are the centres of the drawing slots' Gaussians
+                       distinct?
 5. Features         -- can the encoder features / attention keys separate the
                        objects at all (k-means FG-ARI)? High while the
                        attention FG-ARI is low: the slot competition fails;
@@ -25,10 +27,9 @@ pass before training starts.
 
 Outputs in out_dir:
     sc####_diag.png   captioned sheet (see make_grid): title with the scene's
-                      key scores; one block per view: view 0 (images, masks
-                      and the 2D reconstruction; slot attention; rendered
-                      slot weights), then view 1 (images and masks; rendered
-                      slot weights). Each slot tile has its mask colour and
+                      key scores; one block per view: view 0 (images and
+                      masks; slot attention; rendered slot weights), then
+                      view 1 (images and masks; rendered slot weights). Each slot tile has its mask colour and
                       share of the image. Needs Pillow.
     summary.json      per-scene and mean statistics plus verdicts
 """
@@ -68,7 +69,8 @@ BG_ON_OBJECTS = 0.3  # background slot's share of the object pixels
 DOMINANCE_GOOD = 0.8  # share of the strongest object slot on object pixels
 DOMINANCE_BAD = 0.6
 ARI_GOOD = 0.7
-CENTRE_COLLAPSED = 0.05  # min pairwise distance of active frame centres
+CENTRE_COLLAPSED = 0.05  # min pairwise distance of active slot centres
+OBJECT_FOUND = 0.5  # share of a GT object's pixels one object slot must own
 ACTIVE_OPACITY = 0.05
 
 
@@ -102,16 +104,11 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (N, H, W)
         "attn": np_(result["attn"]).reshape(-1, side, side),  # (K, s, s)
         "slots": np_(result["slots"]),  # (K, C) view-0 slots
-        # Frames as used in the forward pass: (K, 3).
-        "centre": np_(result["frame_centre"]),
         "mu": np_(g["mu"]),
         "scale": np_(g["scale"]),
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
-        # 2D reconstruction of view 0 and its slot alphas.
-        "aux_rgb": np_(result["aux_rgb"][0]),  # (3, a, a)
-        "aux_alpha": np_(result["aux_alpha"][0]),  # (K, a, a)
         "feat_enc": np_(tokens[0]),  # (s*s, C) encoder features, view 0
         "feat_key": np_(keys[0]),  # (s*s, D) attention keys, view 0
     }
@@ -185,6 +182,21 @@ def feature_fg_ari(feat: np.ndarray, labels: np.ndarray) -> float:
     return ari(gt, pred)
 
 
+def object_recall(gt: np.ndarray, labels: np.ndarray) -> float:
+    """Share of the GT objects of which one object slot owns at least
+    OBJECT_FOUND of the pixels. Unlike FG-ARI, every object counts the same,
+    so small objects that are lost show up."""
+    found = []
+    for o in np.unique(gt):
+        if o == 0:
+            continue
+        own = labels[gt == o]
+        own = own[own > 0]
+        best = np.bincount(own).max() if own.size else 0
+        found.append(best >= OBJECT_FOUND * (gt == o).sum())
+    return float(np.mean(found)) if found else float("nan")
+
+
 def analyse(rec: dict) -> dict:
     n_slots = rec["alpha"].shape[1]  # K, slot 0 = background
     size = rec["mask_idx"].shape[1:]
@@ -201,11 +213,13 @@ def analyse(rec: dict) -> dict:
     cos = z_n @ z_n.T
     off = cos[~np.eye(len(z), dtype=bool)]
 
-    # Gaussians per slot.
-    per_slot = []
+    # Gaussians per slot; centre weighted by opacity.
+    per_slot, centres = [], []
     for k in range(n_slots):
         sel = rec["slot_ids"] == k
         mu = rec["mu"][sel]
+        w = rec["opacity"][sel]
+        centres.append((w[:, None] * mu).sum(0) / max(float(w.sum()), 1e-8))
         per_slot.append(
             {
                 "slot": k,
@@ -219,11 +233,11 @@ def analyse(rec: dict) -> dict:
             }
         )
 
-    # Frame centres of the object slots that actually draw something.
+    # Centres of the object slots that actually draw something.
     centre_min_dist = float("nan")
     active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
     if len(active) > 1:
-        c = rec["centre"][active]
+        c = np.stack([centres[k] for k in active])
         d = np.linalg.norm(c[:, None] - c[None], axis=-1)
         centre_min_dist = float(d[~np.eye(len(c), dtype=bool)].min())
 
@@ -245,6 +259,7 @@ def analyse(rec: dict) -> dict:
         out["feat_enc_fg_ari"] = feature_fg_ari(rec["feat_enc"], tok)
         out["feat_key_fg_ari"] = feature_fg_ari(rec["feat_key"], tok)
         out["render_fg_ari_view0"] = fg_ari(gt[0], rec["mask_idx"][0])
+        out["obj_recall_view0"] = object_recall(gt[0], rec["mask_idx"][0])
         novel = [fg_ari(gt[v], rec["mask_idx"][v]) for v in range(1, gt.shape[0])]
         novel = [x for x in novel if not np.isnan(x)]
         out["render_fg_ari_novel"] = float(np.mean(novel)) if novel else float("nan")
@@ -285,7 +300,7 @@ def verdicts(mean: dict) -> list[str]:
         redundant = g("attn_dominance") - g("render_dominance") > 0.1
         cause = (
             "several slots redraw the same object (render dominance well below "
-            "attention's); their frames overlap (see centre_min_dist)."
+            "attention's; see centre_min_dist)."
             if redundant
             else "slots draw their own objects, but the render is soft or misplaced "
             "(edges / thin parts lost to the background slot)."
@@ -304,7 +319,7 @@ def verdicts(mean: dict) -> list[str]:
         )
     if g("centre_min_dist") < CENTRE_COLLAPSED:
         msgs.append(
-            f"[frame] two active frames share a centre (min dist "
+            f"[decoder] two active slots share a centre (min dist "
             f"{g('centre_min_dist'):.3f}); slots stack on the same object."
         )
     if (
@@ -397,8 +412,6 @@ _TEXT = {
     "gt": "GT mask",
     "mask": "render mask",
     "attn_mask": "attention mask",
-    "aux_rgb": "2D recon",
-    "aux_mask": "2D slot mask",
     "pca_enc": "features (PCA)",
     "pca_key": "keys (PCA)",
     "slot": "{slot} {share:.0%}",
@@ -442,7 +455,7 @@ def make_grid(
     """Diagnostic sheet: one block per view, a caption under every tile.
 
     View 0  images: input, render, GT mask, render mask, attention mask,
-            2D reconstruction and its slot mask, PCA of the encoder
+            PCA of the encoder
             features and of the attention keys
             slot attention per slot (bg = background slot)
             rendered weight per slot
@@ -450,8 +463,8 @@ def make_grid(
             rendered weight per slot
     View 0 is the encoded input; view 1 is a novel view the encoder never
     sees, so it tests the 3D. Slot attention: share of each token given to
-    the slot. Rendered slot weight: share of each pixel drawn by the slot's
-    Gaussians (uncovered pixels: 0 for every slot). Grey tiles: white = 1 (all of
+    the slot. Rendered slot weight: the slot's compositing weight per pixel
+    (the weights sum to one over the slots). Grey tiles: white = 1 (all of
     the token / pixel), black = 0. Slot captions carry the slot's mask colour
     and its share of the image (the tile mean), so empty slots read 0%.
     Captions are English.
@@ -494,12 +507,6 @@ def make_grid(
                     image_tiles(0)
                     + [
                         (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
-                        (_rgb(_up(rec["aux_rgb"], size)), _txt("aux_rgb"), None),
-                        (
-                            _colorize(_up(rec["aux_alpha"], size).argmax(0)),
-                            _txt("aux_mask"),
-                            None,
-                        ),
                         (_pca_rgb(rec["feat_enc"], rec, size), _txt("pca_enc"), None),
                         (_pca_rgb(rec["feat_key"], rec, size), _txt("pca_key"), None),
                     ],
@@ -601,6 +608,7 @@ def _title(stats: dict) -> str:
         f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
         f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
         f"bg on objects {fmt(g('bg_on_objects'))} | "
+        f"objects found {fmt(g('obj_recall_view0'))} | "
         f"keys k-means FG-ARI {fmt(g('feat_key_fg_ari'))}"
     )
 
@@ -647,6 +655,7 @@ def diagnose(
         "render_fg_ari_view0",
         "render_fg_ari_novel",
         "attn_render_ari",
+        "obj_recall_view0",
         "centre_min_dist",
         "spread_min",
     ):

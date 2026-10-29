@@ -1,41 +1,30 @@
-"""Training loss: one reconstruction objective, no masks or targets.
+"""Training loss: reconstruction, plus two capacity terms on the object
+slots; no masks or targets.
 
-    total = l1    * L1(render, image)               novel views 1..V-1
-          + ssim  * (1 - SSIM(render, image))       novel views 1..V-1
-          + view0 * L1(render, image)               view 0 (the encoded view)
-          + aux2d * L1(2D recon, image)             view 0
-          + consistency * c * CE(render | 2D masks) view 0, c from train.py
+    total = l1          * L1(render, image)            novel views 1..V-1
+          + ssim        * (1 - SSIM(render, image))    novel views 1..V-1
+          + view0       * L1(render, image)            view 0 (the encoded view)
+          + appearance  * |colour residual|            object Gaussians
+          + compactness * c * spread beyond an object  object Gaussians,
+                                                       c from train.py
 
-Every term reaches every module that produced it (end to end), except the
-2D masks in the consistency term, which are its fixed target; the 3D and
-the 2D reconstruction share the encoder and the slot attention.
+Every term reaches every module that produced it (end to end).
 
-3D reconstruction (L1, SSIM)
+Reconstruction
     L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
-    a structure term, as in 3DGS. The novel views carry the 3D signal: a
-    decomposition that is consistent across views.
+    a structure term, as in 3DGS. The image is the slots' soft z-buffer
+    composite (gsod.py), so these terms are also the slots' competition for
+    the pixels. The novel views carry the 3D signal.
 
-aux2d -- "the slots reconstruct their image in 2D"
-    The spatial broadcast decoder's reconstruction of view 0 from its K
-    slots, against the image area-downsampled to its size. K
-    slots of equal capacity: drawing one part each costs less than one slot
-    drawing everything, which is what makes slot attention decompose a scene
-    (Slot Attention). L1 like the 3D term, so both send gradients of the
-    same size into the shared modules and neither drowns the other.
+appearance -- "one slot, one colour"
+    Mean |per-Gaussian colour residual| of the object Gaussians (logit units,
+    on top of the slot's base colour), weighted by opacity. Makes a slot a
+    poor fit for two objects of different colours.
 
-consistency -- "the 3D render follows the coarse 2D decomposition"
-    Per pixel of view 0 (at the 2D size), the rendered slot split should
-    follow the 2D decoder's slot masks. Both sides are cut off from the
-    shared slots: the 2D masks are detached, and the render is a second one
-    of view 0 from detached slots (GSODModel.render_detached), so only the
-    3D decoders learn and the 2D masks stay a product of 2D reconstruction
-    alone. Pulls the
-    background slot off the pixels 2D gives to objects and lines the 3D
-    slots up with the 2D ones. Scaled by c (train.py): off until the 2D
-    decomposition has formed, faded out late so that the 3D reconstruction
-    can refine what the coarse 2D masks cannot resolve. A small epsilon in
-    the normalisation keeps uncovered pixels at a uniform split with a
-    usable gradient.
+compactness -- "one slot, one object"
+    Opacity-weighted mean of (distance to the slot's centre beyond an
+    object's radius)^2. Off at first, so the slots start spread over the
+    object box and compete for every object; ramped in by train.py.
 """
 
 from __future__ import annotations
@@ -45,8 +34,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs.loss import LossConfig
-
-_EPS = 1e-6
 
 
 def _gaussian_window(
@@ -78,22 +65,6 @@ def ssim(
     return (num / den).mean()
 
 
-def _to_tokens(maps: torch.Tensor, side: int) -> torch.Tensor:
-    """(C, H, W) maps -> (C, side, side) by area averaging."""
-    if maps.shape[-2:] == (side, side):
-        return maps
-    return F.interpolate(maps[None], size=(side, side), mode="area")[0]
-
-
-def consistency_loss(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
-    """consistency: view-0 rendered slot split follows the 2D slot masks."""
-    target = outputs["aux_alpha"][0].detach()  # (K, a, a), sums to 1 per pixel
-    # View 0 rendered from detached slots: only the 3D decoders learn.
-    render = _to_tokens(outputs["slot_alpha_detached"][0], target.shape[-1]) + _EPS
-    render = render / render.sum(0, keepdim=True)
-    return -(target * torch.log(render)).sum(0).mean()
-
-
 class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
@@ -103,10 +74,10 @@ class GSODLoss(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         images: torch.Tensor,
-        consistency_scale: float = 1.0,
+        compactness_scale: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """outputs: model output; images: (V,3,H,W); consistency_scale: the
-        consistency schedule of this step (train.py). Returns (total,
+        """outputs: model output; images: (V,3,H,W); compactness_scale: the
+        compactness schedule of this step (train.py). Returns (total,
         per-term values for logging)."""
         cfg = self.cfg
         rendered, target = outputs["rgb"][1:], images[1:]
@@ -118,14 +89,10 @@ class GSODLoss(nn.Module):
         if cfg.view0 > 0:
             terms["view0"] = F.l1_loss(outputs["rgb"][:1], images[:1])
             weights["view0"] = cfg.view0
-        if cfg.aux2d > 0:
-            aux = outputs["aux_rgb"]  # (1, 3, a, a), view 0
-            target2d = F.interpolate(images[:1], size=aux.shape[-1], mode="area")
-            terms["aux2d"] = F.l1_loss(aux, target2d)
-            weights["aux2d"] = cfg.aux2d
-        if cfg.consistency > 0 and consistency_scale > 0:
-            terms["consistency"] = consistency_loss(outputs)
-            weights["consistency"] = cfg.consistency * consistency_scale
+        terms["appearance"] = outputs["appearance"]
+        weights["appearance"] = cfg.appearance
+        terms["compactness"] = outputs["compactness"]
+        weights["compactness"] = cfg.compactness * compactness_scale
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

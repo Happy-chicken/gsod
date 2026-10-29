@@ -9,11 +9,11 @@ kept here as the package-level factory, so callers can use::
 from __future__ import annotations
 
 from gsod.configs import BaseConfig
-from gsod.model.aux_decoder import SpatialBroadcastDecoder
 from gsod.model.decoders import (
     AttentionDecoder,
-    GaussianParameterHead,
-    SlotFrame,
+    BackgroundHead,
+    ObjectHead,
+    SceneBounds,
 )
 from gsod.model.checkpoint import load_networks, save_networks
 from gsod.model.encoder import Encoder
@@ -35,7 +35,6 @@ def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
         gaussians_per_slot=cfg.gaussians_per_slot,
         bg_gaussians_per_slot=cfg.bg_gaussians_per_slot,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
-        aux2d_size=cfg.aux2d_size,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
         # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none
@@ -48,10 +47,10 @@ __all__ = [
     "Encoder",
     "SlotAttention",
     "AttentionDecoder",
-    "GaussianParameterHead",
-    "SlotFrame",
+    "BackgroundHead",
+    "ObjectHead",
+    "SceneBounds",
     "GSODModel",
-    "SpatialBroadcastDecoder",
     "build_model",
     "save_networks",
     "load_networks",

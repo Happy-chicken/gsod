@@ -1,210 +1,195 @@
-"""Gaussian parameter head for slots.
+"""Gaussian parameter heads for slots.
 
-The head turns per-Gaussian features into the common output interface:
+A head turns the decoder's per-Gaussian features into Gaussians, in the
+*azimuth frame of the input view* (yaw-rotated so view 0 looks along +x):
 
-    mu / scale / quat / opacity / rgb
+    mu / scale / quat / opacity / rgb, each (K, G, ...) for K slots
 
-GSODModel uses two decoders with this head: one for the object slots and one
-for the background slot, which differ in their SlotFrame bounds. Slot ids
-here are local to the decoder, 0..K-1 over the slots it decodes.
+There is no per-slot frame: where a slot's Gaussians go is learned, inside
+fixed regions that are the structural prior (no masks):
 
-The first three values are offsets inside each slot's box (``SlotFrame``)
-in the *azimuth frame of the input view* (yaw-rotated so view 0 looks along
-+x).
+ObjectHead      object slots: anywhere in the object box, the volume objects
+                can occupy. Its Gaussians start spread over the whole box, so
+                every object slot can reach every object and the slots
+                compete for them (render-time compositing, gsod.py). Colour:
+                one base colour per slot plus a small per-Gaussian residual
+                ("rgb_residual", penalised in losses.py), so one slot is a
+                poor fit for two objects of different colours.
+BackgroundHead  background slot: a floor layer and a far shell, both outside
+                the object box, with a lower bound on scale, so it cannot
+                draw an object (at most a blurred decal on the floor, which
+                the other views reject).
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-PARAMS_PER_GAUSSIAN = 14  # mu/offset 3, log-scale 3, quat 4, opacity 1, rgb 3
-
-LOG_SCALE_INIT = math.log(0.1)
 OPACITY_INIT = -2.2  # sigmoid ~= 0.10
+OBJECT_SCALE_INIT = 0.1
+FLOOR_THICKNESS = 0.01
 
 
-def _init_head(head: nn.Linear) -> None:
-    """Shared projection head of the attention decoder.
+@dataclass(frozen=True)
+class SceneBounds:
+    """Scene geometry priors from a SceneGenConfig dict (meta.json["config"]).
 
-    It has a single bias row for all Gaussians, so the spatial spread must come
-    from the per-Gaussian queries. The offset rows therefore keep their default
-    weight scale; only the other rows are shrunk.
+    radius_range is the objects' half size: they rest on the floor with their
+    centres at z = floor + r. fg_xy / fg_z: the object box (the placement
+    area widened by the largest object; floor to the top of the largest
+    object). floor_reach: how far the floor layer extends (beyond the
+    cameras). reach: radius of the far shell.
     """
-    with torch.no_grad():
-        head.weight[3:].mul_(0.1)
-        head.bias.zero_()
-        head.bias[3:6] = LOG_SCALE_INIT
-        head.bias[6] = 1.0  # identity quaternion (w first, gsplat convention)
-        head.bias[10] = OPACITY_INIT
+
+    floor_z: float
+    r_min: float
+    r_max: float
+    fg_xy: float
+    fg_z: tuple[float, float]
+    floor_reach: float
+    reach: float
+
+    @classmethod
+    def from_config(cls, gen: dict) -> "SceneBounds":
+        r_min, r_max = (float(r) for r in gen["radius_range"])
+        floor_z = float(gen.get("floor_z", 0.0))
+        # A cube turned about z reaches sqrt(2) * r from its centre.
+        fg_xy = float(gen["placement_radius"]) + 1.5 * r_max
+        d_max = float(gen["distance_range"][1])
+        return cls(
+            floor_z=floor_z,
+            r_min=r_min,
+            r_max=r_max,
+            fg_xy=fg_xy,
+            fg_z=(floor_z, floor_z + 2.0 * r_max + 0.25),
+            floor_reach=d_max + fg_xy,
+            reach=3.0 * (d_max + float(gen.get("target_height", 0.4))),
+        )
 
 
 def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
 
 
-class SlotFrame(nn.Module):
-    """slot latent -> (centre, extent), bounded by dataset priors.
+def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    return torch.exp(math.log(lo) + (math.log(hi) - math.log(lo)) * torch.sigmoid(raw))
 
-    Everything is predicted from the slot latent alone: centre xy, softly
-    bounded to [-fg_xy, fg_xy]; centre z in [fg_z[0], fg_z[1]]; extent in
-    [fg_extent[0], fg_extent[1]], log-uniform in the predicted value and
-    initialised at fg_extent_init. Gaussian centres: centre + extent *
-    tanh(offset).
 
-    Ray anchoring (``self.ray`` and ``self.anchor_weight``, set by GSODModel
-    for object slots): the ray of view 0 through the centroid of the slot's
-    2D mask gives where the slot is seen; the anchored centre is where that
-    ray reaches the predicted height z, plus a learned residual of at most
-    anchor_residual. The centre used is (1 - w) * free + w * anchored, so the
-    coarse 2D decomposition places the 3D frames while the residual leaves
-    the 3D reconstruction room to correct them. Without a ray (or w = 0) the
-    centre is the free prediction.
+def _projection(d_model: int, n_params: int) -> nn.Sequential:
+    """Feature -> raw parameters. The first three rows (positions) keep their
+    default weight scale, so the spread of the decoder's Gaussian queries
+    spreads the Gaussians; the other rows start small."""
+    mlp = nn.Sequential(
+        nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, n_params)
+    )
+    with torch.no_grad():
+        mlp[-1].weight[3:].mul_(0.1)
+        mlp[-1].bias.zero_()
+    return mlp
 
-    The bounds are the structural prior (uORF's locality): object frames are
-    object-sized and inside the placement area, so the floor and everything
-    far away can only be drawn by the background slot, whose frame spans the
-    scene out beyond the cameras (``from_scene_config(..., background=True)``).
+
+class ObjectHead(nn.Module):
+    """Raw parameters: position 3, scale 3, quat 4, opacity 1, rgb residual 3."""
+
+    def __init__(self, z_dim: int, d_model: int, bounds: SceneBounds):
+        super().__init__()
+        self.xy = bounds.fg_xy
+        self.z = bounds.fg_z
+        self.scale_range = (0.02, bounds.r_max)
+        self.project = _projection(d_model, 14)
+        # Base colour of each slot, from its latent; starts at grey.
+        self.base = nn.Linear(z_dim, 3)
+        lo, hi = (math.log(s) for s in self.scale_range)
+        with torch.no_grad():
+            bias = self.project[-1].bias
+            bias[3:6] = _logit((math.log(OBJECT_SCALE_INIT) - lo) / (hi - lo))
+            bias[6] = 1.0  # identity quaternion (w first, gsplat convention)
+            bias[10] = OPACITY_INIT
+            self.base.weight.zero_()
+            self.base.bias.zero_()
+
+    def forward(self, feat: torch.Tensor, slots: torch.Tensor) -> dict[str, torch.Tensor]:
+        """feat: (K, G, d); slots: (K, C) -> Gaussians (K, G, ...), with the
+        colour residuals as "rgb_residual"."""
+        raw = self.project(feat)
+        z_lo, z_hi = self.z
+        mu = torch.cat(
+            [
+                self.xy * torch.tanh(raw[..., 0:2]),
+                z_lo + (z_hi - z_lo) * torch.sigmoid(raw[..., 2:3]),
+            ],
+            dim=-1,
+        )
+        residual = raw[..., 11:14]
+        return {
+            "mu": mu,
+            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "opacity": torch.sigmoid(raw[..., 10]),
+            "rgb": torch.sigmoid(self.base(slots)[:, None] + residual),
+            "rgb_residual": residual,
+        }
+
+
+class BackgroundHead(nn.Module):
+    """The first half of the Gaussians form a flat floor layer at floor_z
+    within floor_reach; the second half a shell around the scene centre from
+    just outside the object box out to reach. Scales are at least half the
+    smallest object's size.
+
+    Raw parameters: position / direction 3, shell radius 1, scale 3, quat 4,
+    opacity 1, rgb 3.
     """
 
-    def __init__(
-        self,
-        z_dim: int,
-        hidden_dim: int = 64,
-        *,
-        fg_xy: float = 2.1,
-        fg_z: tuple[float, float] = (0.0, 0.8),
-        fg_extent: tuple[float, float] = (0.1, 0.75),
-        fg_extent_init: float = 0.5,
-        anchor_residual: float = 0.5,
-    ):
+    def __init__(self, d_model: int, bounds: SceneBounds, n_gaussians: int):
         super().__init__()
-        # How far the learned residual may move an anchored centre in xy
-        # away from the point where the slot's ray reaches its height.
-        self.anchor_residual = float(anchor_residual)
-        # Set by GSODModel for the current forward pass: rays of view 0
-        # (origin (3,), directions (K, 3)) in the view-0 azimuth frame, and
-        # the weight of the anchored centre.
-        self.ray: tuple[torch.Tensor, torch.Tensor] | None = None
-        self.anchor_weight = 0.0
-        self.fg_xy = float(fg_xy)
-        self.fg_z = (float(fg_z[0]), float(fg_z[1]))
-        self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
-
-        self.fg = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 8)
+        self.n_floor = n_gaussians // 2
+        self.floor_z = bounds.floor_z
+        self.floor_reach = bounds.floor_reach
+        # The shell starts at the object box's farthest corner.
+        self.shell = (
+            math.sqrt(2.0 * bounds.fg_xy**2 + (bounds.fg_z[1] - bounds.floor_z) ** 2),
+            bounds.reach,
         )
-        log_lo, log_hi = math.log(self.fg_extent[0]), math.log(self.fg_extent[1])
+        s_min = 0.5 * bounds.r_min
+        self.floor_scale = (s_min, bounds.floor_reach / 4.0)
+        self.shell_scale = (s_min, bounds.reach / 4.0)
+        self.project = _projection(d_model, 15)
         with torch.no_grad():
-            # Keep default weight scale so different slot latents map to
-            # different centres from the start (no x0.1 here).
-            self.fg[-1].bias.zero_()
-            # Outputs 6:8, the anchored centre's residual, start at zero (on
-            # the ray); they are separate from the free centre (0:2), which
-            # is an absolute position and would saturate the residual's tanh.
-            self.fg[-1].weight[6:8].zero_()
-            self.fg[-1].bias[3:6] = _logit(
-                (math.log(fg_extent_init) - log_lo) / (log_hi - log_lo)
-            )
+            bias = self.project[-1].bias
+            bias[7] = 1.0  # identity quaternion
+            bias[11] = OPACITY_INIT
 
-    @classmethod
-    def from_scene_config(
-        cls, z_dim: int, gen: dict, background: bool = False, **kwargs
-    ) -> "SlotFrame":
-        """Priors from a SceneGenConfig dict (meta.json["config"]).
+    def forward(self, feat: torch.Tensor, slots: torch.Tensor) -> dict[str, torch.Tensor]:
+        """feat: (1, G, d) -> Gaussians (1, G, ...)."""
+        raw = self.project(feat)
+        floor, shell = raw[:, : self.n_floor], raw[:, self.n_floor :]
 
-        Object frames: up to an object's size (tanh rarely reaches 1, so the
-        extent must exceed the half size). Background frame: from the scene's
-        size out beyond the farthest camera, so it can surround every view.
-        """
-        r_max = float(gen["radius_range"][1])
-        fg_xy = float(gen["placement_radius"]) + 0.3
-        floor_z = float(gen.get("floor_z", 0.0))
-        if background:
-            reach = 3.0 * (
-                float(gen["distance_range"][1]) + float(gen.get("target_height", 0.4))
-            )
-            extent, extent_init = (fg_xy, reach), math.sqrt(fg_xy * reach)
-        else:
-            extent, extent_init = (0.1, 1.35 * r_max), min(0.5, 1.2 * r_max)
-        return cls(
-            z_dim,
-            fg_xy=fg_xy,
-            fg_z=(floor_z, floor_z + r_max + 0.25),
-            fg_extent=extent,
-            fg_extent_init=extent_init,
-            **kwargs,
+        floor_xy = self.floor_reach * torch.tanh(floor[..., 0:2])
+        floor_mu = torch.cat([floor_xy, torch.full_like(floor_xy[..., :1], self.floor_z)], -1)
+        floor_scale = _log_uniform(floor[..., 4:6], *self.floor_scale)
+        floor_scale = torch.cat(
+            [floor_scale, torch.full_like(floor_scale[..., :1], FLOOR_THICKNESS)], -1
         )
+        floor_quat = torch.zeros_like(floor[..., 7:11])
+        floor_quat[..., 0] = 1.0  # flat in xy
 
-    def forward(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots: (K, C) slots -> centre (K, 3), extent (K, 3)."""
-        out = self.fg(slots)
-        z_lo, z_hi = self.fg_z
-        z = z_lo + (z_hi - z_lo) * torch.sigmoid(out[:, 2:3])
-        xy = out[:, 0:2]
-        w = self.anchor_weight
-        if self.ray is not None and w > 0:
-            origin, direction = self.ray
-            # Rays at or above the horizon never come down to z; keep them
-            # finite (the xy bound below then clamps the result).
-            dz = direction[:, 2:3].clamp(max=-1e-2)
-            t = ((z - origin[2]) / dz).clamp(min=0.0)
-            anchored = origin[0:2] + t * direction[:, 0:2]
-            anchored = anchored + self.anchor_residual * torch.tanh(out[:, 6:8])
-            xy = (1.0 - w) * xy + w * anchored
-        xy = self.fg_xy * torch.tanh(xy / self.fg_xy)
-        log_lo, log_hi = math.log(self.fg_extent[0]), math.log(self.fg_extent[1])
-        extent = torch.exp(log_lo + (log_hi - log_lo) * torch.sigmoid(out[:, 3:6]))
-        return torch.cat([xy, z], dim=-1), extent
+        r_in, r_out = self.shell
+        radius = r_in + (r_out - r_in) * torch.sigmoid(shell[..., 3:4])
+        centre = shell.new_tensor([0.0, 0.0, self.floor_z])
+        shell_mu = centre + radius * F.normalize(shell[..., 0:3], dim=-1)
 
-
-class GaussianParameterHead(nn.Module):
-    """Project per-Gaussian features (in_dim) to the 14 raw parameters and
-    decode them into the common Gaussian dict."""
-
-    def __init__(
-        self,
-        frame: SlotFrame,
-        in_dim: int,
-        hidden_dim: int,
-        frame_scale_min: float = 0.05,
-        frame_scale_max: float = 0.5,
-    ):
-        super().__init__()
-        self.frame_scale_min = float(frame_scale_min)
-        self.frame_scale_max = float(frame_scale_max)
-        self.project = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(hidden_dim, PARAMS_PER_GAUSSIAN),
-        )
-        _init_head(self.project[-1])
-        self.frame = frame
-
-    def forward(
-        self, raw: torch.Tensor, slots: torch.Tensor, slot_ids: torch.Tensor
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """raw: (M, in_dim); slots: (K, C); slot_ids: (M,) in 0..K-1.
-
-        Returns the Gaussian dict and (M, K) one-hot slot probabilities.
-        """
-        raw = self.project(raw)
-        assert raw.shape[0] == slot_ids.shape[0]
-
-        centre, extent = self.frame(slots)
-        c, e = centre[slot_ids], extent[slot_ids]
-        rel_scale = self.frame_scale_min + (
-            self.frame_scale_max - self.frame_scale_min
-        ) * torch.sigmoid(raw[:, 3:6])
-        gaussians = {
-            "mu": c + e * torch.tanh(raw[:, 0:3]),
-            "scale": e * rel_scale,
-            "quat": F.normalize(raw[:, 6:10], dim=-1),
-            "opacity": torch.sigmoid(raw[:, 10]),
-            "rgb": torch.sigmoid(raw[:, 11:14]),
+        return {
+            "mu": torch.cat([floor_mu, shell_mu], 1),
+            "scale": torch.cat(
+                [floor_scale, _log_uniform(shell[..., 4:7], *self.shell_scale)], 1
+            ),
+            "quat": torch.cat([floor_quat, F.normalize(shell[..., 7:11], dim=-1)], 1),
+            "opacity": torch.sigmoid(raw[..., 11]),
+            "rgb": torch.sigmoid(raw[..., 12:15]),
         }
-        slot_probs = F.one_hot(slot_ids, slots.shape[0]).to(dtype=slots.dtype)
-        return gaussians, slot_probs

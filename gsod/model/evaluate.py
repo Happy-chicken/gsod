@@ -145,7 +145,7 @@ def render_scenes(
       view{v}_mask.png      slot partition (argmax slot per pixel; background
                             slot dark gray)
       view{v}_gt_mask.png   ground truth (if the loader provides masks)
-      view{v}_slot{k}.png   alpha of slot k, grayscale (white = 1)
+      view{v}_slot{k}.png   compositing weight of slot k, grayscale (white = 1)
     Per scene:
       attn_mask.png         slot-attention argmax on view 0 (same colours)
     """

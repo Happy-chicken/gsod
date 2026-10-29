@@ -1,8 +1,8 @@
 """gsplat CUDA splatter backend.
 
 ``GSODModel`` only calls a splatter with a fixed interface; ``GsplatSplatter``
-wraps the gsplat rasterizer. RGB and all per-slot channels are rendered in one
-pass, and all views are rendered in one batched call.
+wraps the gsplat rasterizer. One call renders one set of Gaussians (one
+slot) into all views at once: colour, alpha and depth.
 """
 
 from __future__ import annotations
@@ -33,12 +33,14 @@ class GsplatSplatter:
     def __call__(
         self,
         gaussians: dict[str, torch.Tensor],
-        slot_probs: torch.Tensor,
         cam2world: torch.Tensor,
         image_size: tuple[int, int],
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
     ) -> dict[str, torch.Tensor]:
+        """Returns, per view, (V, C, H, W): "rgb" (C = 3) and "depth" (C = 1),
+        both accumulated over the Gaussians (premultiplied by alpha), and
+        "alpha" (C = 1)."""
         if not gaussians["mu"].is_cuda:
             raise RuntimeError(
                 "GsplatSplatter needs CUDA tensors; this project requires CUDA"
@@ -52,13 +54,7 @@ class GsplatSplatter:
         scale = gaussians["scale"].float().contiguous()
         quat = gaussians["quat"].float().contiguous()
         opacity = gaussians["opacity"].float().contiguous()
-        rgb = gaussians["rgb"].float().contiguous()
-        slot_probs = slot_probs.to(device=device, dtype=torch.float32)
-        num_slots = slot_probs.shape[1]
-
-        # RGB and the per-slot weights share the same alpha weights, so one
-        # rasterization with N-D colors gives both.
-        colors = torch.cat([rgb, slot_probs], dim=-1).contiguous()
+        colors = gaussians["rgb"].float().contiguous()
 
         # gsplat takes the OpenCV world-to-camera matrix, not the transposed
         # world_view_transform used by the original 3DGS rasterizer.
@@ -71,7 +67,7 @@ class GsplatSplatter:
             .contiguous()
         )
 
-        rendered, _, _ = rasterization(
+        rendered, alpha, _ = rasterization(
             means=mu,
             quats=quat,
             scales=scale,
@@ -87,17 +83,17 @@ class GsplatSplatter:
             eps2d=self.eps2d,
             sh_degree=None,
             packed=self.packed,
-            render_mode="RGB",
+            # Accumulated depth (premultiplied), not the expected depth.
+            render_mode="RGB+D",
             rasterize_mode=self.rasterize_mode,
             channel_chunk=self.channel_chunk,
             camera_model="pinhole",
         )
 
         return {
-            "rgb": rendered[..., :3].permute(0, 3, 1, 2).contiguous(),
-            "slot_alpha": rendered[..., 3 : 3 + num_slots]
-            .permute(0, 3, 1, 2)
-            .contiguous(),
+            "rgb": rendered[..., :3].permute(0, 3, 1, 2),
+            "depth": rendered[..., 3:4].permute(0, 3, 1, 2),
+            "alpha": alpha.permute(0, 3, 1, 2),
         }
 
 

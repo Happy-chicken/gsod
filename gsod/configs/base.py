@@ -32,8 +32,6 @@ class BaseConfig:
     bg_gaussians_per_slot: int = 1024
     # Attention width d_model of the Gaussian decoders.
     decoder_hidden_dim: int = 128
-    # Side of the 2D reconstruction of view 0 (model/aux_decoder.py).
-    aux2d_size: int = 64
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
 
@@ -80,9 +78,9 @@ class BaseConfig:
     # None: the test split lives in data_root (Primordia).
     test_root: str | None = None
     # Scene priors (SceneGenConfig keys) for datasets without meta.json; they
-    # set the frame bounds (object size and placement area; the background's
-    # reach beyond the cameras), which are
-    # not stored in checkpoints, so train and test must use the same values.
+    # set the object box and the background's floor and shell (object size,
+    # placement area, camera distance), which are not stored in checkpoints,
+    # so train and test must use the same values.
     scene_prior: dict | None = None
     # Directory for checkpoints and their *_state.json files.
     out_dir: str = field(default_factory=lambda: default_out_dir("run"))

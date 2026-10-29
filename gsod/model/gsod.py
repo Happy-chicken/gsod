@@ -1,28 +1,24 @@
-"""Slot model: encoder -> slot attention -> Gaussian decoder -> splatting.
+"""Slot model: encoder -> slot attention -> Gaussians per slot -> splatting.
 
 views[0] -> Encoder -> tokens -> SlotAttention -> K slots (0 = background)
-    all slots       -> 2D spatial broadcast decoder -> view 0 (training signal)
-    background slot -> background Gaussian decoder --+
-    object slots    -> object Gaussian decoder ------+-> Gaussians (view-0
-                       azimuth frame -> world) -> splatting into every view
+    background slot -> background decoder: floor layer + far shell
+    object slots    -> object decoder: Gaussians anywhere in the object box
+    each slot's Gaussians (view-0 azimuth frame -> world) -> splatted on its
+        own into every view -> composited by a soft z-buffer over the slots
 
-Structural prior, as in uORF (no masks or foreground targets): slot 0 is the
-background, with its own slot-attention parameters and its own decoder,
-whose frame spans the scene out beyond the cameras; object frames are
-object-sized and inside the placement area (SlotFrame). Which pixels are
-background is still learned from reconstruction alone.
+The slots compete in the 3D render itself, with no 2D decoder and no masks:
 
-Coarse to fine: the 2D decoder's slot masks are a coarse decomposition of
-view 0. They guide the 3D model in two ways, without gradient back into the
-2D branch (the 2D masks are learned from 2D reconstruction alone):
-  * ray anchoring: each object slot's frame centre is pulled onto the ray of
-    view 0 through the centroid of its 2D mask (weight ``anchor_weight``,
-    raised by train.py once the 2D decomposition has formed);
-  * the consistency loss (losses.py): the rendered slot split of view 0
-    follows the 2D masks (faded out late in training, so the 3D
-    reconstruction refines what 2D cannot resolve). It is computed on a
-    second render of view 0 from detached slots, so it trains only the 3D
-    decoders and cannot reshape the slots, and with them the 2D masks.
+  * one share of each pixel: the compositing weights w_k(p) of the slots sum
+    to one (softmax over slots of log alpha_k - depth_k / tau), and the
+    image is sum_k w_k colour_k. The reconstruction gradient moves w towards
+    the slot whose colour fits the pixel, as in Slot Attention's decoder;
+    w_k is also slot k's mask, in every view.
+  * every slot can reach every object: object Gaussians start spread over
+    the whole object box (no per-slot frame).
+  * limited capacity: the background cannot enter the object box and has a
+    lower bound on scale; an object slot has one base colour (per-Gaussian
+    residuals are penalised) and is pulled compact (compactness term, from
+    train.py's schedule), so one slot is a poor fit for two objects.
 
 Slot indices in every output (masks, slot_alpha, attention rows):
     0       background
@@ -30,18 +26,13 @@ Slot indices in every output (masks, slot_alpha, attention rows):
 
 Only views[0] is encoded, in training as at inference.
 
-Training objective: reconstruction only (losses.py). Every gradient reaches
-every module; the 2D and the 3D reconstruction share the encoder and the
-slot attention.
-
 Frames
 ------
 Only views[0] is decoded into 3D and the camera azimuth is uniform over 360
 deg, so the image alone does not say where things are in *world* xy.
 Gaussians are therefore predicted in the azimuth frame of view 0 (yaw-rotated
-so view 0 looks along +x; uORF's nss2cam0), each slot's frame from its latent
-alone (SlotFrame), and rotated into the world before splatting. Cameras are
-never modified.
+so view 0 looks along +x; uORF's nss2cam0) and rotated into the world before
+splatting. Cameras are never modified.
 
 Everything that is rendered comes from Gaussians: there is no constant colour
 fill; a pixel no Gaussian covers renders black.
@@ -57,12 +48,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.data_generator.generator import SceneGenConfig
-from gsod.model.aux_decoder import SpatialBroadcastDecoder
-from gsod.model.decoders import AttentionDecoder, SlotFrame
+from gsod.model.decoders import AttentionDecoder, BackgroundHead, ObjectHead, SceneBounds
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 
 Splatter = Callable[..., dict[str, torch.Tensor]]
+
+# Floor on alpha in the compositing logits and colours: keeps log finite and
+# leaves a nearly transparent slot a gradient.
+_ALPHA_EPS = 1e-3
 
 
 def view_yaw(cam2world: torch.Tensor) -> torch.Tensor:
@@ -122,43 +116,22 @@ def yaw_to_world(
     }
 
 
-def mask_rays(
-    masks: torch.Tensor,
-    cam2world0: torch.Tensor,
-    image_size: tuple[int, int],
-    focal_ratio: tuple[float, float],
+def composite(
+    layers: list[dict[str, torch.Tensor]], far: float, tau: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Ray of view 0 through the centroid of each slot mask.
+    """Soft z-buffer over slots.
 
-    masks: (K, a, a) slot masks of view 0 (e.g. the 2D decoder's alphas).
-    Returns (origin (3,), directions (K, 3)) in the view-0 azimuth frame. The
-    azimuth frame is a rotation about +z, so heights are world heights;
-    SlotFrame intersects each ray with the height it predicts for that slot.
+    layers: per slot, the splatter output (V, C, H, W): accumulated "rgb"
+    and "depth", and "alpha". A slot's transparent part counts as being at
+    the far depth, so an empty slot never wins. Returns (image (V, 3, H, W),
+    weights (V, K, H, W), summing to one over the slots).
     """
-    side = masks.shape[-1]
-    h, w = image_size
-    weights = masks.flatten(1)
-    weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-8)
-    idx = torch.arange(side, device=masks.device, dtype=masks.dtype)
-    # Mask cell centres in image pixel coordinates (pixel centres at integers,
-    # matching the dataset and the area-downsampled 2D target).
-    u = (idx + 0.5) * w / side - 0.5
-    v = (idx + 0.5) * h / side - 0.5
-    vv, uu = torch.meshgrid(v, u, indexing="ij")
-    u_bar = (weights * uu.reshape(-1)).sum(-1)
-    v_bar = (weights * vv.reshape(-1)).sum(-1)
-
-    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
-    cx, cy = (w - 1.0) / 2.0, (h - 1.0) / 2.0
-    d_cam = torch.stack(
-        [(u_bar - cx) / fx, (v_bar - cy) / fy, torch.ones_like(u_bar)], -1
-    )
-    c2w = cam2world0.to(masks.dtype)
-    to_azimuth = _yaw_matrix(-view_yaw(cam2world0)).to(masks.dtype)
-    # World ray o + t * R d_cam, rotated into the azimuth frame.
-    origin = to_azimuth @ c2w[:3, 3]
-    directions = d_cam @ (to_azimuth @ c2w[:3, :3]).T
-    return origin, directions
+    rgb = torch.stack([layer["rgb"] for layer in layers], 1)  # (V, K, 3, H, W)
+    alpha = torch.stack([layer["alpha"] for layer in layers], 1)  # (V, K, 1, H, W)
+    depth = torch.stack([layer["depth"] for layer in layers], 1) + (1.0 - alpha) * far
+    weights = (torch.log(alpha + _ALPHA_EPS) - depth / tau).softmax(1)
+    image = (weights * rgb / (alpha + _ALPHA_EPS)).sum(1)
+    return image, weights[:, :, 0]
 
 
 class GSODModel(nn.Module):
@@ -173,16 +146,15 @@ class GSODModel(nn.Module):
         gaussians_per_slot: int = 512,
         bg_gaussians_per_slot: int = 1024,
         decoder_hidden_dim: int = 128,
-        aux2d_size: int = 64,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
         scene_config: dict | None = None,
     ):
         """num_slots: K, the background slot included.
         bg_gaussians_per_slot: Gaussians of the background slot.
-        aux2d_size: side of the 2D reconstruction of view 0.
         scene_config: the SceneGenConfig dict from meta.json (default: the
-        SceneGenConfig defaults); sets the frame bounds.
+        SceneGenConfig defaults); sets the object box and the background's
+        floor and shell.
         Slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
@@ -197,33 +169,33 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
-        self.aux_decoder = SpatialBroadcastDecoder(z_dim, size=aux2d_size)
         scene_config = scene_config or asdict(SceneGenConfig())
+        bounds = SceneBounds.from_config(scene_config)
         self.decoder = AttentionDecoder(
-            z_dim=z_dim,
-            gaussians_per_slot=gaussians_per_slot,
-            hidden_dim=decoder_hidden_dim,
-            frame=SlotFrame.from_scene_config(z_dim, scene_config),
+            z_dim,
+            gaussians_per_slot,
+            decoder_hidden_dim,
+            ObjectHead(z_dim, decoder_hidden_dim, bounds),
         )
-        # Weight of the ray-anchored object frame centres (SlotFrame); set
-        # per step by train.py, 1 = the trained model.
-        self.anchor_weight = 1.0
-        # Training only, set by train.py while the consistency loss is on:
-        # also render view 0 from detached slots (see forward).
-        self.render_detached = False
         self.bg_decoder = AttentionDecoder(
-            z_dim=z_dim,
-            gaussians_per_slot=bg_gaussians_per_slot,
-            hidden_dim=decoder_hidden_dim,
-            frame=SlotFrame.from_scene_config(z_dim, scene_config, background=True),
+            z_dim,
+            bg_gaussians_per_slot,
+            decoder_hidden_dim,
+            BackgroundHead(decoder_hidden_dim, bounds, bg_gaussians_per_slot),
         )
+        # Soft z-buffer: depth differences of a fraction of an object decide
+        # who is in front; transparent parts count as this far.
+        self.depth_tau = bounds.r_max / 4.0
+        self.far = bounds.reach + float(scene_config["distance_range"][1])
+        # Compactness: an object slot's Gaussians within this distance of
+        # their centre cost nothing.
+        self.object_radius = 1.5 * bounds.r_max
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks for checkpoint.save_networks / load_networks."""
         return {
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
-            "AuxDecoder": self.aux_decoder,
             "Decoder": self.decoder,
             "BgDecoder": self.bg_decoder,
         }
@@ -237,53 +209,20 @@ class GSODModel(nn.Module):
         )
         return feat.flatten(start_dim=2).permute(0, 2, 1)
 
-    def _decode(
-        self,
-        slots: torch.Tensor,
-        rays: tuple[torch.Tensor, torch.Tensor],
-        cam2world0: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots: (K, C), 0 = background; rays: view-0 rays of the object
-        slots. Returns (world-frame Gaussians, background first; (M,) slot
-        ids; (K, 3) frame centres in the view-0 azimuth frame, for
-        diagnostics)."""
-        bg_frame, obj_frame = self.bg_decoder.head.frame, self.decoder.head.frame
-        obj_frame.ray = rays
-        obj_frame.anchor_weight = self.anchor_weight
-        try:
-            bg_gaussians, _ = self.bg_decoder(slots[:1])
-            obj_gaussians, obj_probs = self.decoder(slots[1:])
-            with torch.no_grad():  # the frames as used above
-                frame_centre = torch.cat(
-                    [bg_frame(slots[:1])[0], obj_frame(slots[1:])[0]]
-                )
-        finally:
-            obj_frame.ray = None
-        gaussians = {
-            name: torch.cat([bg_gaussians[name], obj_gaussians[name]])
-            for name in bg_gaussians
-        }
-        n_bg = bg_gaussians["mu"].shape[0]
-        slot_ids = torch.cat(
-            [obj_probs.new_zeros(n_bg, dtype=torch.long), obj_probs.argmax(-1) + 1]
-        )
-        return yaw_to_world(gaussians, view_yaw(cam2world0)), slot_ids, frame_centre
-
-    def _render(
-        self,
-        gaussians: dict[str, torch.Tensor],
-        slot_ids: torch.Tensor,
-        cam2world: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        slot_probs = F.one_hot(slot_ids, self.num_slots).to(gaussians["mu"].dtype)
-        return self.splat(
-            gaussians,
-            slot_probs,
-            cam2world,
-            self.image_size,
-            self.focal_ratio,
-            self.near,
-        )
+    def _capacity_terms(
+        self, obj: dict[str, torch.Tensor], residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Object slots (K-1, G, ...): (compactness, appearance) terms, each
+        weighted by the (detached) opacity of the Gaussians, so invisible
+        Gaussians do not count and the terms cannot be met by fading."""
+        w = obj["opacity"].detach()  # (K-1, G)
+        mass = w.sum(1, keepdim=True).clamp_min(1e-8)
+        centre = (w[..., None] * obj["mu"]).sum(1) / mass  # (K-1, 3)
+        dist = ((obj["mu"] - centre[:, None]) ** 2).sum(-1).add(1e-12).sqrt()
+        total = w.sum().clamp_min(1e-8)
+        compactness = (w * F.relu(dist - self.object_radius) ** 2).sum() / total
+        appearance = (w * residual.abs().mean(-1)).sum() / total
+        return compactness, appearance
 
     def forward(
         self, images: torch.Tensor, cam2world: torch.Tensor
@@ -291,38 +230,39 @@ class GSODModel(nn.Module):
         """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
         Only views[0] is encoded."""
         slots, attn = self.slot_attention(self.encode(images[0:1]))
-        aux_rgb, aux_alpha = self.aux_decoder(slots)
         slots, attn = slots[0], attn[0]  # (K, C), (K, s*s)
 
-        # Gaussians (view-0 azimuth frame -> world), background first. Object
-        # frames are anchored to the rays through their 2D masks' centroids.
-        rays = mask_rays(
-            aux_alpha[0, 1:].detach(), cam2world[0], self.image_size, self.focal_ratio
-        )
-        gaussians, slot_ids, frame_centre = self._decode(slots, rays, cam2world[0])
-        rendered = self._render(gaussians, slot_ids, cam2world)
-        # Per-slot weights sum to the pixel's Gaussian coverage; uncovered
-        # pixels render black and take the argmax of zeros (slot 0, the
-        # background) in masks.
-        alpha = rendered["slot_alpha"]
+        obj = self.decoder(slots[1:])  # (K-1, G, ...), view-0 azimuth frame
+        residual = obj.pop("rgb_residual")
+        compactness, appearance = self._capacity_terms(obj, residual)
+        bg = self.bg_decoder(slots[:1])  # (1, G_bg, ...)
+        yaw = view_yaw(cam2world[0])
+        obj, bg = yaw_to_world(obj, yaw), yaw_to_world(bg, yaw)
 
-        out = {
-            "rgb": rendered["rgb"],
-            "slot_alpha": alpha,  # (N, K, H, W)
-            "mask_idx": alpha.argmax(dim=1),  # (N, H, W)
+        per_slot = [{name: bg[name][0] for name in bg}] + [
+            {name: obj[name][k] for name in obj} for k in range(slots.shape[0] - 1)
+        ]
+        layers = [
+            self.splat(g, cam2world, self.image_size, self.focal_ratio, self.near)
+            for g in per_slot
+        ]
+        image, weights = composite(layers, self.far, self.depth_tau)
+
+        gaussians = {name: torch.cat([g[name] for g in per_slot]) for name in bg}
+        slot_ids = torch.cat(
+            [
+                torch.full((g["mu"].shape[0],), k, device=slots.device)
+                for k, g in enumerate(per_slot)
+            ]
+        )
+        return {
+            "rgb": image,
+            "slot_alpha": weights,  # (N, K, H, W), sums to one over slots
+            "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": attn,  # (K, s*s) view-0 slot attention; row 0 = background
             "slots": slots,  # (K, C) view-0 slots; 0 = background
             "slot_ids": slot_ids,  # (M,) slot of each Gaussian
             "gaussians": gaussians,  # world frame, background first
-            "frame_centre": frame_centre,  # (K, 3) frames, view-0 azimuth frame
-            "aux_rgb": aux_rgb,  # (1, 3, a, a) 2D reconstruction of view 0
-            "aux_alpha": aux_alpha,  # (1, K, a, a)
+            "compactness": compactness,
+            "appearance": appearance,
         }
-        if self.training and self.render_detached:
-            # View 0 rendered from detached slots, for the consistency loss:
-            # its gradient trains only the 3D decoders, never the shared
-            # slots (which would drag the 2D masks it follows along).
-            detached, ids, _ = self._decode(slots.detach(), rays, cam2world[0])
-            view0 = self._render(detached, ids, cam2world[:1])
-            out["slot_alpha_detached"] = view0["slot_alpha"]  # (1, K, H, W)
-        return out
