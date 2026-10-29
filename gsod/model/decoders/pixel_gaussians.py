@@ -19,7 +19,11 @@ Geometry and appearance come from different inputs:
   the slots compete for each point by how well they explain it, and a slot
   that loses still gets a gradient. The mixer never sees the encoder
   features: what a Gaussian looks like must go through the slots, or the
-  reconstruction would not depend on them.
+  reconstruction would not depend on them. For the same reason it reads the
+  positions detached: otherwise PixelGeometry learns to code each pixel's
+  colour into tiny depth changes, which the Fourier features of one field
+  (the background's) decode, and the slots are bypassed through the
+  geometry. Geometry is trained by the rendering alone.
 
 Positions are in the azimuth frame of view 0 (see gsod.py).
 """
@@ -177,7 +181,8 @@ class SlotMixer(nn.Module):
     def forward(
         self, mu: torch.Tensor, slots: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pe = self.encode_position(mu)
+        # Detached: no colour path from the pixel features through the depth.
+        pe = self.encode_position(mu.detach())
         out = torch.cat([self.bg(slots[:1], pe), self.obj(slots[1:], pe)])  # (K, M, 4)
         sigma = F.softplus(out[..., 3])
         z_lo, z_hi = self.fg_z
