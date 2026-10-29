@@ -25,29 +25,6 @@ PARAMS_PER_GAUSSIAN = 14  # mu/offset 3, log-scale 3, quat 4, opacity 1, rgb 3
 
 LOG_SCALE_INIT = math.log(0.1)
 OPACITY_INIT = -2.2  # sigmoid ~= 0.10
-OFFSET_SPREAD = 0.8  # initial tanh(offset) ~ U(-0.8, 0.8) inside the frame
-
-
-def init_raw_bias(
-    bias: torch.Tensor,
-    *,
-    offset_spread: float = OFFSET_SPREAD,
-    opacity: float = OPACITY_INIT,
-) -> None:
-    """Initialise an (n_gaussians, 14) bias view in place.
-
-    Offsets get a fixed random spread, so every Gaussian starts at a different
-    point of its slot frame instead of all collapsing onto the frame centre.
-    """
-    n = bias.shape[0]
-    bias.zero_()
-    if offset_spread > 0:
-        u = torch.empty(n, 3, dtype=bias.dtype, device=bias.device)
-        u.uniform_(-offset_spread, offset_spread)
-        bias[:, 0:3] = torch.atanh(u)
-    bias[:, 3:6] = LOG_SCALE_INIT
-    bias[:, 6] = 1.0  # identity quaternion (w first, gsplat convention)
-    bias[:, 10] = opacity
 
 
 def _init_head(head: nn.Linear) -> None:
@@ -59,7 +36,10 @@ def _init_head(head: nn.Linear) -> None:
     """
     with torch.no_grad():
         head.weight[3:].mul_(0.1)
-        init_raw_bias(head.bias.view(1, PARAMS_PER_GAUSSIAN), offset_spread=0.0)
+        head.bias.zero_()
+        head.bias[3:6] = LOG_SCALE_INIT
+        head.bias[6] = 1.0  # identity quaternion (w first, gsplat convention)
+        head.bias[10] = OPACITY_INIT
 
 
 def _logit(p: float) -> float:
@@ -182,33 +162,26 @@ class SlotFrame(nn.Module):
 
 
 class GaussianParameterHead(nn.Module):
-    """Decode per-Gaussian raw parameters into the common Gaussian dict.
-
-    in_dim is 14 when the caller already produced raw Gaussian parameters
-    (the MLP decoders). Attention decoders pass their feature width and the
-    head projects it to 14 first.
-    """
+    """Project per-Gaussian features (in_dim) to the 14 raw parameters and
+    decode them into the common Gaussian dict."""
 
     def __init__(
         self,
         frame: SlotFrame,
-        in_dim: int = PARAMS_PER_GAUSSIAN,
-        hidden_dim: int = 128,
+        in_dim: int,
+        hidden_dim: int,
         frame_scale_min: float = 0.05,
         frame_scale_max: float = 0.5,
     ):
         super().__init__()
         self.frame_scale_min = float(frame_scale_min)
         self.frame_scale_max = float(frame_scale_max)
-        if in_dim == PARAMS_PER_GAUSSIAN:
-            self.project = nn.Identity()
-        else:
-            self.project = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(True),
-                nn.Linear(hidden_dim, PARAMS_PER_GAUSSIAN),
-            )
-            _init_head(self.project[-1])
+        self.project = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, PARAMS_PER_GAUSSIAN),
+        )
+        _init_head(self.project[-1])
         self.frame = frame
 
     def forward(
@@ -219,9 +192,6 @@ class GaussianParameterHead(nn.Module):
         Returns the Gaussian dict and (M, K) one-hot slot probabilities.
         """
         raw = self.project(raw)
-        if raw.dim() == 3:
-            raw = raw.reshape(-1, PARAMS_PER_GAUSSIAN)
-        assert raw.shape[-1] == PARAMS_PER_GAUSSIAN
         assert raw.shape[0] == slot_ids.shape[0]
 
         centre, extent = self.frame(slots)

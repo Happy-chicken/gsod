@@ -1,25 +1,18 @@
-"""Shared GS slot model: encoder, slot attention, selectable Gaussian decoder.
+"""Shared GS slot model: encoder, slot attention, Gaussian decoder.
 
 The gsplat splatter lives in ``gsod/utils/splatter.py``. ``build_model`` is
 kept here as the package-level factory, so callers can use::
 
     from gsod.model import GSODModel, build_model, load_networks
-
-The decoder is chosen by passing its class, e.g.
-``build_model(cfg, meta, decoder_cls=SharedMLPDecoder)``.
 """
 
 from __future__ import annotations
-
-from torch import nn
 
 from gsod.configs import BaseConfig
 from gsod.model.aux_decoder import SpatialBroadcastDecoder
 from gsod.model.decoders import (
     AttentionDecoder,
-    SharedMLPDecoder,
     GaussianParameterHead,
-    PerSlotMLPDecoder,
     SlotFrame,
 )
 from gsod.model.checkpoint import load_networks, save_networks
@@ -29,16 +22,8 @@ from gsod.model.slot_attention import SlotAttention
 from gsod.utils.splatter import GsplatSplatter
 
 
-def build_model(
-    cfg: BaseConfig,
-    meta: dict,
-    decoder_cls: type[nn.Module] = AttentionDecoder,
-) -> GSODModel:
-    """Build a GSODModel from a config profile and dataset metadata.
-
-    decoder_cls: ``AttentionDecoder``, ``SharedMLPDecoder`` or
-    ``PerSlotMLPDecoder`` (any class with the common decoder signature).
-    """
+def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
+    """Build a GSODModel from a config profile and dataset metadata."""
     height, width = meta["image_size"]
     return GSODModel(
         splat=GsplatSplatter(),
@@ -56,15 +41,12 @@ def build_model(
         # Primordia meta.json carries the SceneGenConfig; CLEVR-567 has none
         # and uses the profile's scene_prior instead.
         scene_config=meta.get("config", cfg.scene_prior),
-        decoder_cls=decoder_cls,
     )
 
 
 __all__ = [
     "Encoder",
     "SlotAttention",
-    "PerSlotMLPDecoder",
-    "SharedMLPDecoder",
     "AttentionDecoder",
     "GaussianParameterHead",
     "SlotFrame",

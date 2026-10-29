@@ -1,7 +1,7 @@
 """Base configuration for the GS slot model.
 
-Each slot is decoded into a fixed number of Gaussians by the decoder
-class passed to ``build_model`` (``AttentionDecoder`` by default).
+Each slot is decoded into a fixed number of Gaussians by an
+``AttentionDecoder``.
 
 ``PrimordiaConfig`` and ``Clevr567Config`` inherit these fields and only
 override dataset-specific values.
@@ -30,7 +30,7 @@ class BaseConfig:
     gaussians_per_slot: int = 512
     # and by the background slot (it covers more of the image).
     bg_gaussians_per_slot: int = 1024
-    # Hidden width of the decoder (MLP width, or attention width d_model).
+    # Attention width d_model of the Gaussian decoders.
     decoder_hidden_dim: int = 128
     # Side of the 2D reconstruction of view 0 (model/aux_decoder.py).
     aux2d_size: int = 64

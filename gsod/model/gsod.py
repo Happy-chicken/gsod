@@ -177,15 +177,12 @@ class GSODModel(nn.Module):
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
         scene_config: dict | None = None,
-        decoder_cls: type[nn.Module] = AttentionDecoder,
     ):
         """num_slots: K, the background slot included.
         bg_gaussians_per_slot: Gaussians of the background slot.
         aux2d_size: side of the 2D reconstruction of view 0.
         scene_config: the SceneGenConfig dict from meta.json (default: the
         SceneGenConfig defaults); sets the frame bounds.
-        decoder_cls: Gaussian decoder class (AttentionDecoder, SharedMLPDecoder,
-        PerSlotMLPDecoder), built with the common decoder signature.
         Slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
@@ -202,8 +199,7 @@ class GSODModel(nn.Module):
         )
         self.aux_decoder = SpatialBroadcastDecoder(z_dim, size=aux2d_size)
         scene_config = scene_config or asdict(SceneGenConfig())
-        self.decoder = decoder_cls(
-            n_slots=num_slots - 1,
+        self.decoder = AttentionDecoder(
             z_dim=z_dim,
             gaussians_per_slot=gaussians_per_slot,
             hidden_dim=decoder_hidden_dim,
@@ -215,8 +211,7 @@ class GSODModel(nn.Module):
         # Training only, set by train.py while the consistency loss is on:
         # also render view 0 from detached slots (see forward).
         self.render_detached = False
-        self.bg_decoder = decoder_cls(
-            n_slots=1,
+        self.bg_decoder = AttentionDecoder(
             z_dim=z_dim,
             gaussians_per_slot=bg_gaussians_per_slot,
             hidden_dim=decoder_hidden_dim,

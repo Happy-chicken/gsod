@@ -21,7 +21,6 @@ from gsod.model.decoders.parameter_head import GaussianParameterHead, SlotFrame
 class AttentionDecoder(nn.Module):
     def __init__(
         self,
-        n_slots: int,
         z_dim: int,
         gaussians_per_slot: int,
         hidden_dim: int,
@@ -31,9 +30,8 @@ class AttentionDecoder(nn.Module):
         n_tokens: int = 8,
         query_std: float = 2.0,
     ):
-        """Common decoder signature (n_slots, z_dim, gaussians_per_slot,
-        hidden_dim, frame); n_slots is not needed here (the decoder works for
-        any number of slots). hidden_dim is the attention width d_model."""
+        """Works for any number of slots; hidden_dim is the attention width
+        d_model."""
         super().__init__()
         d_model = int(hidden_dim)
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
