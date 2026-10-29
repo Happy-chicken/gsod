@@ -8,13 +8,15 @@ A head turns the decoder's per-Gaussian features into Gaussians, in the
 There is no per-slot frame: where a slot's Gaussians go is learned, inside
 fixed regions that are the structural prior (no masks):
 
-ObjectHead      object slots: anywhere in the object box, the volume objects
-                can occupy. Its Gaussians start spread over the whole box, so
-                every object slot can reach every object and the slots
-                compete for them (render-time compositing, gsod.py). Colour:
-                one base colour per slot plus a small per-Gaussian residual
-                ("rgb_residual", penalised in losses.py), so one slot is a
-                poor fit for two objects of different colours.
+ObjectHead      object slots: around the region the slot's attention covers
+                (centre and extent per slot, from GSODModel), starting with
+                that region's mean colour, so a slot's Gaussians depend on
+                the input through its attention from the first step. While
+                the attention is still spread, so are the Gaussians. Colour:
+                region colour + a per-slot correction from the latent + a
+                small per-Gaussian residual ("rgb_residual", penalised in
+                losses.py), so one slot is a poor fit for two objects of
+                different colours.
 BackgroundHead  background slot: a floor layer and a far shell, both outside
                 the object box, with a lower bound on scale, so it cannot
                 draw an object (at most a blurred decal on the floor, which
@@ -98,11 +100,9 @@ class ObjectHead(nn.Module):
 
     def __init__(self, z_dim: int, d_model: int, bounds: SceneBounds):
         super().__init__()
-        self.xy = bounds.fg_xy
-        self.z = bounds.fg_z
         self.scale_range = (0.02, bounds.r_max)
         self.project = _projection(d_model, 14)
-        # Base colour of each slot, from its latent; starts at grey.
+        # Colour correction of each slot, from its latent; starts at zero.
         self.base = nn.Linear(z_dim, 3)
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
@@ -113,25 +113,26 @@ class ObjectHead(nn.Module):
             self.base.weight.zero_()
             self.base.bias.zero_()
 
-    def forward(self, feat: torch.Tensor, slots: torch.Tensor) -> dict[str, torch.Tensor]:
-        """feat: (K, G, d); slots: (K, C) -> Gaussians (K, G, ...), with the
-        colour residuals as "rgb_residual"."""
+    def forward(
+        self,
+        feat: torch.Tensor,
+        slots: torch.Tensor,
+        centre: torch.Tensor,
+        extent: torch.Tensor,
+        colour: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """feat: (K, G, d); slots: (K, C); per slot, its attention region:
+        centre (K, 3), extent (K, 3) and mean colour (K, 3) -> Gaussians
+        (K, G, ...), with the colour residuals as "rgb_residual"."""
         raw = self.project(feat)
-        z_lo, z_hi = self.z
-        mu = torch.cat(
-            [
-                self.xy * torch.tanh(raw[..., 0:2]),
-                z_lo + (z_hi - z_lo) * torch.sigmoid(raw[..., 2:3]),
-            ],
-            dim=-1,
-        )
         residual = raw[..., 11:14]
+        region = torch.logit(colour.clamp(0.02, 0.98)) + self.base(slots)
         return {
-            "mu": mu,
+            "mu": centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3]),
             "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(raw[..., 10]),
-            "rgb": torch.sigmoid(self.base(slots)[:, None] + residual),
+            "rgb": torch.sigmoid(region[:, None] + residual),
             "rgb_residual": residual,
         }
 

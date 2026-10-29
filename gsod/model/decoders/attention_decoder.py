@@ -62,11 +62,12 @@ class AttentionDecoder(nn.Module):
         q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
         return q + self.ffn(self.norm_ff(q))
 
-    def forward(self, slots: torch.Tensor) -> dict[str, torch.Tensor]:
-        """slots: (K, C) -> Gaussians (K, G, ...), grouped by slot."""
+    def forward(self, slots: torch.Tensor, **context) -> dict[str, torch.Tensor]:
+        """slots: (K, C) -> Gaussians (K, G, ...), grouped by slot. context:
+        extra per-slot inputs of the head."""
         K = slots.shape[0]
         assert K >= 1
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
-        return self.head(self._attend(q, k, v), slots)
+        return self.head(self._attend(q, k, v), slots, **context)

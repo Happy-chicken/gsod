@@ -14,8 +14,12 @@ The slots compete in the 3D render itself, with no 2D decoder and no masks:
     the slots it hides or that hide it, and the reconstruction gradient
     moves the pixel to the slot whose colour fits; w_k is also slot k's
     mask, in every view.
-  * every slot can reach every object: object Gaussians start spread over
-    the whole object box (no per-slot frame).
+  * input-dependent from the first step: each object slot's Gaussians sit
+    in the region its attention covers (attention-weighted centre and spread
+    of the points where the token rays reach object height) and start with
+    that region's mean colour (``attention_regions``). The reconstruction
+    gradient reaches the attention through them; while the attention is
+    still spread, so are the Gaussians.
   * limited capacity: the background cannot enter the object box and has a
     lower bound on scale; an object slot has one base colour (per-Gaussian
     residuals are penalised) and is pulled compact (compactness term, from
@@ -116,6 +120,56 @@ def yaw_to_world(
     }
 
 
+def token_points(
+    cam2world0: torch.Tensor,
+    side: int,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+    height: float,
+    xy_bound: float,
+) -> torch.Tensor:
+    """(side*side, 3), row-major: where the view-0 ray through the centre of
+    each encoder token cell reaches z = height, in the view-0 azimuth frame,
+    with xy clamped to [-xy_bound, xy_bound] (rays at or above the horizon
+    end on the bound)."""
+    h, w = image_size
+    c2w = cam2world0
+    idx = torch.arange(side, device=c2w.device, dtype=c2w.dtype)
+    # Cell centres in image pixel coordinates (pixel centres at integers,
+    # matching the dataset and the bilinear resize into the encoder).
+    u = (idx + 0.5) * w / side - 0.5
+    v = (idx + 0.5) * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
+    cx, cy = (w - 1.0) / 2.0, (h - 1.0) / 2.0
+    d_cam = torch.stack([(uu - cx) / fx, (vv - cy) / fy, torch.ones_like(uu)], -1)
+    to_azimuth = _yaw_matrix(-view_yaw(c2w)).to(c2w.dtype)
+    origin = to_azimuth @ c2w[:3, 3]
+    directions = d_cam.reshape(-1, 3) @ (to_azimuth @ c2w[:3, :3]).T
+    t = ((height - origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
+    xy = (origin[:2] + t[:, None] * directions[:, :2]).clamp(-xy_bound, xy_bound)
+    return torch.cat([xy, torch.full_like(xy[:, :1], height)], -1)
+
+
+def attention_regions(
+    attn: torch.Tensor,
+    points: torch.Tensor,
+    colours: torch.Tensor,
+    extent_range: tuple[float, float],
+    half_height: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Each slot's attention region: attn (K, N) over N tokens, their points
+    (N, 3) and colours (N, 3) -> centre (K, 3) and mean colour (K, 3), the
+    attention-weighted means, and extent (K, 3): twice the weighted spread
+    in xy, within extent_range, and half_height in z."""
+    p = attn / attn.sum(1, keepdim=True)
+    centre = p @ points
+    spread = (p @ points[:, :2] ** 2 - centre[:, :2] ** 2).clamp_min(0.0).add(1e-8).sqrt()
+    extent_xy = (2.0 * spread).clamp(*extent_range)
+    extent = torch.cat([extent_xy, torch.full_like(extent_xy[:, :1], half_height)], -1)
+    return centre, extent, p @ colours
+
+
 def composite(
     layers: list[dict[str, torch.Tensor]], tau: float, far: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -186,6 +240,7 @@ class GSODModel(nn.Module):
         )
         scene_config = scene_config or asdict(SceneGenConfig())
         bounds = SceneBounds.from_config(scene_config)
+        self.bounds = bounds
         self.decoder = AttentionDecoder(
             z_dim,
             gaussians_per_slot,
@@ -248,7 +303,19 @@ class GSODModel(nn.Module):
         slots, attn = self.slot_attention(self.encode(images[0:1]))
         slots, attn = slots[0], attn[0]  # (K, C), (K, s*s)
 
-        obj = self.decoder(slots[1:])  # (K-1, G, ...), view-0 azimuth frame
+        # Object slots start from their attention regions: token rays at the
+        # height of an average object's centre, and the token colours.
+        b, side = self.bounds, self.input_size
+        mid = 0.5 * (b.r_min + b.r_max)
+        points = token_points(
+            cam2world[0], side, self.image_size, self.focal_ratio, b.floor_z + mid, b.fg_xy
+        )
+        colours = F.interpolate(images[0:1], size=side, mode="area")[0].flatten(1).T
+        centre, extent, colour = attention_regions(
+            attn[1:], points, colours, (b.r_max, b.fg_xy), b.r_max + 0.125
+        )
+        # (K-1, G, ...), view-0 azimuth frame
+        obj = self.decoder(slots[1:], centre=centre, extent=extent, colour=colour)
         residual = obj.pop("rgb_residual")
         compactness, appearance = self._capacity_terms(obj, residual)
         bg = self.bg_decoder(slots[:1])  # (1, G_bg, ...)
