@@ -115,13 +115,17 @@ class SlotFrame(nn.Module):
         self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
 
         self.fg = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 6)
+            nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 8)
         )
         log_lo, log_hi = math.log(self.fg_extent[0]), math.log(self.fg_extent[1])
         with torch.no_grad():
             # Keep default weight scale so different slot latents map to
             # different centres from the start (no x0.1 here).
             self.fg[-1].bias.zero_()
+            # Outputs 6:8, the anchored centre's residual, start at zero (on
+            # the ray); they are separate from the free centre (0:2), which
+            # is an absolute position and would saturate the residual's tanh.
+            self.fg[-1].weight[6:8].zero_()
             self.fg[-1].bias[3:6] = _logit(
                 (math.log(fg_extent_init) - log_lo) / (log_hi - log_lo)
             )
@@ -169,7 +173,7 @@ class SlotFrame(nn.Module):
             dz = direction[:, 2:3].clamp(max=-1e-2)
             t = ((z - origin[2]) / dz).clamp(min=0.0)
             anchored = origin[0:2] + t * direction[:, 0:2]
-            anchored = anchored + self.anchor_residual * torch.tanh(xy)
+            anchored = anchored + self.anchor_residual * torch.tanh(out[:, 6:8])
             xy = (1.0 - w) * xy + w * anchored
         xy = self.fg_xy * torch.tanh(xy / self.fg_xy)
         log_lo, log_hi = math.log(self.fg_extent[0]), math.log(self.fg_extent[1])

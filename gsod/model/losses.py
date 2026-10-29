@@ -25,8 +25,11 @@ aux2d -- "the slots reconstruct their image in 2D"
 
 consistency -- "the 3D render follows the coarse 2D decomposition"
     Per pixel of view 0 (at the 2D size), the rendered slot split should
-    follow the 2D decoder's slot masks, detached: only the 3D model learns,
-    the 2D masks stay a product of 2D reconstruction alone. Pulls the
+    follow the 2D decoder's slot masks. Both sides are cut off from the
+    shared slots: the 2D masks are detached, and the render is a second one
+    of view 0 from detached slots (GSODModel.render_detached), so only the
+    3D decoders learn and the 2D masks stay a product of 2D reconstruction
+    alone. Pulls the
     background slot off the pixels 2D gives to objects and lines the 3D
     slots up with the 2D ones. Scaled by c (train.py): off until the 2D
     decomposition has formed, faded out late so that the 3D reconstruction
@@ -85,7 +88,8 @@ def _to_tokens(maps: torch.Tensor, side: int) -> torch.Tensor:
 def consistency_loss(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
     """consistency: view-0 rendered slot split follows the 2D slot masks."""
     target = outputs["aux_alpha"][0].detach()  # (K, a, a), sums to 1 per pixel
-    render = _to_tokens(outputs["slot_alpha"][0], target.shape[-1]) + _EPS
+    # View 0 rendered from detached slots: only the 3D decoders learn.
+    render = _to_tokens(outputs["slot_alpha_detached"][0], target.shape[-1]) + _EPS
     render = render / render.sum(0, keepdim=True)
     return -(target * torch.log(render)).sum(0).mean()
 

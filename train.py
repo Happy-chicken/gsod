@@ -104,6 +104,7 @@ def train(
 
         anchor, consistency = _coarse_to_fine(step, cfg.steps)
         model.anchor_weight = anchor
+        model.render_detached = consistency > 0
         loss, terms = criterion(model(images, cams), images, consistency)
         opt.zero_grad(set_to_none=True)
         loss.backward()
