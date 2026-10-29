@@ -4,8 +4,10 @@
           + ssim  * (1 - SSIM(render, image))       novel views 1..V-1
           + view0 * L1(render, image)               view 0 (the encoded view)
           + aux2d * L1(2D recon, image)             view 0
+          + consistency * c * CE(render | 2D masks) view 0, c from train.py
 
-Every term reaches every module that produced it (end to end); the 3D and
+Every term reaches every module that produced it (end to end), except the
+2D masks in the consistency term, which are its fixed target; the 3D and
 the 2D reconstruction share the encoder and the slot attention.
 
 3D reconstruction (L1, SSIM)
@@ -20,6 +22,17 @@ aux2d -- "the slots reconstruct their image in 2D"
     drawing everything, which is what makes slot attention decompose a scene
     (Slot Attention). L1 like the 3D term, so both send gradients of the
     same size into the shared modules and neither drowns the other.
+
+consistency -- "the 3D render follows the coarse 2D decomposition"
+    Per pixel of view 0 (at the 2D size), the rendered slot split should
+    follow the 2D decoder's slot masks, detached: only the 3D model learns,
+    the 2D masks stay a product of 2D reconstruction alone. Pulls the
+    background slot off the pixels 2D gives to objects and lines the 3D
+    slots up with the 2D ones. Scaled by c (train.py): off until the 2D
+    decomposition has formed, faded out late so that the 3D reconstruction
+    can refine what the coarse 2D masks cannot resolve. A small epsilon in
+    the normalisation keeps uncovered pixels at a uniform split with a
+    usable gradient.
 """
 
 from __future__ import annotations
@@ -69,16 +82,28 @@ def _to_tokens(maps: torch.Tensor, side: int) -> torch.Tensor:
     return F.interpolate(maps[None], size=(side, side), mode="area")[0]
 
 
+def consistency_loss(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """consistency: view-0 rendered slot split follows the 2D slot masks."""
+    target = outputs["aux_alpha"][0].detach()  # (K, a, a), sums to 1 per pixel
+    render = _to_tokens(outputs["slot_alpha"][0], target.shape[-1]) + _EPS
+    render = render / render.sum(0, keepdim=True)
+    return -(target * torch.log(render)).sum(0).mean()
+
+
 class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
 
     def forward(
-        self, outputs: dict[str, torch.Tensor], images: torch.Tensor
+        self,
+        outputs: dict[str, torch.Tensor],
+        images: torch.Tensor,
+        consistency_scale: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """outputs: model output; images: (V,3,H,W). Returns (total, per-term
-        values for logging)."""
+        """outputs: model output; images: (V,3,H,W); consistency_scale: the
+        consistency schedule of this step (train.py). Returns (total,
+        per-term values for logging)."""
         cfg = self.cfg
         rendered, target = outputs["rgb"][1:], images[1:]
         terms: dict[str, torch.Tensor] = {
@@ -94,6 +119,9 @@ class GSODLoss(nn.Module):
             target2d = F.interpolate(images[:1], size=aux.shape[-1], mode="area")
             terms["aux2d"] = F.l1_loss(aux, target2d)
             weights["aux2d"] = cfg.aux2d
+        if cfg.consistency > 0 and consistency_scale > 0:
+            terms["consistency"] = consistency_loss(outputs)
+            weights["consistency"] = cfg.consistency * consistency_scale
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

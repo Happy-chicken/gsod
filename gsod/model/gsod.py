@@ -12,6 +12,16 @@ whose frame spans the scene out beyond the cameras; object frames are
 object-sized and inside the placement area (SlotFrame). Which pixels are
 background is still learned from reconstruction alone.
 
+Coarse to fine: the 2D decoder's slot masks are a coarse decomposition of
+view 0. They guide the 3D model in two ways, without gradient back into the
+2D branch (the 2D masks are learned from 2D reconstruction alone):
+  * ray anchoring: each object slot's frame centre is pulled onto the ray of
+    view 0 through the centroid of its 2D mask (weight ``anchor_weight``,
+    raised by train.py once the 2D decomposition has formed);
+  * the consistency loss (losses.py): the rendered slot split of view 0
+    follows the 2D masks (faded out late in training, so the 3D
+    reconstruction refines what 2D cannot resolve).
+
 Slot indices in every output (masks, slot_alpha, attention rows):
     0       background
     1..K-1  objects
@@ -110,6 +120,45 @@ def yaw_to_world(
     }
 
 
+def mask_rays(
+    masks: torch.Tensor,
+    cam2world0: torch.Tensor,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ray of view 0 through the centroid of each slot mask.
+
+    masks: (K, a, a) slot masks of view 0 (e.g. the 2D decoder's alphas).
+    Returns (origin (3,), directions (K, 3)) in the view-0 azimuth frame. The
+    azimuth frame is a rotation about +z, so heights are world heights;
+    SlotFrame intersects each ray with the height it predicts for that slot.
+    """
+    side = masks.shape[-1]
+    h, w = image_size
+    weights = masks.flatten(1)
+    weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-8)
+    idx = torch.arange(side, device=masks.device, dtype=masks.dtype)
+    # Mask cell centres in image pixel coordinates (pixel centres at integers,
+    # matching the dataset and the area-downsampled 2D target).
+    u = (idx + 0.5) * w / side - 0.5
+    v = (idx + 0.5) * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    u_bar = (weights * uu.reshape(-1)).sum(-1)
+    v_bar = (weights * vv.reshape(-1)).sum(-1)
+
+    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
+    cx, cy = (w - 1.0) / 2.0, (h - 1.0) / 2.0
+    d_cam = torch.stack(
+        [(u_bar - cx) / fx, (v_bar - cy) / fy, torch.ones_like(u_bar)], -1
+    )
+    c2w = cam2world0.to(masks.dtype)
+    to_azimuth = _yaw_matrix(-view_yaw(cam2world0)).to(masks.dtype)
+    # World ray o + t * R d_cam, rotated into the azimuth frame.
+    origin = to_azimuth @ c2w[:3, 3]
+    directions = d_cam @ (to_azimuth @ c2w[:3, :3]).T
+    return origin, directions
+
+
 class GSODModel(nn.Module):
     def __init__(
         self,
@@ -160,6 +209,9 @@ class GSODModel(nn.Module):
             hidden_dim=decoder_hidden_dim,
             frame=SlotFrame.from_scene_config(z_dim, scene_config),
         )
+        # Weight of the ray-anchored object frame centres (SlotFrame); set
+        # per step by train.py, 1 = the trained model.
+        self.anchor_weight = 1.0
         self.bg_decoder = decoder_cls(
             n_slots=1,
             z_dim=z_dim,
@@ -196,9 +248,33 @@ class GSODModel(nn.Module):
         aux_rgb, aux_alpha = self.aux_decoder(slots)
         slots, attn = slots[0], attn[0]  # (K, C), (K, s*s)
 
-        # Gaussians (view-0 azimuth frame), background first.
-        bg_gaussians, _ = self.bg_decoder(slots[:1])
-        obj_gaussians, obj_probs = self.decoder(slots[1:])
+        # Gaussians (view-0 azimuth frame), background first. Object frames
+        # are anchored to the rays through their 2D masks' centroids.
+        frames = [
+            getattr(getattr(d, "head", None), "frame", None)
+            for d in (self.bg_decoder, self.decoder)
+        ]
+        obj_frame = frames[1]
+        if obj_frame is not None and self.canonical_azimuth:
+            obj_frame.ray = mask_rays(
+                aux_alpha[0, 1:].detach(),
+                cam2world[0],
+                self.image_size,
+                self.focal_ratio,
+            )
+            obj_frame.anchor_weight = self.anchor_weight
+        frame_centre = None
+        try:
+            bg_gaussians, _ = self.bg_decoder(slots[:1])
+            obj_gaussians, obj_probs = self.decoder(slots[1:])
+            if None not in frames:
+                with torch.no_grad():  # frames actually used, for diagnostics
+                    frame_centre = torch.cat(
+                        [frames[0](slots[:1])[0], frames[1](slots[1:])[0]]
+                    )
+        finally:
+            if obj_frame is not None:
+                obj_frame.ray = None
         gaussians = {
             name: torch.cat([bg_gaussians[name], obj_gaussians[name]])
             for name in bg_gaussians
@@ -208,16 +284,6 @@ class GSODModel(nn.Module):
             [obj_probs.new_zeros(n_bg, dtype=torch.long), obj_probs.argmax(-1) + 1]
         )
         slot_probs = F.one_hot(slot_ids, self.num_slots).to(obj_probs.dtype)
-        frame_centre = None
-        frames = [
-            getattr(getattr(d, "head", None), "frame", None)
-            for d in (self.bg_decoder, self.decoder)
-        ]
-        if None not in frames:
-            with torch.no_grad():  # for diagnostics
-                frame_centre = torch.cat(
-                    [frames[0](slots[:1])[0], frames[1](slots[1:])[0]]
-                )
         if self.canonical_azimuth:
             gaussians = yaw_to_world(gaussians, view_yaw(cam2world[0]))
 

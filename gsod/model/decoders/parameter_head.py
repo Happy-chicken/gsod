@@ -75,9 +75,14 @@ class SlotFrame(nn.Module):
     initialised at fg_extent_init. Gaussian centres: centre + extent *
     tanh(offset).
 
-    Not tying the frame to anything else (e.g. the attention) means the
-    rendering loss can move a slot onto any object within its bounds; where
-    a slot is must be carried by its latent.
+    Ray anchoring (``self.ray`` and ``self.anchor_weight``, set by GSODModel
+    for object slots): the ray of view 0 through the centroid of the slot's
+    2D mask gives where the slot is seen; the anchored centre is where that
+    ray reaches the predicted height z, plus a learned residual of at most
+    anchor_residual. The centre used is (1 - w) * free + w * anchored, so the
+    coarse 2D decomposition places the 3D frames while the residual leaves
+    the 3D reconstruction room to correct them. Without a ray (or w = 0) the
+    centre is the free prediction.
 
     The bounds are the structural prior (uORF's locality): object frames are
     object-sized and inside the placement area, so the floor and everything
@@ -94,8 +99,17 @@ class SlotFrame(nn.Module):
         fg_z: tuple[float, float] = (0.0, 0.8),
         fg_extent: tuple[float, float] = (0.1, 0.75),
         fg_extent_init: float = 0.5,
+        anchor_residual: float = 0.5,
     ):
         super().__init__()
+        # How far the learned residual may move an anchored centre in xy
+        # away from the point where the slot's ray reaches its height.
+        self.anchor_residual = float(anchor_residual)
+        # Set by GSODModel for the current forward pass: rays of view 0
+        # (origin (3,), directions (K, 3)) in the view-0 azimuth frame, and
+        # the weight of the anchored centre.
+        self.ray: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.anchor_weight = 0.0
         self.fg_xy = float(fg_xy)
         self.fg_z = (float(fg_z[0]), float(fg_z[1]))
         self.fg_extent = (float(fg_extent[0]), float(fg_extent[1]))
@@ -146,7 +160,18 @@ class SlotFrame(nn.Module):
         out = self.fg(slots)
         z_lo, z_hi = self.fg_z
         z = z_lo + (z_hi - z_lo) * torch.sigmoid(out[:, 2:3])
-        xy = self.fg_xy * torch.tanh(out[:, 0:2] / self.fg_xy)
+        xy = out[:, 0:2]
+        w = self.anchor_weight
+        if self.ray is not None and w > 0:
+            origin, direction = self.ray
+            # Rays at or above the horizon never come down to z; keep them
+            # finite (the xy bound below then clamps the result).
+            dz = direction[:, 2:3].clamp(max=-1e-2)
+            t = ((z - origin[2]) / dz).clamp(min=0.0)
+            anchored = origin[0:2] + t * direction[:, 0:2]
+            anchored = anchored + self.anchor_residual * torch.tanh(xy)
+            xy = (1.0 - w) * xy + w * anchored
+        xy = self.fg_xy * torch.tanh(xy / self.fg_xy)
         log_lo, log_hi = math.log(self.fg_extent[0]), math.log(self.fg_extent[1])
         extent = torch.exp(log_lo + (log_hi - log_lo) * torch.sigmoid(out[:, 3:6]))
         return torch.cat([xy, z], dim=-1), extent
