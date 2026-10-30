@@ -55,10 +55,15 @@ def run_model(model: GSODModel, item: dict, device: torch.device, seed: int) -> 
 
 
 def attn_labels(result: dict, model: GSODModel, size: tuple[int, int]) -> np.ndarray:
-    """Slot-attention argmax of view 0, upsampled to the render size."""
+    """Slot-attention argmax over the object slots (labels 1..K-1) of view
+    0, upsampled to the render size. Row 0, the empty option, is left out:
+    it takes most of every object's tokens too (the object slots only need
+    their attention's spread over the tokens), so with it the argmax says
+    "empty" almost everywhere and no longer shows which object slot a token
+    belongs to. FG-ARI only reads object pixels anyway."""
     attn = result["attn"].detach().cpu().numpy()  # (K, s*s)
     side = model.input_size
-    labels = attn.argmax(0).reshape(side, side)
+    labels = (attn[1:].argmax(0) + 1).reshape(side, side)
     return upsample_labels(labels, size)
 
 
@@ -74,7 +79,8 @@ def evaluate(
       psnr_view0              reference view, all pixels
       ari, fg_ari             novel views, rendered slot mask vs GT
       ari_view0, fg_ari_view0 reference view, rendered slot mask vs GT
-      attn_fg_ari             reference view, slot-attention argmax vs GT
+      attn_fg_ari             reference view, slot-attention argmax over the
+                              object slots vs GT
       attn_render_ari         reference view, slot-attention vs rendered mask
                               (on GT object pixels)
     """
@@ -147,7 +153,8 @@ def render_scenes(
       view{v}_gt_mask.png   ground truth (if the loader provides masks)
       view{v}_slot{k}.png   compositing weight of slot k, grayscale (white = 1)
     Per scene:
-      attn_mask.png         slot-attention argmax on view 0 (same colours)
+      attn_mask.png         slot-attention argmax over the object slots on
+                            view 0 (same colours)
     """
     out = Path(out_dir)
     was_training = model.training

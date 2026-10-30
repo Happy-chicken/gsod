@@ -203,7 +203,9 @@ def analyse(rec: dict) -> dict:
     gt = rec["gt"]
     alpha0 = rec["alpha"][0]
     attn = np.stack([upsample_labels(a, size) for a in rec["attn"]])  # nearest
-    attn_lab = attn.argmax(0)
+    # Argmax over the object slots: the empty option (row 0) wins on object
+    # tokens too (see evaluate.attn_labels).
+    attn_lab = attn[1:].argmax(0) + 1
 
     # Object pixels: GT if available, else what the attention gives to objects.
     obj = gt[0] > 0 if gt is not None else attn[0] < 0.5
@@ -375,31 +377,6 @@ def _rgb(chw: np.ndarray) -> np.ndarray:
     return (np.clip(chw.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
-def _pca_rgb(feat: np.ndarray, rec: dict, size: tuple[int, int]) -> np.ndarray:
-    """First 3 principal components of view-0 token features as RGB.
-
-    PCA is fitted on object tokens only (GT, else the tokens the attention
-    gives to object slots), otherwise the background, ~80% of the tokens,
-    takes the main components; each component is stretched over its 1-99%
-    range on those tokens; the background is dimmed.
-    """
-    side = rec["attn"].shape[-1]
-    labels = _token_labels(rec)
-    obj = (labels > 0 if labels is not None else rec["attn"][0] < 0.5).ravel()
-    if obj.sum() < 3:
-        obj = np.ones_like(obj)
-    x = feat - feat[obj].mean(0)
-    _, _, vt = np.linalg.svd(x[obj], full_matrices=False)
-    proj = x @ vt[:3].T
-    lo, hi = np.percentile(proj[obj], [1, 99], axis=0)
-    rgb = np.clip((proj - lo) / np.maximum(hi - lo, 1e-8), 0.0, 1.0)
-    rgb[~obj] *= 0.25
-    rgb = rgb.reshape(side, side, 3)
-    rows = (np.arange(size[0]) * side) // size[0]
-    cols = (np.arange(size[1]) * side) // size[1]
-    return (rgb[rows[:, None], cols[None, :]] * 255 + 0.5).astype(np.uint8)
-
-
 def _up(maps: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     """(C, h, w) -> (C, H, W), nearest."""
     return np.stack([upsample_labels(m, size) for m in maps])
@@ -420,9 +397,7 @@ _TEXT = {
     "render": "render",
     "gt": "GT mask",
     "mask": "render mask",
-    "attn_mask": "attention mask",
-    "pca_enc": "features (PCA)",
-    "pca_key": "keys (PCA)",
+    "attn_mask": "attention (objects)",
     "slot": "{slot} {share:.0%}",
 }
 _FONTS = (
@@ -463,10 +438,9 @@ def make_grid(
 ) -> np.ndarray:
     """Diagnostic sheet: one block per view, a caption under every tile.
 
-    View 0  images: input, render, GT mask, render mask, attention mask,
-            PCA of the encoder
-            features and of the attention keys
-            slot attention per slot (bg = background slot)
+    View 0  images: input, render, GT mask, render mask, attention argmax
+            over the object slots
+            slot attention per slot (bg = the empty option)
             rendered weight per slot
     View 1  images: input, render, GT mask, render mask (novel view)
             rendered weight per slot
@@ -515,9 +489,7 @@ def make_grid(
                     _txt("row_images"),
                     image_tiles(0)
                     + [
-                        (_colorize(attn_up.argmax(0)), _txt("attn_mask"), None),
-                        (_pca_rgb(rec["feat_enc"], rec, size), _txt("pca_enc"), None),
-                        (_pca_rgb(rec["feat_key"], rec, size), _txt("pca_key"), None),
+                        (_colorize(attn_up[1:].argmax(0) + 1), _txt("attn_mask"), None),
                     ],
                 ),
                 (_txt("row_attn"), slot_tiles(rec["attn"])),
