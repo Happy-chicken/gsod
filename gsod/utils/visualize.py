@@ -3,15 +3,14 @@
 train.py logs them at every validation, test.py once on the test split
 (``scene_panels``). Per scene and on average they answer:
 
-1. Initialisation   -- are the Gaussians of a slot spread out, or one point?
-2. Slot attention   -- are the slot latents distinct? Does one slot take the
-                       whole image? Does the attention map separate objects
-                       (attn FG-ARI, dominance)?
-3. Decoder          -- does the rendered slot partition follow the attention,
+1. Slot attention   -- are the slot latents distinct? Does the attention
+                       map separate objects (attn FG-ARI, dominance)?
+2. Decoder          -- does the rendered slot partition follow the attention,
                        or do several slots redundantly draw the same object
                        (render dominance, attn/render ARI)? Is every object
-                       owned by some slot (object recall)?
-4. Slot centres     -- are the centres of the drawing slots' Gaussians
+                       owned by some slot (object recall)? Does the
+                       background cover objects?
+3. Slot centres     -- are the centres of the drawing slots' Gaussians
                        distinct?
 
 Each scene's images are logged as separate captioned tiles grouped into
@@ -25,8 +24,8 @@ import numpy as np
 
 from gsod.utils.metrics import ari, fg_ari, upsample_labels
 
-# Same colours as evaluate.py: label / slot 0 (background) dark gray,
-# k >= 1 PALETTE[(k-1) % 8].
+# Mask colours (also evaluate.py's PNGs): label / slot 0 (background) dark
+# gray, k >= 1 PALETTE[(k-1) % 8].
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
 PALETTE = np.array(
     [
@@ -43,7 +42,6 @@ PALETTE = np.array(
 )
 
 OBJECT_FOUND = 0.5  # share of a GT object's pixels one object slot must own
-ACTIVE_OPACITY = 0.05
 
 
 # ----------------------------------------------------------------------------
@@ -74,7 +72,6 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "attn": np_(result["attn"]).reshape(-1, side, side),  # (K, s, s)
         "slots": np_(result["slots"]),  # (K-1, C) view-0 object slots
         "mu": np_(g["mu"]),
-        "scale": np_(g["scale"]),
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
@@ -133,54 +130,29 @@ def analyse(rec: dict) -> dict:
     cos = z_n @ z_n.T
     off = cos[~np.eye(len(z), dtype=bool)]
 
-    # Gaussians per slot; centre weighted by opacity.
-    per_slot, centres = [], []
-    for k in range(n_slots):
+    # Opacity-weighted centres of the object slots that actually draw
+    # something in view 0.
+    centres = []
+    for k in range(1, n_slots):
+        if alpha0[k].mean() <= 0.005:
+            continue
         sel = rec["slot_ids"] == k
-        mu = rec["mu"][sel]
         w = rec["opacity"][sel]
-        centres.append((w[:, None] * mu).sum(0) / max(float(w.sum()), 1e-8))
-        # Slots without Gaussians (the background is not decoded): nan.
-        if sel.any():
-            gauss = {
-                "spread": float(np.linalg.norm(mu - mu.mean(0), axis=1).mean()),
-                "mean_scale": float(rec["scale"][sel].mean()),
-                "mean_opacity": float(w.mean()),
-                "active_frac": float((w > ACTIVE_OPACITY).mean()),
-            }
-        else:
-            gauss = dict.fromkeys(
-                ("spread", "mean_scale", "mean_opacity", "active_frac"), float("nan")
-            )
-        per_slot.append(
-            {
-                "slot": k,
-                **gauss,
-                "coverage_view0": float(alpha0[k].mean()),
-                "render_share_view0": float((rec["mask_idx"][0] == k).mean()),
-                "attn_share": float(rec["attn"][k].mean()),
-            }
-        )
-
-    # Centres of the object slots that actually draw something.
+        centres.append((w[:, None] * rec["mu"][sel]).sum(0) / max(float(w.sum()), 1e-8))
     centre_min_dist = float("nan")
-    active = [k for k in range(1, n_slots) if per_slot[k]["coverage_view0"] > 0.005]
-    if len(active) > 1:
-        c = np.stack([centres[k] for k in active])
+    if len(centres) > 1:
+        c = np.stack(centres)
         d = np.linalg.norm(c[:, None] - c[None], axis=-1)
         centre_min_dist = float(d[~np.eye(len(c), dtype=bool)].min())
 
     out = {
         "slot_cos_mean": float(np.mean(off)),
-        "slot_cos_max": float(np.max(off)),
-        "attn_obj_max_share": float(max(p["attn_share"] for p in per_slot[1:])),
         "bg_on_objects": float(alpha0[0][obj].mean()) if obj.any() else float("nan"),
         "attn_dominance": _dominance(attn[1:], obj),
         "render_dominance": _dominance(alpha0[1:], obj),
-        # On object pixels: on all pixels the background slot dominates.
+        # On object pixels: on all pixels the background dominates.
         "attn_render_ari": ari(attn_lab, rec["mask_idx"][0], mask=obj),
         "centre_min_dist": centre_min_dist,
-        "per_slot": per_slot,
     }
     if gt is not None:
         out["attn_fg_ari"] = fg_ari(gt[0], attn_lab)
@@ -195,7 +167,7 @@ def analyse(rec: dict) -> dict:
 # ----------------------------------------------------------------------------
 # 3. Visualise
 # ----------------------------------------------------------------------------
-def _colorize(labels: np.ndarray, background=MASK_BG) -> np.ndarray:
+def colorize(labels: np.ndarray, background=MASK_BG) -> np.ndarray:
     """Labels -> RGB: 0 (background) dark gray, k -> PALETTE[(k - 1) % 8]."""
     out = np.empty(labels.shape + (3,), dtype=np.uint8)
     out[...] = background
@@ -251,17 +223,17 @@ def panels(rec: dict) -> dict[str, dict[str, list[tuple[np.ndarray, str]]]]:
         tiles = [
             (_rgb(rec["target"][v]), "input"),
             (_rgb(rec["rgb"][v]), "render"),
-            (_colorize(rec["mask_idx"][v]), "render mask"),
+            (colorize(rec["mask_idx"][v]), "render mask"),
         ]
         if gt is not None:
-            tiles.insert(2, (_colorize(gt[v]), "GT mask"))
+            tiles.insert(2, (colorize(gt[v]), "GT mask"))
         return tiles
 
     attn_up = _up(rec["attn"], size)
     out = {
         "view0": {
             "images": images(0),
-            "attention": [(_colorize(attn_up.argmax(0)), "attention mask")]
+            "attention": [(colorize(attn_up.argmax(0)), "attention mask")]
             + _slot_tiles(attn_up),
             "slots": _slot_tiles(rec["alpha"][0]),
         }
@@ -276,10 +248,7 @@ def panels(rec: dict) -> dict[str, dict[str, list[tuple[np.ndarray, str]]]]:
 # ----------------------------------------------------------------------------
 def summarize(per_scene: list[dict]) -> dict:
     keys = [k for k, v in per_scene[0].items() if isinstance(v, float)]
-    mean = {k: float(np.nanmean([s[k] for s in per_scene])) for k in keys}
-    spreads = [p["spread"] for s in per_scene for p in s["per_slot"][1:]]
-    mean["spread_min"] = float(np.min(spreads))
-    return mean
+    return {k: float(np.nanmean([s[k] for s in per_scene])) for k in keys}
 
 
 def scene_panels(

@@ -21,14 +21,12 @@ class GsplatSplatter:
         rasterize_mode: str = "classic",
         eps2d: float = 0.3,
         radius_clip: float = 0.0,
-        channel_chunk: int = 32,
     ):
         self.far = float(far)
         self.packed = bool(packed)
         self.rasterize_mode = str(rasterize_mode)
         self.eps2d = float(eps2d)
         self.radius_clip = float(radius_clip)
-        self.channel_chunk = int(channel_chunk)
 
     def __call__(
         self,
@@ -86,7 +84,6 @@ class GsplatSplatter:
             # Accumulated depth (premultiplied), not the expected depth.
             render_mode="RGB+D",
             rasterize_mode=self.rasterize_mode,
-            channel_chunk=self.channel_chunk,
             camera_model="pinhole",
         )
 

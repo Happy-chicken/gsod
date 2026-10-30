@@ -22,23 +22,7 @@ from gsod.data_loader.primordia import PrimordiaScenes
 from gsod.model.gsod import GSODModel
 from gsod.utils.metrics import SquaredError, ari, fg_ari, upsample_labels
 from gsod.utils.png import save_png
-
-# Masks show label / slot 0 (background) dark gray, k >= 1 palette[k - 1].
-MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
-PALETTE = np.array(
-    [
-        [230, 25, 75],
-        [60, 180, 75],
-        [255, 225, 25],
-        [0, 130, 200],
-        [245, 130, 48],
-        [145, 30, 180],
-        [70, 240, 240],
-        [240, 50, 230],
-    ],
-    dtype=np.uint8,
-)
-
+from gsod.utils.visualize import colorize
 
 def run_model(model: GSODModel, item: dict, device: torch.device, seed: int) -> dict:
     """One forward pass with a fixed seed.
@@ -169,11 +153,11 @@ def render_scenes(
         for v in range(mask_idx.shape[0]):
             save_png(scene_dir / f"view{v}_target.png", _to_uint8(item["images"][v]))
             save_png(scene_dir / f"view{v}_render.png", _to_uint8(result["rgb"][v]))
-            save_png(scene_dir / f"view{v}_mask.png", _colorize(mask_idx[v]))
+            save_png(scene_dir / f"view{v}_mask.png", colorize(mask_idx[v]))
             if gt is not None:
                 save_png(
                     scene_dir / f"view{v}_gt_mask.png",
-                    _colorize(gt[v].cpu().numpy().astype(np.int64)),
+                    colorize(gt[v].cpu().numpy().astype(np.int64)),
                 )
             for k in range(alpha.shape[1]):
                 gray = (alpha[v, k].clamp(0.0, 1.0) * 255.0 + 0.5).cpu().numpy()
@@ -183,21 +167,10 @@ def render_scenes(
         attn = result["attn"].detach().cpu().numpy()  # (K, s*s)
         side = model.input_size
         labels = upsample_labels(attn.argmax(0).reshape(side, side), mask_idx.shape[1:])
-        save_png(scene_dir / "attn_mask.png", _colorize(labels))
+        save_png(scene_dir / "attn_mask.png", colorize(labels))
     model.train(was_training)
 
 
 def _to_uint8(chw: torch.Tensor) -> np.ndarray:
     hwc = chw.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
     return (hwc * 255.0 + 0.5).astype(np.uint8)
-
-
-def _colorize(labels: np.ndarray, background=MASK_BG) -> np.ndarray:
-    """Labels -> RGB: 0 (background) dark gray, k -> PALETTE[(k - 1) % 8]."""
-    out = np.empty(labels.shape + (3,), dtype=np.uint8)
-    out[...] = background
-    for k in np.unique(labels):
-        if k == 0:
-            continue
-        out[labels == k] = PALETTE[(int(k) - 1) % len(PALETTE)]
-    return out

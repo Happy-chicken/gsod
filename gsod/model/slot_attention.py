@@ -16,23 +16,6 @@ the last iteration is passed straight through to the queries. Learned
 queries trained without this scheme (plain QSA) are worse than random
 initialisation in the paper's ablation; the detach + straight-through pair is
 what makes them work.
-
-Original Slot Attention initialisation (replaced, kept for reference): all
-slots sampled from one shared learnable Gaussian, with gradients through
-every iteration. Slots then start nearly identical and tend to split
-one object equally between them (mean slot cosine 0.45 vs 0.33, attention
-FG-ARI 0.71 vs 0.85 with BO-QSA in our runs).
-
-    # __init__
-    #     self.slots_mu = nn.Parameter(torch.randn(1, 1, slot_dim))
-    #     self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, slot_dim))
-    #     init.xavier_uniform_(self.slots_logsigma)
-    # forward
-    #     mu = self.slots_mu.expand(b, self.num_slots, -1)
-    #     sigma = self.slots_logsigma.exp().expand(b, self.num_slots, -1)
-    #     slots = mu + sigma * torch.randn_like(mu)
-    #     for _ in range(self.iters):     # no detach, no straight-through
-    #         ...
 """
 
 from __future__ import annotations
@@ -58,7 +41,6 @@ class SlotAttention(nn.Module):
         """num_slots: K, the empty option included (K-1 object slots)."""
         super().__init__()
         assert num_slots >= 2, "need at least two slots"
-        self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
         self.scale = slot_dim**-0.5
@@ -105,24 +87,14 @@ class SlotAttention(nn.Module):
         grid = torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1)
         return grid.reshape(1, n_tokens, 4)
 
-    def project_inputs(
-        self, feat: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """BxNxC tokens -> (keys, values), each BxNxD.
-
-        The keys are the space the attention compares slots in: a token can
-        only be told apart from another if their keys differ.
-        """
-        feat = feat + self.pos_proj(self._grid(feat.shape[1], feat.device))
-        feat = self.norm_feat(self.feat_mlp(feat))
-        return self.to_k(feat), self.to_v(feat)
-
     def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
         slots_init = self.slot_queries.expand(b, -1, -1)
         slots = slots_init
 
-        k, v = self.project_inputs(feat)
+        feat = feat + self.pos_proj(self._grid(feat.shape[1], feat.device))
+        feat = self.norm_feat(self.feat_mlp(feat))
+        k, v = self.to_k(feat), self.to_v(feat)
 
         attn = None
         for it in range(self.iters):

@@ -240,7 +240,6 @@ class GSODModel(nn.Module):
         self.splat = GsplatSplatter()
         self.image_size = tuple(image_size)
         self.input_size = input_size
-        self.num_slots = num_slots
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
 
@@ -255,7 +254,7 @@ class GSODModel(nn.Module):
             z_dim,
             gaussians_per_slot,
             decoder_hidden_dim,
-            ObjectHead(z_dim, decoder_hidden_dim, bounds),
+            ObjectHead(decoder_hidden_dim, bounds),
         )
         self.register_buffer(
             "background",
