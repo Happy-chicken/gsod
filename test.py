@@ -1,9 +1,14 @@
 #!/usr/bin/env python
 """Evaluate and render a trained checkpoint.
 
+The metrics and the diagnostic sheets of the first TEST_SHEETS scenes go
+to a W&B run (job_type "test") in the training runs' project; the renders
+are also written as PNGs unless --no-render.
+
 Examples:
     python test.py --dataset primordia --split test
     python test.py --dataset clevr567 --split test   # data/clevr/clevr_567_test
+    python test.py --dataset primordia --suffix epoch_50
 """
 
 from __future__ import annotations
@@ -12,12 +17,17 @@ import argparse
 from pathlib import Path
 
 import torch
+import wandb
 
 from gsod.configs import config_for
 from gsod.utils.paths import latest_run_dir
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model, load_networks
 from gsod.model.evaluate import evaluate, render_scenes
+from gsod.utils.visualize import sheets
+
+WANDB_PROJECT = "gsod"
+TEST_SHEETS = 16
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--suffix", default="latest", help="checkpoint suffix")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--out", default=None, help="output directory for PNGs")
-    parser.add_argument("--no-render", action="store_true", help="only print metrics")
+    parser.add_argument("--no-render", action="store_true", help="skip the PNG renders")
     return parser.parse_args()
 
 
@@ -75,9 +85,29 @@ def main() -> None:
     )
     if cfg.dataset_mode == "primordia":
         dataset = WithGTMasks(dataset, data_root)
-    metrics = evaluate(model, dataset, device)
+    with torch.no_grad():
+        metrics = evaluate(model, dataset, device)
+        images, captions, stats = sheets(model, dataset, device, TEST_SHEETS)
     print(f"{args.split} split:", {k: round(v, 4) for k, v in metrics.items()})
-    # print(f"{args.split} split: mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f}")
+
+    run = wandb.init(
+        project=WANDB_PROJECT,
+        name=f"{Path(checkpoint).name}_{args.split}_{args.suffix}",
+        job_type="test",
+        dir=str(checkpoint),
+        config={"checkpoint": str(checkpoint), "suffix": args.suffix, "split": args.split},
+    )
+    run.summary.update({f"test/{k}": v for k, v in metrics.items()})
+    run.summary.update({f"diag/{k}": v for k, v in stats.items()})
+    run.log(
+        {
+            "test/sheets": [
+                wandb.Image(image, caption=caption)
+                for image, caption in zip(images, captions)
+            ]
+        }
+    )
+    run.finish()
 
     if not args.no_render:
         out = Path(args.out or f"{checkpoint}/renders/{args.split}_{args.suffix}")

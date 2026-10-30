@@ -1,6 +1,7 @@
-"""Slot diagnostics: where does object discovery break?
+"""Slot diagnostics for W&B: per-scene sheets and averaged statistics.
 
-Answers, per scene and on average:
+train.py logs them at every validation, test.py once on the test split
+(``sheets``). Per scene and on average they answer:
 
 1. Initialisation   -- are the Gaussians of a slot spread out, or one point?
 2. Slot attention   -- are the slot latents distinct? Does one slot take the
@@ -13,32 +14,17 @@ Answers, per scene and on average:
 4. Slot centres     -- are the centres of the drawing slots' Gaussians
                        distinct?
 
-Usage (from your own test script, after loading a checkpoint):
-
-    from gsod.utils.diagnose import diagnose
-    report = diagnose(model, val_dataset, device, "debug/step_020000")
-
-Also run it once on a freshly initialised model: the "init" checks should
-pass before training starts.
-
-Outputs in out_dir:
-    sc####_diag.png   captioned sheet (see make_grid): title with the scene's
-                      key scores; one block per view: view 0 (images and
-                      masks; slot attention; rendered slot weights), then
-                      view 1 (images and masks; rendered slot weights). Each slot tile has its mask colour and
-                      share of the image. Needs Pillow.
-    summary.json      per-scene and mean statistics plus verdicts
+A sheet (make_grid) has a title with the scene's key scores and one block
+per view: view 0 (images and masks; slot attention; rendered slot weights),
+then view 1 (images and masks; rendered slot weights). Each slot tile has
+its mask colour and share of the image. Needs Pillow.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 
 from gsod.utils.metrics import ari, fg_ari, upsample_labels
-from gsod.utils.png import save_png
 
 # Same colours as evaluate.py: label / slot 0 (background) dark gray,
 # k >= 1 PALETTE[(k-1) % 8].
@@ -57,15 +43,6 @@ PALETTE = np.array(
     dtype=np.uint8,
 )
 
-# Verdict thresholds (heuristics; tune once you have a working run to compare).
-SPREAD_COLLAPSED = 0.05  # mean distance of a slot's Gaussians to their mean
-SLOT_COS_COLLAPSED = 0.95  # mean pairwise cosine of object-slot latents
-SLOT_TAKES_ALL = 0.5  # attention share of the largest object slot
-BG_ON_OBJECTS = 0.3  # background's (uncovered) share of the object pixels
-DOMINANCE_GOOD = 0.8  # share of the strongest object slot on object pixels
-DOMINANCE_BAD = 0.6
-ARI_GOOD = 0.7
-CENTRE_COLLAPSED = 0.05  # min pairwise distance of active slot centres
 OBJECT_FOUND = 0.5  # share of a GT object's pixels one object slot must own
 ACTIVE_OPACITY = 0.05
 
@@ -214,75 +191,6 @@ def analyse(rec: dict) -> dict:
         novel = [x for x in novel if not np.isnan(x)]
         out["render_fg_ari_novel"] = float(np.mean(novel)) if novel else float("nan")
     return out
-
-
-def verdicts(mean: dict) -> list[str]:
-    """Turn mean statistics into a ranked list of likely problems."""
-    msgs = []
-    g = lambda key: mean.get(key, float("nan"))  # noqa: E731
-
-    if g("spread_min") < SPREAD_COLLAPSED:
-        msgs.append(
-            "[init] some object slot has all Gaussians at one point "
-            f"(min spread {g('spread_min'):.3f}); check offset-bias / query-bias init."
-        )
-    if g("slot_cos_mean") > SLOT_COS_COLLAPSED:
-        msgs.append(
-            f"[slot attention] object slot latents nearly identical (mean cos "
-            f"{g('slot_cos_mean'):.3f}); slots never separate. Try soft position "
-            "embedding + feature MLP, longer training / LR warmup."
-        )
-    if g("attn_obj_max_share") > SLOT_TAKES_ALL:
-        msgs.append(
-            f"[slot attention] one object slot takes {g('attn_obj_max_share'):.0%} "
-            "of the image; it is drawing the background or several objects."
-        )
-    if g("bg_on_objects") > BG_ON_OBJECTS:
-        msgs.append(
-            f"[background] the background slot draws {g('bg_on_objects'):.0%} of "
-            "the object pixels; it is explaining objects."
-        )
-    attn_ok = g("attn_dominance") > DOMINANCE_GOOD or g("attn_fg_ari") > ARI_GOOD
-    render_bad = (
-        g("render_dominance") < DOMINANCE_BAD or g("render_fg_ari_view0") < ARI_GOOD
-    )
-    if attn_ok and render_bad:
-        redundant = g("attn_dominance") - g("render_dominance") > 0.1
-        cause = (
-            "several slots redraw the same object (render dominance well below "
-            "attention's; see centre_min_dist)."
-            if redundant
-            else "slots draw their own objects, but the render is soft or misplaced "
-            "(edges / thin parts lost to the background slot)."
-        )
-        msgs.append(
-            "[decoder] render segments worse than attention "
-            f"(FG-ARI attn {g('attn_fg_ari'):.2f} vs render {g('render_fg_ari_view0'):.2f}; "
-            f"dominance attn {g('attn_dominance'):.2f} vs render {g('render_dominance'):.2f}): "
-            + cause
-        )
-    elif not attn_ok and g("attn_dominance") < DOMINANCE_BAD:
-        msgs.append(
-            f"[slot attention] attention does not separate objects (attn dom "
-            f"{g('attn_dominance'):.2f}, attn FG-ARI {g('attn_fg_ari'):.2f}); fix this "
-            "before the decoder."
-        )
-    if g("centre_min_dist") < CENTRE_COLLAPSED:
-        msgs.append(
-            f"[decoder] two active slots share a centre (min dist "
-            f"{g('centre_min_dist'):.3f}); slots stack on the same object."
-        )
-    if (
-        g("render_fg_ari_view0") > ARI_GOOD
-        and g("render_fg_ari_novel") < g("render_fg_ari_view0") - 0.2
-    ):
-        msgs.append(
-            "[3D] view 0 is segmented but novel views are not; objects are flat or "
-            "at the wrong depth. Check multi-view loss weighting and cameras."
-        )
-    if not msgs:
-        msgs.append("no failure pattern matched")
-    return msgs
 
 
 # ----------------------------------------------------------------------------
@@ -494,7 +402,7 @@ def make_grid(
 
 
 # ----------------------------------------------------------------------------
-# 4. Driver
+# 4. Scenes
 # ----------------------------------------------------------------------------
 def summarize(per_scene: list[dict]) -> dict:
     keys = [k for k, v in per_scene[0].items() if isinstance(v, float)]
@@ -519,52 +427,25 @@ def _title(stats: dict) -> str:
     )
 
 
-def diagnose(
-    model,
-    dataset,
-    device,
-    out_dir,
-    n_scenes: int = 8,
-    seed: int = 0,
-) -> dict:
-    out = Path(out_dir)
+def sheets(
+    model, dataset, device, n_scenes: int, seed: int = 0
+) -> tuple[list[np.ndarray], list[str], dict[str, float]]:
+    """Diagnostic sheets of the first n_scenes scenes of dataset.
+
+    Returns (sheets, (H, W, 3) uint8 each; their captions, the scene and its
+    key scores; the statistics of analyse averaged over the scenes).
+    """
     was_training = model.training
     model.eval()
-    per_scene = []
+    images, captions, per_scene = [], [], []
     for i in range(min(n_scenes, len(dataset))):
         item = dataset[i]
         rec = collect(model, item, device, seed + i)
         stats = analyse(rec)
         stats["scene"] = int(item.get("scene", i))
         per_scene.append(stats)
-        save_png(
-            out / f"sc{stats['scene']:04d}_diag.png",
-            make_grid(rec, title=_title(stats)),
-        )
+        title = _title(stats)
+        images.append(make_grid(rec, title=title))
+        captions.append(title)
     model.train(was_training)
-
-    mean = summarize(per_scene)
-    report = {"mean": mean, "verdicts": verdicts(mean), "scenes": per_scene}
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "summary.json").write_text(json.dumps(report, indent=2))
-
-    print(f"[diagnose] {len(per_scene)} scenes -> {out}")
-    for key in (
-        "slot_cos_mean",
-        "attn_obj_max_share",
-        "bg_on_objects",
-        "attn_dominance",
-        "render_dominance",
-        "attn_fg_ari",
-        "render_fg_ari_view0",
-        "render_fg_ari_novel",
-        "attn_render_ari",
-        "obj_recall_view0",
-        "centre_min_dist",
-        "spread_min",
-    ):
-        if key in mean:
-            print(f"  {key:22s} {mean[key]:.3f}")
-    for msg in report["verdicts"]:
-        print("  ->", msg)
-    return report
+    return images, captions, summarize(per_scene)

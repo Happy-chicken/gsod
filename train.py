@@ -11,9 +11,16 @@ per step); the learning-rate schedule, validation and saving are in epochs.
 
 Checkpoints stay in the uORF layout (gsod/model/checkpoint.py):
 ``{suffix}_net_*.pth`` / ``{suffix}_optimizer_0.pth`` / ``{suffix}_state.json``
-for latest, best and epoch_<n>, so test.py and the diagnostics load them
-unchanged; ``--resume`` continues from one of them. Lightning writes no
-checkpoints of its own. The W&B run lives in the checkpoint directory.
+for latest, best and epoch_<n>, so test.py loads them unchanged;
+``--resume`` continues from one of them. Lightning writes no checkpoints of
+its own.
+
+W&B (run in the checkpoint directory) gets the training terms, and at every
+validation -- before the first epoch, then every eval_every epochs -- the
+validation metrics (val/*), the diagnostic statistics of the first
+VAL_SHEETS validation scenes (diag/*) and their diagnostic sheets
+(val/sheets, gsod/utils/visualize.py). The best validation PSNR and its
+epoch go to the run summary. Nothing is printed per validation.
 
 The training loop lives here because train.py is the only training entry
 point. Model code stays training-loop-agnostic.
@@ -41,8 +48,12 @@ from gsod.model.checkpoint import load_networks, save_networks
 from gsod.model.evaluate import evaluate
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
+from gsod.utils.visualize import sheets
 
 WANDB_PROJECT = "gsod"
+# Validation scenes drawn as diagnostic sheets at every validation (the
+# same scenes each time, so the sheets can be compared across epochs).
+VAL_SHEETS = 4
 
 
 class GSODTraining(L.LightningModule):
@@ -97,6 +108,10 @@ class GSODTraining(L.LightningModule):
                 str(self.out), self.resume, {}, self.trainer.optimizers, device=self.device
             )
 
+    def on_train_start(self) -> None:
+        if self.resume is None:
+            self._validate(0)  # the untrained model, as a baseline
+
     def training_step(self, item: dict, batch_idx: int) -> torch.Tensor:
         images, cams = item["images"], item["cam2world"]
         ref = self.rng.randrange(images.shape[0])
@@ -118,20 +133,37 @@ class GSODTraining(L.LightningModule):
 
     def on_train_epoch_end(self) -> None:
         epoch = self.epoch + 1  # this epoch is done
-        if len(self.val_set) and epoch % self.cfg.eval_every == 0:
-            with torch.no_grad():
-                metrics = evaluate(self.model, self.val_set, self.device)
-            self.log_dict({f"val/{k}": v for k, v in metrics.items()}, batch_size=1)
-            print(
-                f"epoch {epoch} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f} "
-                f"fg_ari {metrics['fg_ari']:.3f} attn_fg_ari {metrics['attn_fg_ari']:.3f}"
-            )
-            if metrics["psnr"] > self.best_psnr:
-                self.best_psnr = metrics["psnr"]
-                self._save("best", epoch)
-                print(f"epoch {epoch} new best psnr {self.best_psnr:.2f}")
+        if epoch % self.cfg.eval_every == 0:
+            self._validate(epoch)
         if epoch % self.cfg.save_every == 0:
             self._save(f"epoch_{epoch}", epoch)
+
+    def _validate(self, epoch: int) -> None:
+        """Validation metrics, diagnostic statistics and sheets to W&B; keeps
+        the best checkpoint by validation PSNR."""
+        if not len(self.val_set):
+            return
+        with torch.no_grad():
+            metrics = evaluate(self.model, self.val_set, self.device)
+            images, captions, stats = sheets(
+                self.model, self.val_set, self.device, VAL_SHEETS
+            )
+        step = self.global_step
+        self.logger.log_metrics(
+            {
+                "epoch": epoch,
+                **{f"val/{k}": v for k, v in metrics.items()},
+                **{f"diag/{k}": v for k, v in stats.items()},
+            },
+            step=step,
+        )
+        self.logger.log_image("val/sheets", images=images, caption=captions, step=step)
+        if metrics["psnr"] > self.best_psnr:
+            self.best_psnr = metrics["psnr"]
+            self._save("best", epoch)
+            summary = self.logger.experiment.summary
+            summary["best_psnr"] = self.best_psnr
+            summary["best_epoch"] = epoch
 
     def on_train_end(self) -> None:
         self._save("latest", self.start_epoch + self.trainer.current_epoch)

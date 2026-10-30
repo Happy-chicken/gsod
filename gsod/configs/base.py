@@ -37,7 +37,7 @@ class BaseConfig:
     # --- optimisation ----------------------------------------------------------
     # Number of epochs (passes over the training scenes); each step trains on
     # one scene. All schedules below are in epochs (fractional within one).
-    epochs: int = 125
+    epochs: int = 100
     # Adam learning rate: linear warm-up over lr_warmup_epochs, then halved
     # every lr_half_life epochs (Slot Attention's schedule).
     lr: float = 3e-4
@@ -50,9 +50,9 @@ class BaseConfig:
     # Log the training terms every N steps (a logging rate, not a schedule).
     log_every: int = 100
     # Run validation on the val split every N epochs.
-    eval_every: int = 2
+    eval_every: int = 5
     # Write an epoch_<n> checkpoint every N epochs.
-    save_every: int = 5
+    save_every: int = 10
     # DataLoader worker processes.
     num_workers: int = 4
     # Loss term weights.
