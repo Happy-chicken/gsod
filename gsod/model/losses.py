@@ -1,30 +1,15 @@
-"""Training loss: reconstruction, plus two capacity terms on the object
-slots; no masks or targets.
+"""Training loss: reconstruction only, no masks or targets.
 
-    total = l1          * L1(render, image)            novel views 1..V-1
-          + ssim        * (1 - SSIM(render, image))    novel views 1..V-1
-          + view0       * L1(render, image)            view 0 (the encoded view)
-          + appearance  * |colour residual|            object Gaussians
-          + compactness * c * spread beyond an object  object Gaussians,
-                                                       c from train.py
+    total = l1    * L1(render, image)           novel views 1..V-1
+          + ssim  * (1 - SSIM(render, image))   novel views 1..V-1
+          + view0 * L1(render, image)           view 0 (the encoded view)
 
 Every term reaches every module that produced it (end to end).
 
-Reconstruction
-    L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as
-    a structure term, as in 3DGS. The image is the slots' layered composite
-    (gsod.py), so these terms are also the slots' competition for the
-    pixels. The novel views carry the 3D signal.
-
-appearance -- "one slot, one colour"
-    Mean |per-Gaussian colour residual| of the object Gaussians (logit units,
-    on top of the slot's base colour), weighted by opacity. Makes a slot a
-    poor fit for two objects of different colours.
-
-compactness -- "one slot, one object"
-    Opacity-weighted mean of (distance to the slot's centre beyond an
-    object's radius)^2. Off at first, so the slots start spread over the
-    object box and compete for every object; ramped in by train.py.
+L1 rather than MSE (splatting speckle is over-penalised by L2); D-SSIM as a
+structure term, as in 3DGS. The image is the slots' layered composite
+(gsod.py), so these terms are also the slots' competition for the pixels.
+The novel views carry the 3D signal.
 """
 
 from __future__ import annotations
@@ -71,14 +56,10 @@ class GSODLoss(nn.Module):
         self.cfg = cfg
 
     def forward(
-        self,
-        outputs: dict[str, torch.Tensor],
-        images: torch.Tensor,
-        compactness_scale: float = 1.0,
+        self, outputs: dict[str, torch.Tensor], images: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """outputs: model output; images: (V,3,H,W); compactness_scale: the
-        compactness schedule of this step (train.py). Returns (total,
-        per-term values for logging)."""
+        """outputs: model output; images: (V,3,H,W). Returns (total, per-term
+        values for logging)."""
         cfg = self.cfg
         rendered, target = outputs["rgb"][1:], images[1:]
         terms: dict[str, torch.Tensor] = {
@@ -89,10 +70,6 @@ class GSODLoss(nn.Module):
         if cfg.view0 > 0:
             terms["view0"] = F.l1_loss(outputs["rgb"][:1], images[:1])
             weights["view0"] = cfg.view0
-        terms["appearance"] = outputs["appearance"]
-        weights["appearance"] = cfg.appearance
-        terms["compactness"] = outputs["compactness"]
-        weights["compactness"] = cfg.compactness * compactness_scale
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

@@ -25,9 +25,6 @@ The slots compete in the 3D render itself, with no 2D decoder and no masks:
     that region's mean colour (``attention_regions``). The reconstruction
     gradient reaches the attention through them; while the attention is
     still spread, so are the Gaussians.
-  * limited capacity: an object slot has one base colour (per-Gaussian
-    residuals are penalised) and is pulled compact (compactness term, from
-    train.py's schedule), so one slot is a poor fit for two objects.
 
 Slot indices in every output (masks, slot_alpha, attention rows):
     0       background (in slot_alpha: the uncovered share of the pixel)
@@ -265,9 +262,6 @@ class GSODModel(nn.Module):
         # parts count as this far.
         self.depth_tau = bounds.r_max / 4.0
         self.far = bounds.d_max + 2.0 * bounds.fg_xy
-        # Compactness: an object slot's Gaussians within this distance of
-        # their centre cost nothing.
-        self.object_radius = 1.5 * bounds.r_max
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks for checkpoint.save_networks / load_networks."""
@@ -285,21 +279,6 @@ class GSODModel(nn.Module):
             )
         )
         return feat.flatten(start_dim=2).permute(0, 2, 1)
-
-    def _capacity_terms(
-        self, obj: dict[str, torch.Tensor], residual: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Object slots (K-1, G, ...): (compactness, appearance) terms, each
-        weighted by the (detached) opacity of the Gaussians, so invisible
-        Gaussians do not count and the terms cannot be met by fading."""
-        w = obj["opacity"].detach()  # (K-1, G)
-        mass = w.sum(1, keepdim=True).clamp_min(1e-8)
-        centre = (w[..., None] * obj["mu"]).sum(1) / mass  # (K-1, 3)
-        dist = ((obj["mu"] - centre[:, None]) ** 2).sum(-1).add(1e-12).sqrt()
-        total = w.sum().clamp_min(1e-8)
-        compactness = (w * F.relu(dist - self.object_radius) ** 2).sum() / total
-        appearance = (w * residual.abs().mean(-1)).sum() / total
-        return compactness, appearance
 
     def forward(
         self, images: torch.Tensor, cam2world: torch.Tensor
@@ -322,8 +301,6 @@ class GSODModel(nn.Module):
         )
         # (K-1, G, ...), view-0 azimuth frame
         obj = self.decoder(slots, centre=centre, extent=extent, colour=colour)
-        residual = obj.pop("rgb_residual")
-        compactness, appearance = self._capacity_terms(obj, residual)
         obj = yaw_to_world(obj, view_yaw(cam2world[0]))
 
         per_slot = [{name: obj[name][k] for name in obj} for k in range(slots.shape[0])]
@@ -346,6 +323,4 @@ class GSODModel(nn.Module):
             "slots": slots,  # (K-1, C) view-0 object slots (masks 1..K-1)
             "slot_ids": slot_ids,  # (M,) slot of each Gaussian (1..K-1)
             "gaussians": gaussians,  # world frame, object slots only
-            "compactness": compactness,
-            "appearance": appearance,
         }

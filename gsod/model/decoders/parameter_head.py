@@ -13,9 +13,7 @@ ObjectHead      object slots: around the region the slot's attention covers
                 the input through its attention from the first step. While
                 the attention is still spread, so are the Gaussians. Colour:
                 region colour + a per-slot correction from the latent + a
-                small per-Gaussian residual ("rgb_residual", penalised in
-                losses.py), so one slot is a poor fit for two objects of
-                different colours.
+                per-Gaussian residual.
 
 The background is not decoded: it is the empty space behind the objects
 (gsod.py).
@@ -88,7 +86,7 @@ def _projection(d_model: int, n_params: int) -> nn.Sequential:
 
 
 class ObjectHead(nn.Module):
-    """Raw parameters: position 3, scale 3, quat 4, opacity 1, rgb residual 3."""
+    """Raw parameters: position 3, scale 3, quat 4, opacity 1, colour residual 3."""
 
     def __init__(self, z_dim: int, d_model: int, bounds: SceneBounds):
         super().__init__()
@@ -115,15 +113,13 @@ class ObjectHead(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """feat: (K, G, d); slots: (K, C); per slot, its attention region:
         centre (K, 3), extent (K, 3) and mean colour (K, 3) -> Gaussians
-        (K, G, ...), with the colour residuals as "rgb_residual"."""
+        (K, G, ...)."""
         raw = self.project(feat)
-        residual = raw[..., 11:14]
         region = torch.logit(colour.clamp(0.02, 0.98)) + self.base(slots)
         return {
             "mu": centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3]),
             "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(raw[..., 10]),
-            "rgb": torch.sigmoid(region[:, None] + residual),
-            "rgb_residual": residual,
+            "rgb": torch.sigmoid(region[:, None] + raw[..., 11:14]),
         }
