@@ -12,10 +12,6 @@ Answers, per scene and on average:
                        owned by some slot (object recall)?
 4. Slot centres     -- are the centres of the drawing slots' Gaussians
                        distinct?
-5. Features         -- can the encoder features / attention keys separate the
-                       objects at all (k-means FG-ARI)? High while the
-                       attention FG-ARI is low: the slot competition fails;
-                       both low: the features do not tell the objects apart.
 
 Usage (from your own test script, after loading a checkpoint):
 
@@ -87,9 +83,6 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
     with torch.no_grad(), torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         result = model(images, cams)
-        # View-0 tokens: encoder output and the keys slot attention compares.
-        tokens = model.encode(images[:1])
-        keys, _ = model.slot_attention.project_inputs(tokens)
 
     def np_(x):
         return None if x is None else x.detach().float().cpu().numpy()
@@ -109,8 +102,6 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "opacity": np_(g["opacity"]),
         "slot_ids": result["slot_ids"].cpu().numpy(),
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
-        "feat_enc": np_(tokens[0]),  # (s*s, C) encoder features, view 0
-        "feat_key": np_(keys[0]),  # (s*s, D) attention keys, view 0
     }
 
 
@@ -131,55 +122,6 @@ def _dominance(weights: np.ndarray, pixels: np.ndarray) -> float:
     if not keep.any():
         return float("nan")
     return float((w[:, keep].max(0) / total[keep]).mean())
-
-
-def _token_labels(rec: dict) -> np.ndarray | None:
-    """GT labels of view 0 at token resolution (s, s), or None without GT."""
-    if rec["gt"] is None:
-        return None
-    side = rec["attn"].shape[-1]
-    return upsample_labels(rec["gt"][0], (side, side))  # nearest
-
-
-def _kmeans(x: np.ndarray, k: int, seed: int = 0, n_init: int = 10) -> np.ndarray:
-    """k-means++ / Lloyd on rows of x; labels of the lowest-inertia run."""
-    rng = np.random.default_rng(seed)
-    best, best_inertia = np.zeros(len(x), dtype=np.int64), np.inf
-    for _ in range(n_init):
-        centres = x[rng.integers(len(x))][None]
-        for _ in range(1, k):
-            d2 = ((x[:, None] - centres[None]) ** 2).sum(-1).min(1)
-            p = d2 / d2.sum() if d2.sum() > 0 else None
-            centres = np.vstack([centres, x[rng.choice(len(x), p=p)]])
-        for _ in range(100):
-            labels = ((x[:, None] - centres[None]) ** 2).sum(-1).argmin(1)
-            new = np.stack(
-                [x[labels == j].mean(0) if (labels == j).any() else centres[j] for j in range(k)]
-            )
-            if np.allclose(new, centres):
-                break
-            centres = new
-        inertia = float(((x - centres[labels]) ** 2).sum())
-        if inertia < best_inertia:
-            best, best_inertia = labels, inertia
-    return best
-
-
-def feature_fg_ari(feat: np.ndarray, labels: np.ndarray) -> float:
-    """FG-ARI of k-means on the object tokens' (L2-normalised) features.
-
-    feat: (s*s, C); labels: (s, s) GT at token resolution. k is the number of
-    visible GT objects, so this is an upper bound on what any grouping of
-    these features can reach; nan without at least two object tokens.
-    """
-    obj = labels.ravel() > 0
-    if obj.sum() < 2:
-        return float("nan")
-    x = feat[obj]
-    x = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-8)
-    gt = labels.ravel()[obj]
-    pred = _kmeans(x, len(np.unique(gt)))
-    return ari(gt, pred)
 
 
 def object_recall(gt: np.ndarray, labels: np.ndarray) -> float:
@@ -266,9 +208,6 @@ def analyse(rec: dict) -> dict:
     }
     if gt is not None:
         out["attn_fg_ari"] = fg_ari(gt[0], attn_lab)
-        tok = _token_labels(rec)
-        out["feat_enc_fg_ari"] = feature_fg_ari(rec["feat_enc"], tok)
-        out["feat_key_fg_ari"] = feature_fg_ari(rec["feat_key"], tok)
         out["render_fg_ari_view0"] = fg_ari(gt[0], rec["mask_idx"][0])
         out["obj_recall_view0"] = object_recall(gt[0], rec["mask_idx"][0])
         novel = [fg_ari(gt[v], rec["mask_idx"][v]) for v in range(1, gt.shape[0])]
@@ -340,19 +279,6 @@ def verdicts(mean: dict) -> list[str]:
         msgs.append(
             "[3D] view 0 is segmented but novel views are not; objects are flat or "
             "at the wrong depth. Check multi-view loss weighting and cameras."
-        )
-    feat, attn = g("feat_key_fg_ari"), g("attn_fg_ari")
-    if feat - attn > 0.1:
-        msgs.append(
-            f"[slot attention] the attention keys separate the objects (k-means "
-            f"FG-ARI {feat:.2f}) better than the attention does ({attn:.2f}): "
-            "the slot competition fails, not the encoder."
-        )
-    elif feat < ARI_GOOD and attn < ARI_GOOD:
-        msgs.append(
-            f"[encoder] neither the attention keys (k-means FG-ARI {feat:.2f}) nor "
-            f"the attention ({attn:.2f}) separate the objects: the features do "
-            "not tell them apart; improve the encoder."
         )
     if not msgs:
         msgs.append("no failure pattern matched")
@@ -589,8 +515,7 @@ def _title(stats: dict) -> str:
         f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
         f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
         f"bg on objects {fmt(g('bg_on_objects'))} | "
-        f"objects found {fmt(g('obj_recall_view0'))} | "
-        f"keys k-means FG-ARI {fmt(g('feat_key_fg_ari'))}"
+        f"objects found {fmt(g('obj_recall_view0'))}"
     )
 
 
@@ -630,8 +555,6 @@ def diagnose(
         "bg_on_objects",
         "attn_dominance",
         "render_dominance",
-        "feat_enc_fg_ari",
-        "feat_key_fg_ari",
         "attn_fg_ari",
         "render_fg_ari_view0",
         "render_fg_ari_novel",
