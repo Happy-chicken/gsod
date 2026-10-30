@@ -38,7 +38,7 @@ class SceneGenConfig:
 
     # Objects rest on this plane; it is not drawn (one uniform background).
     floor_z: float = 0.0
-    background_color: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    background_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     split: tuple[float, float, float] = (0.8, 0.1, 0.1)
     seed: int = 0

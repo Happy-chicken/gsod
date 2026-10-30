@@ -65,7 +65,7 @@ PALETTE = np.array(
 SPREAD_COLLAPSED = 0.05  # mean distance of a slot's Gaussians to their mean
 SLOT_COS_COLLAPSED = 0.95  # mean pairwise cosine of object-slot latents
 SLOT_TAKES_ALL = 0.5  # attention share of the largest object slot
-BG_ON_OBJECTS = 0.3  # background slot's share of the object pixels
+BG_ON_OBJECTS = 0.3  # background's (uncovered) share of the object pixels
 DOMINANCE_GOOD = 0.8  # share of the strongest object slot on object pixels
 DOMINANCE_BAD = 0.6
 ARI_GOOD = 0.7
@@ -103,7 +103,7 @@ def collect(model, item: dict, device, seed: int = 0) -> dict[str, np.ndarray]:
         "alpha": np_(result["slot_alpha"]),  # (N, K, H, W)
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (N, H, W)
         "attn": np_(result["attn"]).reshape(-1, side, side),  # (K, s, s)
-        "slots": np_(result["slots"]),  # (K, C) view-0 slots
+        "slots": np_(result["slots"]),  # (K-1, C) view-0 object slots
         "mu": np_(g["mu"]),
         "scale": np_(g["scale"]),
         "opacity": np_(g["opacity"]),
@@ -208,7 +208,7 @@ def analyse(rec: dict) -> dict:
     # Object pixels: GT if available, else what the attention gives to objects.
     obj = gt[0] > 0 if gt is not None else attn[0] < 0.5
 
-    z = rec["slots"][1:]  # object slots
+    z = rec["slots"]  # object slots
     z_n = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-8)
     cos = z_n @ z_n.T
     off = cos[~np.eye(len(z), dtype=bool)]

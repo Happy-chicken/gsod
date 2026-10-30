@@ -19,7 +19,7 @@ class Scene:
 
     primitives: list[Primitive]
     colors: np.ndarray
-    background_color: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    background_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
     ambient: float = 0.55
     light_dir: tuple[float, float, float] = (-0.4, -0.35, 0.85)
 

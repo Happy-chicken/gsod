@@ -22,7 +22,7 @@ class BaseConfig:
     input_size: int = 64
     # Channel width of encoder features and slot latents.
     z_dim: int = 64
-    # Number of slots K: one background slot + K-1 object slots.
+    # Number of slots K: the empty background (index 0) + K-1 object slots.
     num_slots: int = 6
     # Number of slot-attention refinement iterations.
     attn_iter: int = 3

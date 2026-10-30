@@ -1,15 +1,16 @@
 """Slot model: encoder -> slot attention -> Gaussians per slot -> splatting.
 
-views[0] -> Encoder -> tokens -> SlotAttention -> K slots (0 = background)
+views[0] -> Encoder -> tokens -> SlotAttention -> K-1 object slots
     object slots -> object decoder -> Gaussians per slot (view-0 azimuth
         frame -> world) -> each slot splatted on its own into every view ->
         alpha-composited as layers in a soft depth order, over the
         background colour
 
-The background is empty: slot 0 takes part in slot attention (it can take
-the background tokens away from the object slots) but is not decoded, and
-whatever no object covers shows the background colour (the dataset's,
-``background_color`` in its scene config). Nothing has to learn to draw it.
+The background is empty: there is no background slot. Slot attention has
+an empty option (row 0 of the attention, no parameters) that takes the
+tokens no object slot wants, and whatever no object covers shows the
+background colour (the dataset's ``background_color``, black if absent).
+Nothing has to learn to draw it.
 
 The slots compete in the 3D render itself, with no 2D decoder and no masks:
 
@@ -227,13 +228,13 @@ class GSODModel(nn.Module):
         near: float = 0.1,
         scene_config: dict | None = None,
     ):
-        """num_slots: K, the background slot included (it is not decoded).
+        """num_slots: K, the empty background included (K-1 object slots).
         scene_config: the SceneGenConfig dict from meta.json (default: the
         SceneGenConfig defaults); sets the object box and the background
-        colour (``background_color``, mid grey if absent).
+        colour (``background_color``, black if absent).
         Slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
-        assert num_slots >= 2, "num_slots counts the background; need >= 2"
+        assert num_slots >= 2, "num_slots counts the empty background; need >= 2"
         self.splat = splat
         self.image_size = tuple(image_size)
         self.input_size = input_size
@@ -256,7 +257,7 @@ class GSODModel(nn.Module):
         )
         self.register_buffer(
             "background",
-            torch.tensor(scene_config.get("background_color", (0.5, 0.5, 0.5))),
+            torch.tensor(scene_config.get("background_color", (0.0, 0.0, 0.0))),
             persistent=False,
         )
         # Soft depth order of the slot layers: depth differences of a
@@ -306,7 +307,7 @@ class GSODModel(nn.Module):
         """images: (N,3,H,W) in [0,1]; cam2world: (N,4,4) world frame.
         Only views[0] is encoded."""
         slots, attn = self.slot_attention(self.encode(images[0:1]))
-        slots, attn = slots[0], attn[0]  # (K, C), (K, s*s)
+        slots, attn = slots[0], attn[0]  # (K-1, C) object slots, (K, s*s)
 
         # Object slots start from their attention regions: token rays at the
         # height of an average object's centre, and the token colours.
@@ -320,12 +321,12 @@ class GSODModel(nn.Module):
             attn[1:], points, colours, (b.r_max, b.fg_xy), b.r_max + 0.125
         )
         # (K-1, G, ...), view-0 azimuth frame
-        obj = self.decoder(slots[1:], centre=centre, extent=extent, colour=colour)
+        obj = self.decoder(slots, centre=centre, extent=extent, colour=colour)
         residual = obj.pop("rgb_residual")
         compactness, appearance = self._capacity_terms(obj, residual)
         obj = yaw_to_world(obj, view_yaw(cam2world[0]))
 
-        per_slot = [{name: obj[name][k] for name in obj} for k in range(slots.shape[0] - 1)]
+        per_slot = [{name: obj[name][k] for name in obj} for k in range(slots.shape[0])]
         layers = [
             self.splat(g, cam2world, self.image_size, self.focal_ratio, self.near)
             for g in per_slot
@@ -334,15 +335,15 @@ class GSODModel(nn.Module):
 
         gaussians = {name: obj[name].flatten(0, 1) for name in obj}
         n_gauss = obj["mu"].shape[1]
-        slot_ids = torch.arange(1, slots.shape[0], device=slots.device).repeat_interleave(
+        slot_ids = torch.arange(1, slots.shape[0] + 1, device=slots.device).repeat_interleave(
             n_gauss
         )
         return {
             "rgb": image,
             "slot_alpha": weights,  # (N, K, H, W); 0 = uncovered (background)
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
-            "attn": attn,  # (K, s*s) view-0 slot attention; row 0 = background
-            "slots": slots,  # (K, C) view-0 slots; 0 = background
+            "attn": attn,  # (K, s*s) view-0 slot attention; row 0 = empty
+            "slots": slots,  # (K-1, C) view-0 object slots (masks 1..K-1)
             "slot_ids": slot_ids,  # (M,) slot of each Gaussian (1..K-1)
             "gaussians": gaussians,  # world frame, object slots only
             "compactness": compactness,
