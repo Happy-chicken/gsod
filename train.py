@@ -20,7 +20,7 @@ L1 of the novel views and of view 0 and the gradient norm (train/*), and at
 every validation -- before the first epoch, then every eval_every epochs --
 the validation PSNR and render FG-ARI (val/*), four diagnostic statistics
 of the first VAL_SCENES validation scenes (diag/*), and those scenes'
-images, one section per scene (gsod/utils/visualize.py). Lightning's
+images, grouped by scene and view (gsod/utils/visualize.py). Lightning's
 global-step and epoch counters are hidden from the charts. The best
 validation PSNR and its epoch go to the run summary. Nothing is printed per
 validation.

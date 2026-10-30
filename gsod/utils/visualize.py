@@ -15,8 +15,8 @@ train.py logs them at every validation, test.py once on the test split
                        distinct?
 
 Each scene's images are logged as separate captioned tiles grouped into
-panels (``panels``): view 0, slot attention, slot weights in view 0,
-view 1, slot weights in view 1.
+panels by view (``panels``): view0/images, view0/attention, view0/slots,
+view1/images, view1/slots.
 """
 
 from __future__ import annotations
@@ -230,15 +230,17 @@ def _slot_tiles(maps: np.ndarray) -> list[tuple[np.ndarray, str]]:
 
 
 def panels(rec: dict) -> dict[str, list[tuple[np.ndarray, str]]]:
-    """One scene's images as separate captioned tiles, grouped into panels:
+    """One scene's images as separate captioned tiles, grouped into panels
+    by view:
 
-    view0         input, render, GT mask, render mask, attention argmax over
-                  the object slots (view 0, the encoded input)
-    attention     each slot's share of the view-0 tokens (bg = empty option)
-    slots_view0   each slot's compositing weight per pixel in view 0 (bg:
-                  the share no object covers)
-    view1, slots_view1   the same for view 1, a novel view the encoder never
-                  sees, so it tests the 3D
+    view0/images     input, render, GT mask, render mask, attention argmax
+                     over the object slots (view 0, the encoded input)
+    view0/attention  each slot's share of the view-0 tokens (bg = empty
+                     option)
+    view0/slots      each slot's compositing weight per pixel (bg: the
+                     share no object covers)
+    view1/images, view1/slots   the same for view 1, a novel view the
+                     encoder never sees, so it tests the 3D
 
     Masks: argmax slot per pixel, background dark grey, slot k in PALETTE.
     """
@@ -257,14 +259,14 @@ def panels(rec: dict) -> dict[str, list[tuple[np.ndarray, str]]]:
 
     attn_up = _up(rec["attn"], size)
     out = {
-        "view0": images(0)
+        "view0/images": images(0)
         + [(_colorize(attn_up[1:].argmax(0) + 1), "attention (objects)")],
-        "attention": _slot_tiles(attn_up),
-        "slots_view0": _slot_tiles(rec["alpha"][0]),
+        "view0/attention": _slot_tiles(attn_up),
+        "view0/slots": _slot_tiles(rec["alpha"][0]),
     }
     if rec["rgb"].shape[0] > 1:
-        out["view1"] = images(1)
-        out["slots_view1"] = _slot_tiles(rec["alpha"][1])
+        out["view1/images"] = images(1)
+        out["view1/slots"] = _slot_tiles(rec["alpha"][1])
     return out
 
 
@@ -279,26 +281,12 @@ def summarize(per_scene: list[dict]) -> dict:
     return mean
 
 
-def _title(stats: dict) -> str:
-    def fmt(value) -> str:
-        return "-" if value is None or np.isnan(value) else f"{value:.2f}"
-
-    g = stats.get
-    return (
-        f"FG-ARI v0 {fmt(g('render_fg_ari_view0'))}, "
-        f"novel {fmt(g('render_fg_ari_novel'))} | "
-        f"objects found {fmt(g('obj_recall_view0'))} | "
-        f"bg on objects {fmt(g('bg_on_objects'))}"
-    )
-
-
 def scene_panels(
     model, dataset, device, n_scenes: int, seed: int = 0
 ) -> tuple[dict[str, list[tuple[np.ndarray, str]]], dict[str, float]]:
     """Panels of the first n_scenes scenes of dataset, keyed
-    "scene####/<panel>" (one W&B section per scene), and the statistics of
-    analyse averaged over the scenes. The scene's key scores are the caption
-    of its view-0 input tile."""
+    "scene####/view<v>/<panel>", and the statistics of analyse averaged over
+    the scenes."""
     was_training = model.training
     model.eval()
     out, per_scene = {}, []
@@ -308,9 +296,6 @@ def scene_panels(
         stats = analyse(rec)
         stats["scene"] = int(item.get("scene", i))
         per_scene.append(stats)
-        scene = panels(rec)
-        image, _ = scene["view0"][0]
-        scene["view0"][0] = (image, _title(stats))
-        out.update({f"scene{stats['scene']:04d}/{k}": v for k, v in scene.items()})
+        out.update({f"scene{stats['scene']:04d}/{k}": v for k, v in panels(rec).items()})
     model.train(was_training)
     return out, summarize(per_scene)

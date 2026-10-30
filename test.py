@@ -2,7 +2,7 @@
 """Evaluate and render a trained checkpoint.
 
 The metrics (in the run summary), the diagnostic statistics and the images
-of the first TEST_SCENES scenes (one section per scene) go to a W&B run
+of the first TEST_SCENES scenes (grouped by scene and view) go to a W&B run
 (job_type "test") in the training runs' project; the renders are also
 written as PNGs unless --no-render.
 
