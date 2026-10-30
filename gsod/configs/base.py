@@ -35,23 +35,24 @@ class BaseConfig:
     near: float = 0.1
 
     # --- optimisation ----------------------------------------------------------
-    # Number of optimisation steps; each step trains on one scene.
-    steps: int = 10_000
-    # Adam learning rate: linear warm-up over lr_warmup_steps, then halved
-    # every lr_half_life steps (Slot Attention's schedule).
+    # Number of epochs (passes over the training scenes); each step trains on
+    # one scene. All schedules below are in epochs (fractional within one).
+    epochs: int = 125
+    # Adam learning rate: linear warm-up over lr_warmup_epochs, then halved
+    # every lr_half_life epochs (Slot Attention's schedule).
     lr: float = 3e-4
-    lr_warmup_steps: int = 5_000
-    lr_half_life: int = 100_000
+    lr_warmup_epochs: float = 6
+    lr_half_life: float = 125
     # Gradient-norm clipping (0 = off).
     grad_clip: float = 1.0
     # Seed for torch, scene/view sampling, and model initialisation.
     seed: int = 0
-    # Print a training log line every N steps.
+    # Log the training terms every N steps (a logging rate, not a schedule).
     log_every: int = 100
-    # Run validation on the val split every N steps.
-    eval_every: int = 2_000
-    # Write an iter_<step> checkpoint every N steps.
-    save_every: int = 5_000
+    # Run validation on the val split every N epochs.
+    eval_every: int = 2
+    # Write an epoch_<n> checkpoint every N epochs.
+    save_every: int = 5
     # DataLoader worker processes.
     num_workers: int = 4
     # Loss term weights.

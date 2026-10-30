@@ -1,6 +1,6 @@
 """Checkpoint interface, same file layout as uORF's BaseModel.
 
-Files written into save_dir for a given suffix (e.g. 'latest' or 'iter_1000'):
+Files written into save_dir for a given suffix (e.g. 'latest' or 'epoch_25'):
     {suffix}_net_{name}.pth          one per network
     {suffix}_optimizer_{i}.pth       one per optimizer
     {suffix}_lr_scheduler_{i}.pth    one per scheduler
