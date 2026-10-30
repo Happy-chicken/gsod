@@ -21,8 +21,9 @@ The slots compete in the 3D render itself, with no 2D decoder and no masks:
     mask, in every view.
   * input-dependent from the first step: each object slot's Gaussians sit
     in the region its attention covers (attention-weighted centre and spread
-    of the points where the token rays reach object height) and start with
-    that region's mean colour (``attention_regions``). The reconstruction
+    of the points where the token rays reach object height, the attention
+    sharpened so the strongest core dominates) and start with that region's
+    mean colour (``attention_regions``). The reconstruction
     gradient reaches the attention through them; while the attention is
     still spread, so are the Gaussians.
 
@@ -59,6 +60,10 @@ from gsod.utils.splatter import GsplatSplatter
 
 # A slot's transparent part counts as this much of a layer at the far depth.
 _ALPHA_EPS = 1e-3
+# Attention regions weight the tokens by attention ** this power, so a slot
+# whose attention has two cores starts from the stronger one (0.6 vs 0.3:
+# 16 : 1 instead of 2 : 1) instead of the mean of two objects.
+_REGION_SHARPNESS = 4.0
 
 
 def view_yaw(cam2world: torch.Tensor) -> torch.Tensor:
@@ -158,9 +163,11 @@ def attention_regions(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Each slot's attention region: attn (K, N) over N tokens, their points
     (N, 3) and colours (N, 3) -> centre (K, 3) and mean colour (K, 3), the
-    attention-weighted means, and extent (K, 3): twice the weighted spread
-    in xy, within extent_range, and half_height in z."""
-    p = attn / attn.sum(1, keepdim=True)
+    weighted means, and extent (K, 3): twice the weighted spread in xy,
+    within extent_range, and half_height in z. The weights are the slot's
+    attention sharpened (attn ** _REGION_SHARPNESS, normalised over the
+    tokens), so its strongest core dominates."""
+    p = (_REGION_SHARPNESS * attn.log()).softmax(dim=1)
     centre = p @ points
     spread = (p @ points[:, :2] ** 2 - centre[:, :2] ** 2).clamp_min(0.0).add(1e-8).sqrt()
     extent_xy = (2.0 * spread).clamp(*extent_range)

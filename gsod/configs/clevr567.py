@@ -34,8 +34,8 @@ class Clevr567Config(BaseConfig):
     # uORF's CLEVR-567 train / test roots (flat uORF layout).
     data_root: str = "data/clevr/clevr_567_train"
     test_root: str | None = "data/clevr/clevr_567_test"
-    # 5-7 objects per scene + the empty background.
-    num_slots: int = 8
+    # 5-7 objects per scene + spare slots + the empty background.
+    num_slots: int = 10
     scene_prior: dict | None = field(default_factory=_clevr_scene_prior)
     # CLEVR-567 checkpoint directory.
     out_dir: str = field(default_factory=lambda: default_out_dir("clevr567"))
