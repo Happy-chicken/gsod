@@ -11,9 +11,13 @@ ObjectHead      object slots: around the region the slot's attention covers
                 (centre and extent per slot, from GSODModel), starting with
                 that region's mean colour, so a slot's Gaussians depend on
                 the input through its attention from the first step. While
-                the attention is still spread, so are the Gaussians. Like the
-                position, the colour is the region's plus a per-Gaussian
-                offset.
+                the attention is still spread, so are the Gaussians. The
+                region's centre gets a shift predicted from the slot latent
+                (zero at first): the region is a guess from view 0 alone and
+                misplaces an object along the view-0 ray, e.g. one of which
+                only the top shows behind another; the shift lets the other
+                views pull it back. Like the position, the colour is the
+                region's plus a per-Gaussian offset.
 
 The background is not decoded: it is the empty space behind the objects
 (gsod.py).
@@ -88,28 +92,40 @@ def _projection(d_model: int, n_params: int) -> nn.Sequential:
 class ObjectHead(nn.Module):
     """Raw parameters: position 3, scale 3, quat 4, opacity 1, colour residual 3."""
 
-    def __init__(self, d_model: int, bounds: SceneBounds):
+    def __init__(self, z_dim: int, d_model: int, bounds: SceneBounds):
         super().__init__()
         self.scale_range = (0.02, bounds.r_max)
         self.project = _projection(d_model, 14)
+        # Shift of the region centre from the slot latent, bounded per axis
+        # (up to half the object box in xy, an object's size in z).
+        self.shift = nn.Linear(z_dim, 3)
+        self.register_buffer(
+            "shift_bound",
+            torch.tensor([0.5 * bounds.fg_xy, 0.5 * bounds.fg_xy, bounds.r_max]),
+            persistent=False,
+        )
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
             bias = self.project[-1].bias
             bias[3:6] = _logit((math.log(OBJECT_SCALE_INIT) - lo) / (hi - lo))
             bias[6] = 1.0  # identity quaternion (w first, gsplat convention)
             bias[10] = OPACITY_INIT
+            self.shift.weight.zero_()
+            self.shift.bias.zero_()
 
     def forward(
         self,
         feat: torch.Tensor,
+        slots: torch.Tensor,
         centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat: (K, G, d); per slot, its attention region:
+        """feat: (K, G, d); slots: (K, C); per slot, its attention region:
         centre (K, 3), extent (K, 3) and mean colour (K, 3) -> Gaussians
         (K, G, ...)."""
         raw = self.project(feat)
+        centre = centre + self.shift_bound * torch.tanh(self.shift(slots))
         region = torch.logit(colour.clamp(0.02, 0.98))
         return {
             "mu": centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3]),

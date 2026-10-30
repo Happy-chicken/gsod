@@ -23,7 +23,9 @@ The slots compete in the 3D render itself, with no 2D decoder and no masks:
     in the region its attention covers (attention-weighted centre and spread
     of the points where the token rays reach object height, the attention
     sharpened so the strongest core dominates) and start with that region's
-    mean colour (``attention_regions``). The reconstruction
+    mean colour (``attention_regions``); the decoder learns a shift of the
+    centre from the slot latent, so the other views can correct where view
+    0 alone misplaced an object. The reconstruction
     gradient reaches the attention through them; while the attention is
     still spread, so are the Gaussians.
 
@@ -254,7 +256,7 @@ class GSODModel(nn.Module):
             z_dim,
             gaussians_per_slot,
             decoder_hidden_dim,
-            ObjectHead(decoder_hidden_dim, bounds),
+            ObjectHead(z_dim, decoder_hidden_dim, bounds),
         )
         self.register_buffer(
             "background",

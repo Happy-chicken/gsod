@@ -29,7 +29,7 @@ class AttentionDecoder(nn.Module):
         query_std: float = 2.0,
     ):
         """Works for any number of slots; hidden_dim is the attention width
-        d_model; head maps features (K, G, d) to Gaussians."""
+        d_model; head maps (features (K, G, d), slots (K, C)) to Gaussians."""
         super().__init__()
         d_model = int(hidden_dim)
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -69,4 +69,4 @@ class AttentionDecoder(nn.Module):
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
-        return self.head(self._attend(q, k, v), **context)
+        return self.head(self._attend(q, k, v), slots, **context)
