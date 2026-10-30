@@ -186,7 +186,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
-    parser.add_argument("--bg-gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
@@ -215,7 +214,6 @@ def main() -> None:
         "num_slots",
         "attn_iter",
         "gaussians_per_slot",
-        "bg_gaussians_per_slot",
         "decoder_hidden_dim",
     ]
     values = {

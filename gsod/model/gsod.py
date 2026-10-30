@@ -1,11 +1,15 @@
 """Slot model: encoder -> slot attention -> Gaussians per slot -> splatting.
 
 views[0] -> Encoder -> tokens -> SlotAttention -> K slots (0 = background)
-    background slot -> background decoder: floor layer + far shell
-    object slots    -> object decoder: Gaussians anywhere in the object box
-    each slot's Gaussians (view-0 azimuth frame -> world) -> splatted on its
-        own into every view -> the slots alpha-composited as layers in a
-        soft depth order
+    object slots -> object decoder -> Gaussians per slot (view-0 azimuth
+        frame -> world) -> each slot splatted on its own into every view ->
+        alpha-composited as layers in a soft depth order, over the
+        background colour
+
+The background is empty: slot 0 takes part in slot attention (it can take
+the background tokens away from the object slots) but is not decoded, and
+whatever no object covers shows the background colour (the dataset's,
+``background_color`` in its scene config). Nothing has to learn to draw it.
 
 The slots compete in the 3D render itself, with no 2D decoder and no masks:
 
@@ -20,13 +24,12 @@ The slots compete in the 3D render itself, with no 2D decoder and no masks:
     that region's mean colour (``attention_regions``). The reconstruction
     gradient reaches the attention through them; while the attention is
     still spread, so are the Gaussians.
-  * limited capacity: the background cannot enter the object box and has a
-    lower bound on scale; an object slot has one base colour (per-Gaussian
+  * limited capacity: an object slot has one base colour (per-Gaussian
     residuals are penalised) and is pulled compact (compactness term, from
     train.py's schedule), so one slot is a poor fit for two objects.
 
 Slot indices in every output (masks, slot_alpha, attention rows):
-    0       background
+    0       background (in slot_alpha: the uncovered share of the pixel)
     1..K-1  objects
 
 Only views[0] is encoded, in training as at inference.
@@ -39,8 +42,6 @@ Gaussians are therefore predicted in the azimuth frame of view 0 (yaw-rotated
 so view 0 looks along +x; uORF's nss2cam0) and rotated into the world before
 splatting. Cameras are never modified.
 
-Everything that is rendered comes from Gaussians: there is no constant colour
-fill; a pixel no Gaussian covers renders black.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.data_generator.generator import SceneGenConfig
-from gsod.model.decoders import AttentionDecoder, BackgroundHead, ObjectHead, SceneBounds
+from gsod.model.decoders import AttentionDecoder, ObjectHead, SceneBounds
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 
@@ -171,9 +172,13 @@ def attention_regions(
 
 
 def composite(
-    layers: list[dict[str, torch.Tensor]], tau: float, far: float
+    layers: list[dict[str, torch.Tensor]],
+    tau: float,
+    far: float,
+    background: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Alpha compositing of the slots as layers, in a soft depth order.
+    """Alpha compositing of the object slots as layers, in a soft depth
+    order, over a background colour (3,) behind all of them.
 
     layers: per slot, the splatter output (V, C, H, W): accumulated "rgb"
     and "depth", and "alpha". Slot k sits at its expected depth d_k (pulled
@@ -182,12 +187,15 @@ def composite(
     it:
 
         T_k   = prod_{j != k} (1 - alpha_j * sigmoid((d_k - d_j) / tau))
-        image = sum_k T_k * rgb_k          (rgb_k already carries alpha_k)
+        T_bg  = prod_k (1 - alpha_k)
+        image = sum_k T_k * rgb_k + T_bg * background
+                                           (rgb_k already carries alpha_k)
         w_k   = T_k * alpha_k              slot k's share of the pixel
 
     A faint slot hides little, however close it is, and there is no
     division by a slot's alpha and no log in the image. Returns (image
-    (V, 3, H, W), weights (V, K, H, W), summing to the pixel's coverage).
+    (V, 3, H, W), weights (V, 1 + K, H, W): the background's share T_bg
+    first, then the slots').
     """
     rgb = torch.stack([layer["rgb"] for layer in layers], 1)  # (V, K, 3, H, W)
     alpha = torch.stack([layer["alpha"] for layer in layers], 1)  # (V, K, 1, H, W)
@@ -198,9 +206,10 @@ def composite(
     not_self = 1.0 - torch.eye(alpha.shape[1], device=alpha.device, dtype=alpha.dtype)
     front = front * not_self[None, :, :, None, None, None]
     transmittance = (1.0 - alpha[:, :, None] * front).prod(1)  # (V, K, 1, H, W)
-    image = (transmittance * rgb).sum(1)
-    weights = transmittance * alpha
-    return image, weights[:, :, 0]
+    uncovered = (1.0 - alpha).prod(1)  # (V, 1, H, W)
+    image = (transmittance * rgb).sum(1) + uncovered * background[:, None, None]
+    weights = torch.cat([uncovered, (transmittance * alpha)[:, :, 0]], 1)
+    return image, weights
 
 
 class GSODModel(nn.Module):
@@ -213,17 +222,15 @@ class GSODModel(nn.Module):
         num_slots: int = 6,
         attn_iter: int = 3,
         gaussians_per_slot: int = 512,
-        bg_gaussians_per_slot: int = 1024,
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
         scene_config: dict | None = None,
     ):
-        """num_slots: K, the background slot included.
-        bg_gaussians_per_slot: Gaussians of the background slot.
+        """num_slots: K, the background slot included (it is not decoded).
         scene_config: the SceneGenConfig dict from meta.json (default: the
-        SceneGenConfig defaults); sets the object box and the background's
-        floor and shell.
+        SceneGenConfig defaults); sets the object box and the background
+        colour (``background_color``, mid grey if absent).
         Slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
@@ -247,17 +254,16 @@ class GSODModel(nn.Module):
             decoder_hidden_dim,
             ObjectHead(z_dim, decoder_hidden_dim, bounds),
         )
-        self.bg_decoder = AttentionDecoder(
-            z_dim,
-            bg_gaussians_per_slot,
-            decoder_hidden_dim,
-            BackgroundHead(decoder_hidden_dim, bounds, bg_gaussians_per_slot),
+        self.register_buffer(
+            "background",
+            torch.tensor(scene_config.get("background_color", (0.5, 0.5, 0.5))),
+            persistent=False,
         )
         # Soft depth order of the slot layers: depth differences of a
         # fraction of an object decide who is in front; nearly transparent
         # parts count as this far.
         self.depth_tau = bounds.r_max / 4.0
-        self.far = bounds.reach + float(scene_config["distance_range"][1])
+        self.far = bounds.d_max + 2.0 * bounds.fg_xy
         # Compactness: an object slot's Gaussians within this distance of
         # their centre cost nothing.
         self.object_radius = 1.5 * bounds.r_max
@@ -268,7 +274,6 @@ class GSODModel(nn.Module):
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
             "Decoder": self.decoder,
-            "BgDecoder": self.bg_decoder,
         }
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -318,34 +323,28 @@ class GSODModel(nn.Module):
         obj = self.decoder(slots[1:], centre=centre, extent=extent, colour=colour)
         residual = obj.pop("rgb_residual")
         compactness, appearance = self._capacity_terms(obj, residual)
-        bg = self.bg_decoder(slots[:1])  # (1, G_bg, ...)
-        yaw = view_yaw(cam2world[0])
-        obj, bg = yaw_to_world(obj, yaw), yaw_to_world(bg, yaw)
+        obj = yaw_to_world(obj, view_yaw(cam2world[0]))
 
-        per_slot = [{name: bg[name][0] for name in bg}] + [
-            {name: obj[name][k] for name in obj} for k in range(slots.shape[0] - 1)
-        ]
+        per_slot = [{name: obj[name][k] for name in obj} for k in range(slots.shape[0] - 1)]
         layers = [
             self.splat(g, cam2world, self.image_size, self.focal_ratio, self.near)
             for g in per_slot
         ]
-        image, weights = composite(layers, self.depth_tau, self.far)
+        image, weights = composite(layers, self.depth_tau, self.far, self.background)
 
-        gaussians = {name: torch.cat([g[name] for g in per_slot]) for name in bg}
-        slot_ids = torch.cat(
-            [
-                torch.full((g["mu"].shape[0],), k, device=slots.device)
-                for k, g in enumerate(per_slot)
-            ]
+        gaussians = {name: obj[name].flatten(0, 1) for name in obj}
+        n_gauss = obj["mu"].shape[1]
+        slot_ids = torch.arange(1, slots.shape[0], device=slots.device).repeat_interleave(
+            n_gauss
         )
         return {
             "rgb": image,
-            "slot_alpha": weights,  # (N, K, H, W), sums to the coverage
+            "slot_alpha": weights,  # (N, K, H, W); 0 = uncovered (background)
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": attn,  # (K, s*s) view-0 slot attention; row 0 = background
             "slots": slots,  # (K, C) view-0 slots; 0 = background
-            "slot_ids": slot_ids,  # (M,) slot of each Gaussian
-            "gaussians": gaussians,  # world frame, background first
+            "slot_ids": slot_ids,  # (M,) slot of each Gaussian (1..K-1)
+            "gaussians": gaussians,  # world frame, object slots only
             "compactness": compactness,
             "appearance": appearance,
         }

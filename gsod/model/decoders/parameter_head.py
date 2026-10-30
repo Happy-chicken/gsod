@@ -5,8 +5,7 @@ A head turns the decoder's per-Gaussian features into Gaussians, in the
 
     mu / scale / quat / opacity / rgb, each (K, G, ...) for K slots
 
-There is no per-slot frame: where a slot's Gaussians go is learned, inside
-fixed regions that are the structural prior (no masks):
+Only the object slots are decoded:
 
 ObjectHead      object slots: around the region the slot's attention covers
                 (centre and extent per slot, from GSODModel), starting with
@@ -17,10 +16,9 @@ ObjectHead      object slots: around the region the slot's attention covers
                 small per-Gaussian residual ("rgb_residual", penalised in
                 losses.py), so one slot is a poor fit for two objects of
                 different colours.
-BackgroundHead  background slot: a floor layer and a far shell, both outside
-                the object box, with a lower bound on scale, so it cannot
-                draw an object (at most a blurred decal on the floor, which
-                the other views reject).
+
+The background is not decoded: it is the empty space behind the objects
+(gsod.py).
 """
 
 from __future__ import annotations
@@ -34,7 +32,6 @@ import torch.nn.functional as F
 
 OPACITY_INIT = -2.2  # sigmoid ~= 0.10
 OBJECT_SCALE_INIT = 0.1
-FLOOR_THICKNESS = 0.01
 
 
 @dataclass(frozen=True)
@@ -42,19 +39,16 @@ class SceneBounds:
     """Scene geometry priors from a SceneGenConfig dict (meta.json["config"]).
 
     radius_range is the objects' half size: they rest on the floor with their
-    centres at z = floor + r. fg_xy / fg_z: the object box (the placement
-    area widened by the largest object; floor to the top of the largest
-    object). floor_reach: how far the floor layer extends (beyond the
-    cameras). reach: radius of the far shell.
+    centres at z = floor + r. fg_xy: half width of the object box (the
+    placement area widened by the largest object). d_max: the farthest
+    camera distance.
     """
 
     floor_z: float
     r_min: float
     r_max: float
     fg_xy: float
-    fg_z: tuple[float, float]
-    floor_reach: float
-    reach: float
+    d_max: float
 
     @classmethod
     def from_config(cls, gen: dict) -> "SceneBounds":
@@ -68,9 +62,7 @@ class SceneBounds:
             r_min=r_min,
             r_max=r_max,
             fg_xy=fg_xy,
-            fg_z=(floor_z, floor_z + 2.0 * r_max + 0.25),
-            floor_reach=d_max + fg_xy,
-            reach=3.0 * (d_max + float(gen.get("target_height", 0.4))),
+            d_max=d_max,
         )
 
 
@@ -134,63 +126,4 @@ class ObjectHead(nn.Module):
             "opacity": torch.sigmoid(raw[..., 10]),
             "rgb": torch.sigmoid(region[:, None] + residual),
             "rgb_residual": residual,
-        }
-
-
-class BackgroundHead(nn.Module):
-    """The first half of the Gaussians form a flat floor layer at floor_z
-    within floor_reach; the second half a shell around the scene centre from
-    just outside the object box out to reach. Scales are at least half the
-    smallest object's size.
-
-    Raw parameters: position / direction 3, shell radius 1, scale 3, quat 4,
-    opacity 1, rgb 3.
-    """
-
-    def __init__(self, d_model: int, bounds: SceneBounds, n_gaussians: int):
-        super().__init__()
-        self.n_floor = n_gaussians // 2
-        self.floor_z = bounds.floor_z
-        self.floor_reach = bounds.floor_reach
-        # The shell starts at the object box's farthest corner.
-        self.shell = (
-            math.sqrt(2.0 * bounds.fg_xy**2 + (bounds.fg_z[1] - bounds.floor_z) ** 2),
-            bounds.reach,
-        )
-        s_min = 0.5 * bounds.r_min
-        self.floor_scale = (s_min, bounds.floor_reach / 4.0)
-        self.shell_scale = (s_min, bounds.reach / 4.0)
-        self.project = _projection(d_model, 15)
-        with torch.no_grad():
-            bias = self.project[-1].bias
-            bias[7] = 1.0  # identity quaternion
-            bias[11] = OPACITY_INIT
-
-    def forward(self, feat: torch.Tensor, slots: torch.Tensor) -> dict[str, torch.Tensor]:
-        """feat: (1, G, d) -> Gaussians (1, G, ...)."""
-        raw = self.project(feat)
-        floor, shell = raw[:, : self.n_floor], raw[:, self.n_floor :]
-
-        floor_xy = self.floor_reach * torch.tanh(floor[..., 0:2])
-        floor_mu = torch.cat([floor_xy, torch.full_like(floor_xy[..., :1], self.floor_z)], -1)
-        floor_scale = _log_uniform(floor[..., 4:6], *self.floor_scale)
-        floor_scale = torch.cat(
-            [floor_scale, torch.full_like(floor_scale[..., :1], FLOOR_THICKNESS)], -1
-        )
-        floor_quat = torch.zeros_like(floor[..., 7:11])
-        floor_quat[..., 0] = 1.0  # flat in xy
-
-        r_in, r_out = self.shell
-        radius = r_in + (r_out - r_in) * torch.sigmoid(shell[..., 3:4])
-        centre = shell.new_tensor([0.0, 0.0, self.floor_z])
-        shell_mu = centre + radius * F.normalize(shell[..., 0:3], dim=-1)
-
-        return {
-            "mu": torch.cat([floor_mu, shell_mu], 1),
-            "scale": torch.cat(
-                [floor_scale, _log_uniform(shell[..., 4:7], *self.shell_scale)], 1
-            ),
-            "quat": torch.cat([floor_quat, F.normalize(shell[..., 7:11], dim=-1)], 1),
-            "opacity": torch.sigmoid(raw[..., 11]),
-            "rgb": torch.sigmoid(raw[..., 12:15]),
         }

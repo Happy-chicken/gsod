@@ -220,13 +220,22 @@ def analyse(rec: dict) -> dict:
         mu = rec["mu"][sel]
         w = rec["opacity"][sel]
         centres.append((w[:, None] * mu).sum(0) / max(float(w.sum()), 1e-8))
+        # Slots without Gaussians (the background is not decoded): nan.
+        if sel.any():
+            gauss = {
+                "spread": float(np.linalg.norm(mu - mu.mean(0), axis=1).mean()),
+                "mean_scale": float(rec["scale"][sel].mean()),
+                "mean_opacity": float(w.mean()),
+                "active_frac": float((w > ACTIVE_OPACITY).mean()),
+            }
+        else:
+            gauss = dict.fromkeys(
+                ("spread", "mean_scale", "mean_opacity", "active_frac"), float("nan")
+            )
         per_slot.append(
             {
                 "slot": k,
-                "spread": float(np.linalg.norm(mu - mu.mean(0), axis=1).mean()),
-                "mean_scale": float(rec["scale"][sel].mean()),
-                "mean_opacity": float(rec["opacity"][sel].mean()),
-                "active_frac": float((rec["opacity"][sel] > ACTIVE_OPACITY).mean()),
+                **gauss,
                 "coverage_view0": float(alpha0[k].mean()),
                 "render_share_view0": float((rec["mask_idx"][0] == k).mean()),
                 "attn_share": float(rec["attn"][k].mean()),
@@ -464,7 +473,7 @@ def make_grid(
     View 0 is the encoded input; view 1 is a novel view the encoder never
     sees, so it tests the 3D. Slot attention: share of each token given to
     the slot. Rendered slot weight: the slot's compositing weight per pixel
-    (the weights sum to the pixel's coverage). Grey tiles: white = 1 (all of
+    (bg: the share no object covers). Grey tiles: white = 1 (all of
     the token / pixel), black = 0. Slot captions carry the slot's mask colour
     and its share of the image (the tile mean), so empty slots read 0%.
     Captions are English.

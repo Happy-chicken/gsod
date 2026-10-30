@@ -11,7 +11,6 @@ from __future__ import annotations
 from gsod.configs import BaseConfig
 from gsod.model.decoders import (
     AttentionDecoder,
-    BackgroundHead,
     ObjectHead,
     SceneBounds,
 )
@@ -33,7 +32,6 @@ def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
         num_slots=cfg.num_slots,
         attn_iter=cfg.attn_iter,
         gaussians_per_slot=cfg.gaussians_per_slot,
-        bg_gaussians_per_slot=cfg.bg_gaussians_per_slot,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
@@ -47,7 +45,6 @@ __all__ = [
     "Encoder",
     "SlotAttention",
     "AttentionDecoder",
-    "BackgroundHead",
     "ObjectHead",
     "SceneBounds",
     "GSODModel",
