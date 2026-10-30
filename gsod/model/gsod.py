@@ -28,6 +28,10 @@ The slots compete in the 3D render itself, with no 2D decoder and no masks:
     0 alone misplaced an object. The reconstruction
     gradient reaches the attention through them; while the attention is
     still spread, so are the Gaussians.
+  * presence from the token competition: an object slot's opacities are
+    scaled by a gate of its share of the attention, so a slot is drawn only
+    as far as it wins tokens; spare slots fade out instead of drawing on
+    another slot's object.
 
 Slot indices in every output (masks, slot_alpha, attention rows):
     0       background (in slot_alpha: the uncovered share of the pixel)
@@ -66,6 +70,11 @@ _ALPHA_EPS = 1e-3
 # whose attention has two cores starts from the stronger one (0.6 vs 0.3:
 # 16 : 1 instead of 2 : 1) instead of the mean of two objects.
 _REGION_SHARPNESS = 4.0
+# Presence gate of an object slot: its share m of the attention (mean over
+# the tokens) scales its opacities by m / (m + this). A slot that wins
+# tokens (an object's: ~1-3 %) is drawn; a spare slot that wins almost
+# none (~0.03 %) fades out instead of drawing on another slot's object.
+_PRESENCE_SCALE = 0.003
 
 
 def view_yaw(cam2world: torch.Tensor) -> torch.Tensor:
@@ -307,6 +316,8 @@ class GSODModel(nn.Module):
         )
         # (K-1, G, ...), view-0 azimuth frame
         obj = self.decoder(slots, centre=centre, extent=extent, colour=colour)
+        mass = attn[1:].mean(dim=1)  # (K-1,) each slot's share of the attention
+        obj["opacity"] = obj["opacity"] * (mass / (mass + _PRESENCE_SCALE))[:, None]
         obj = yaw_to_world(obj, view_yaw(cam2world[0]))
 
         per_slot = [{name: obj[name][k] for name in obj} for k in range(slots.shape[0])]
