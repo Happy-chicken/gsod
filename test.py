@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Evaluate and render a trained checkpoint.
 
-The metrics and the diagnostic sheets of the first TEST_SHEETS scenes go
-to a W&B run (job_type "test") in the training runs' project; the renders
-are also written as PNGs unless --no-render.
+The metrics (in the run summary), the diagnostic statistics and the images
+of the first TEST_SCENES scenes (one section per scene) go to a W&B run
+(job_type "test") in the training runs' project; the renders are also
+written as PNGs unless --no-render.
 
 Examples:
     python test.py --dataset primordia --split test
@@ -24,10 +25,10 @@ from gsod.utils.paths import latest_run_dir
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model, load_networks
 from gsod.model.evaluate import evaluate, render_scenes
-from gsod.utils.visualize import sheets
+from gsod.utils.visualize import scene_panels
 
 WANDB_PROJECT = "gsod"
-TEST_SHEETS = 16
+TEST_SCENES = 16
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +88,7 @@ def main() -> None:
         dataset = WithGTMasks(dataset, data_root)
     with torch.no_grad():
         metrics = evaluate(model, dataset, device)
-        images, captions, stats = sheets(model, dataset, device, TEST_SHEETS)
+        panels, stats = scene_panels(model, dataset, device, TEST_SCENES)
     print(f"{args.split} split:", {k: round(v, 4) for k, v in metrics.items()})
 
     run = wandb.init(
@@ -101,10 +102,8 @@ def main() -> None:
     run.summary.update({f"diag/{k}": v for k, v in stats.items()})
     run.log(
         {
-            "test/sheets": [
-                wandb.Image(image, caption=caption)
-                for image, caption in zip(images, captions)
-            ]
+            key: [wandb.Image(image, caption=caption) for image, caption in tiles]
+            for key, tiles in panels.items()
         }
     )
     run.finish()

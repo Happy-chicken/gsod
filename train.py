@@ -15,12 +15,15 @@ for latest, best and epoch_<n>, so test.py loads them unchanged;
 ``--resume`` continues from one of them. Lightning writes no checkpoints of
 its own.
 
-W&B (run in the checkpoint directory) gets the training terms, and at every
-validation -- before the first epoch, then every eval_every epochs -- the
-validation metrics (val/*), the diagnostic statistics of the first
-VAL_SHEETS validation scenes (diag/*) and their diagnostic sheets
-(val/sheets, gsod/utils/visualize.py). The best validation PSNR and its
-epoch go to the run summary. Nothing is printed per validation.
+W&B (run in the checkpoint directory) gets a few key curves: the training
+L1 of the novel views and of view 0 and the gradient norm (train/*), and at
+every validation -- before the first epoch, then every eval_every epochs --
+the validation PSNR and render FG-ARI (val/*), four diagnostic statistics
+of the first VAL_SCENES validation scenes (diag/*), and those scenes'
+images, one section per scene (gsod/utils/visualize.py). Lightning's
+global-step and epoch counters are hidden from the charts. The best
+validation PSNR and its epoch go to the run summary. Nothing is printed per
+validation.
 
 The training loop lives here because train.py is the only training entry
 point. Model code stays training-loop-agnostic.
@@ -36,6 +39,7 @@ from pathlib import Path
 
 import lightning as L
 import torch
+import wandb
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities import grad_norm
 from torch.utils.data import DataLoader
@@ -48,12 +52,19 @@ from gsod.model.checkpoint import load_networks, save_networks
 from gsod.model.evaluate import evaluate
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
-from gsod.utils.visualize import sheets
+from gsod.utils.visualize import scene_panels
 
 WANDB_PROJECT = "gsod"
-# Validation scenes drawn as diagnostic sheets at every validation (the
-# same scenes each time, so the sheets can be compared across epochs).
-VAL_SHEETS = 4
+# Validation scenes drawn at every validation (the same scenes each time,
+# so their images can be compared across epochs).
+VAL_SCENES = 4
+# The charts: W&B name -> key of evaluate() / of the diagnostic statistics.
+VAL_CHARTS = {
+    "val/psnr": "psnr",
+    "val/fg_ari_view0": "fg_ari_view0",
+    "val/fg_ari_novel": "fg_ari",
+}
+DIAG_CHARTS = ("obj_recall_view0", "bg_on_objects", "render_dominance", "slot_cos_mean")
 
 
 class GSODTraining(L.LightningModule):
@@ -118,11 +129,8 @@ class GSODTraining(L.LightningModule):
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order], cams[order]
         loss, terms = self.criterion(self.model(images, cams), images)
-        self.log_dict(
-            {f"train/{name}": value for name, value in terms.items() if name != "l1"},
-            batch_size=1,
-        )
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
+        self.log("train/view0", terms["view0"], batch_size=1)
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
@@ -139,25 +147,25 @@ class GSODTraining(L.LightningModule):
             self._save(f"epoch_{epoch}", epoch)
 
     def _validate(self, epoch: int) -> None:
-        """Validation metrics, diagnostic statistics and sheets to W&B; keeps
-        the best checkpoint by validation PSNR."""
+        """Key validation metrics, diagnostic statistics and the images of
+        VAL_SCENES scenes to W&B; keeps the best checkpoint by validation
+        PSNR."""
         if not len(self.val_set):
             return
         with torch.no_grad():
             metrics = evaluate(self.model, self.val_set, self.device)
-            images, captions, stats = sheets(
-                self.model, self.val_set, self.device, VAL_SHEETS
-            )
-        step = self.global_step
+            panels, stats = scene_panels(self.model, self.val_set, self.device, VAL_SCENES)
         self.logger.log_metrics(
             {
-                "epoch": epoch,
-                **{f"val/{k}": v for k, v in metrics.items()},
-                **{f"diag/{k}": v for k, v in stats.items()},
+                **{name: metrics[key] for name, key in VAL_CHARTS.items()},
+                **{f"diag/{key}": stats.get(key, float("nan")) for key in DIAG_CHARTS},
+                **{
+                    key: [wandb.Image(image, caption=caption) for image, caption in tiles]
+                    for key, tiles in panels.items()
+                },
             },
-            step=step,
+            step=self.global_step,
         )
-        self.logger.log_image("val/sheets", images=images, caption=captions, step=step)
         if metrics["psnr"] > self.best_psnr:
             self.best_psnr = metrics["psnr"]
             self._save("best", epoch)
@@ -232,6 +240,9 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
     logger = WandbLogger(
         project=WANDB_PROJECT, name=out.name, save_dir=str(out), config=asdict(cfg)
     )
+    # Lightning's counters (the x axis) get no charts of their own.
+    for counter in ("trainer/global_step", "epoch"):
+        logger.experiment.define_metric(counter, hidden=True)
     trainer = L.Trainer(
         accelerator="gpu",
         devices=1,

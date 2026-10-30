@@ -1,7 +1,7 @@
-"""Slot diagnostics for W&B: per-scene sheets and averaged statistics.
+"""Slot diagnostics for W&B: per-scene image panels and averaged statistics.
 
 train.py logs them at every validation, test.py once on the test split
-(``sheets``). Per scene and on average they answer:
+(``scene_panels``). Per scene and on average they answer:
 
 1. Initialisation   -- are the Gaussians of a slot spread out, or one point?
 2. Slot attention   -- are the slot latents distinct? Does one slot take the
@@ -14,10 +14,9 @@ train.py logs them at every validation, test.py once on the test split
 4. Slot centres     -- are the centres of the drawing slots' Gaussians
                        distinct?
 
-A sheet (make_grid) has a title with the scene's key scores and one block
-per view: view 0 (images and masks; slot attention; rendered slot weights),
-then view 1 (images and masks; rendered slot weights). Each slot tile has
-its mask colour and share of the image. Needs Pillow.
+Each scene's images are logged as separate captioned tiles grouped into
+panels (``panels``): view 0, slot attention, slot weights in view 0,
+view 1, slot weights in view 1.
 """
 
 from __future__ import annotations
@@ -221,184 +220,52 @@ def _gray(hw: np.ndarray) -> np.ndarray:
     return np.repeat(g[..., None], 3, axis=-1)
 
 
-_TEXT = {
-    "view0": "View 0",
-    "view1": "View 1",
-    "row_images": "images (masks: argmax slot per pixel)",
-    "row_attn": "slot attention",
-    "row_alpha": "rendered slot weight",
-    "image": "input image",
-    "render": "render",
-    "gt": "GT mask",
-    "mask": "render mask",
-    "attn_mask": "attention (objects)",
-    "slot": "{slot} {share:.0%}",
-}
-_FONTS = (
-    "DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "Arial.ttf",
-)
-
-
-def _load_font(size: int):
-    from PIL import ImageFont
-
-    for path in _FONTS:
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def _txt(key: str, **fmt) -> str:
-    return _TEXT[key].format(**fmt)
-
-
 def _slot_name(k: int) -> str:
     return "bg" if k == 0 else f"s{k}"
 
 
-def _slot_color(k: int) -> np.ndarray:
-    return MASK_BG if k == 0 else PALETTE[(k - 1) % len(PALETTE)]
+def _slot_tiles(maps: np.ndarray) -> list[tuple[np.ndarray, str]]:
+    """Grey tile per slot (white = 1), captioned with its share of the image."""
+    return [(_gray(m), f"{_slot_name(k)} {float(m.mean()):.0%}") for k, m in enumerate(maps)]
 
 
-def make_grid(
-    rec: dict,
-    pad: int = 4,
-    title: str | None = None,
-    min_tile: int = 128,
-) -> np.ndarray:
-    """Diagnostic sheet: one block per view, a caption under every tile.
+def panels(rec: dict) -> dict[str, list[tuple[np.ndarray, str]]]:
+    """One scene's images as separate captioned tiles, grouped into panels:
 
-    View 0  images: input, render, GT mask, render mask, attention argmax
-            over the object slots
-            slot attention per slot (bg = the empty option)
-            rendered weight per slot
-    View 1  images: input, render, GT mask, render mask (novel view)
-            rendered weight per slot
-    View 0 is the encoded input; view 1 is a novel view the encoder never
-    sees, so it tests the 3D. Slot attention: share of each token given to
-    the slot. Rendered slot weight: the slot's compositing weight per pixel
-    (bg: the share no object covers). Grey tiles: white = 1 (all of
-    the token / pixel), black = 0. Slot captions carry the slot's mask colour
-    and its share of the image (the tile mean), so empty slots read 0%.
-    Captions are English.
+    view0         input, render, GT mask, render mask, attention argmax over
+                  the object slots (view 0, the encoded input)
+    attention     each slot's share of the view-0 tokens (bg = empty option)
+    slots_view0   each slot's compositing weight per pixel in view 0 (bg:
+                  the share no object covers)
+    view1, slots_view1   the same for view 1, a novel view the encoder never
+                  sees, so it tests the 3D
+
+    Masks: argmax slot per pixel, background dark grey, slot k in PALETTE.
     """
-    from PIL import Image, ImageDraw
-
-    n_views = rec["rgb"].shape[0]
     size = rec["mask_idx"].shape[1:]
-    blank = np.zeros(size + (3,), dtype=np.uint8)
-    attn_up = np.stack([upsample_labels(a, size) for a in rec["attn"]])
     gt = rec["gt"]
 
-    scale = max(1, min_tile // max(size))
-    tile_h, tile_w = size[0] * scale, size[1] * scale
-    font = _load_font(max(10, tile_w // 10))
-    cap_h = font.size + 8 if hasattr(font, "size") else 16
-    head_h = cap_h
-
-    def image_tiles(v: int) -> list:
-        return [
-            (_rgb(rec["target"][v]), _txt("image"), None),
-            (_rgb(rec["rgb"][v]), _txt("render"), None),
-            (_colorize(gt[v]) if gt is not None else blank, _txt("gt"), None),
-            (_colorize(rec["mask_idx"][v]), _txt("mask"), None),
+    def images(v: int) -> list[tuple[np.ndarray, str]]:
+        tiles = [
+            (_rgb(rec["target"][v]), "input"),
+            (_rgb(rec["rgb"][v]), "render"),
+            (_colorize(rec["mask_idx"][v]), "render mask"),
         ]
+        if gt is not None:
+            tiles.insert(2, (_colorize(gt[v]), "GT mask"))
+        return tiles
 
-    def slot_tiles(maps: np.ndarray) -> list:
-        return [
-            (_gray(m), _txt("slot", slot=_slot_name(k), share=float(m.mean())), k)
-            for k, m in enumerate(maps)
-        ]
-
-    # Blocks of (view heading, [(row heading, [(image, caption, slot or None)])]).
-    blocks = [
-        (
-            _txt("view0"),
-            [
-                (
-                    _txt("row_images"),
-                    image_tiles(0)
-                    + [
-                        (_colorize(attn_up[1:].argmax(0) + 1), _txt("attn_mask"), None),
-                    ],
-                ),
-                (_txt("row_attn"), slot_tiles(rec["attn"])),
-                (_txt("row_alpha"), slot_tiles(rec["alpha"][0])),
-            ],
-        )
-    ]
-    if n_views > 1:
-        blocks.append(
-            (
-                _txt("view1"),
-                [
-                    (_txt("row_images"), image_tiles(1)),
-                    (_txt("row_alpha"), slot_tiles(rec["alpha"][1])),
-                ],
-            )
-        )
-
-    n_cols = max(len(row) for _, rows in blocks for _, row in rows)
-    block_h = tile_h + cap_h
-    top = head_h if title else 0
-    height = (
-        top
-        + sum(head_h + pad + len(rows) * (head_h + block_h + pad) for _, rows in blocks)
-        + pad
-    )
-    width = n_cols * (tile_w + pad) + pad
-    sheet = Image.new("RGB", (width, height), (255, 255, 255))
-    draw = ImageDraw.Draw(sheet)
-
-    def fit(text: str, max_w: int) -> str:
-        if draw.textlength(text, font=font) <= max_w:
-            return text
-        while text and draw.textlength(text + "…", font=font) > max_w:
-            text = text[:-1]
-        return text + "…"
-
-    if title:
-        draw.text((pad, 4), fit(title, width - 2 * pad), fill=(0, 0, 0), font=font)
-    y = top + pad
-    for view_heading, rows in blocks:
-        # View heading on a light band, so the two views read as blocks.
-        draw.rectangle([0, y, width, y + head_h - 2], fill=(230, 230, 236))
-        draw.text((pad, y + 2), fit(view_heading, width - 2 * pad), fill=(0, 0, 0), font=font)
-        y += head_h + pad
-        for heading, row in rows:
-            draw.text(
-                (pad, y), fit(heading, width - 2 * pad), fill=(90, 90, 90), font=font
-            )
-            y += head_h
-            for c, (img, caption, slot) in enumerate(row):
-                x = pad + c * (tile_w + pad)
-                tile = Image.fromarray(img).resize((tile_w, tile_h), Image.NEAREST)
-                sheet.paste(tile, (x, y))
-                # Thin frame so white tiles stay visible on the white sheet.
-                draw.rectangle(
-                    [x - 1, y - 1, x + tile_w, y + tile_h], outline=(170, 170, 170)
-                )
-                text_x = x
-                if slot is not None:
-                    sw = cap_h - 10
-                    draw.rectangle(
-                        [x, y + tile_h + 5, x + sw, y + tile_h + 5 + sw],
-                        fill=tuple(int(c_) for c_ in _slot_color(slot)),
-                        outline=(0, 0, 0),
-                    )
-                    text_x = x + sw + 4
-                draw.text(
-                    (text_x, y + tile_h + 3),
-                    fit(caption, tile_w - (text_x - x)),
-                    fill=(0, 0, 0),
-                    font=font,
-                )
-            y += block_h + pad
-    return np.asarray(sheet)
+    attn_up = _up(rec["attn"], size)
+    out = {
+        "view0": images(0)
+        + [(_colorize(attn_up[1:].argmax(0) + 1), "attention (objects)")],
+        "attention": _slot_tiles(attn_up),
+        "slots_view0": _slot_tiles(rec["alpha"][0]),
+    }
+    if rec["rgb"].shape[0] > 1:
+        out["view1"] = images(1)
+        out["slots_view1"] = _slot_tiles(rec["alpha"][1])
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -418,34 +285,32 @@ def _title(stats: dict) -> str:
 
     g = stats.get
     return (
-        f"scene {stats['scene']:04d} | FG-ARI: attention {fmt(g('attn_fg_ari'))}, "
-        f"render v0 {fmt(g('render_fg_ari_view0'))}, "
-        f"render novel {fmt(g('render_fg_ari_novel'))} | dominance: attention "
-        f"{fmt(g('attn_dominance'))}, render {fmt(g('render_dominance'))} | "
-        f"bg on objects {fmt(g('bg_on_objects'))} | "
-        f"objects found {fmt(g('obj_recall_view0'))}"
+        f"FG-ARI v0 {fmt(g('render_fg_ari_view0'))}, "
+        f"novel {fmt(g('render_fg_ari_novel'))} | "
+        f"objects found {fmt(g('obj_recall_view0'))} | "
+        f"bg on objects {fmt(g('bg_on_objects'))}"
     )
 
 
-def sheets(
+def scene_panels(
     model, dataset, device, n_scenes: int, seed: int = 0
-) -> tuple[list[np.ndarray], list[str], dict[str, float]]:
-    """Diagnostic sheets of the first n_scenes scenes of dataset.
-
-    Returns (sheets, (H, W, 3) uint8 each; their captions, the scene and its
-    key scores; the statistics of analyse averaged over the scenes).
-    """
+) -> tuple[dict[str, list[tuple[np.ndarray, str]]], dict[str, float]]:
+    """Panels of the first n_scenes scenes of dataset, keyed
+    "scene####/<panel>" (one W&B section per scene), and the statistics of
+    analyse averaged over the scenes. The scene's key scores are the caption
+    of its view-0 input tile."""
     was_training = model.training
     model.eval()
-    images, captions, per_scene = [], [], []
+    out, per_scene = {}, []
     for i in range(min(n_scenes, len(dataset))):
         item = dataset[i]
         rec = collect(model, item, device, seed + i)
         stats = analyse(rec)
         stats["scene"] = int(item.get("scene", i))
         per_scene.append(stats)
-        title = _title(stats)
-        images.append(make_grid(rec, title=title))
-        captions.append(title)
+        scene = panels(rec)
+        image, _ = scene["view0"][0]
+        scene["view0"][0] = (image, _title(stats))
+        out.update({f"scene{stats['scene']:04d}/{k}": v for k, v in scene.items()})
     model.train(was_training)
-    return images, captions, summarize(per_scene)
+    return out, summarize(per_scene)
