@@ -234,9 +234,9 @@ def panels(rec: dict) -> dict[str, dict[str, list[tuple[np.ndarray, str]]]]:
 
     view0  images     input, render, GT mask, render mask (view 0, the
                       encoded input)
-           attention  the attention mask (argmax over the object slots),
-                      then each slot's share of the tokens (bg = empty
-                      option)
+           attention  the attention mask (argmax over all rows: the empty
+                      option, shown as background, and the slots), then
+                      each slot's share of the tokens (bg = empty option)
            slots      each slot's compositing weight per pixel (bg: the
                       share no object covers)
     view1  images, slots   the same for view 1, a novel view the encoder
@@ -261,7 +261,7 @@ def panels(rec: dict) -> dict[str, dict[str, list[tuple[np.ndarray, str]]]]:
     out = {
         "view0": {
             "images": images(0),
-            "attention": [(_colorize(attn_up[1:].argmax(0) + 1), "attention mask")]
+            "attention": [(_colorize(attn_up.argmax(0)), "attention mask")]
             + _slot_tiles(attn_up),
             "slots": _slot_tiles(rec["alpha"][0]),
         }

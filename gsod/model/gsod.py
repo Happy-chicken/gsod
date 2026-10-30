@@ -44,7 +44,6 @@ splatting. Cameras are never modified.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import asdict
 
 import torch
@@ -55,8 +54,8 @@ from gsod.data_generator.generator import SceneGenConfig
 from gsod.model.decoders import AttentionDecoder, ObjectHead, SceneBounds
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
+from gsod.utils.splatter import GsplatSplatter
 
-Splatter = Callable[..., dict[str, torch.Tensor]]
 
 # A slot's transparent part counts as this much of a layer at the far depth.
 _ALPHA_EPS = 1e-3
@@ -213,7 +212,6 @@ def composite(
 class GSODModel(nn.Module):
     def __init__(
         self,
-        splat: Splatter,
         image_size: tuple[int, int] = (128, 128),
         input_size: int = 64,
         z_dim: int = 64,
@@ -232,7 +230,7 @@ class GSODModel(nn.Module):
         Slots are initialised BO-QSA style (see slot_attention.py)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the empty background; need >= 2"
-        self.splat = splat
+        self.splat = GsplatSplatter()
         self.image_size = tuple(image_size)
         self.input_size = input_size
         self.num_slots = num_slots

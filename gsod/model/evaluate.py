@@ -153,8 +153,8 @@ def render_scenes(
       view{v}_gt_mask.png   ground truth (if the loader provides masks)
       view{v}_slot{k}.png   compositing weight of slot k, grayscale (white = 1)
     Per scene:
-      attn_mask.png         slot-attention argmax over the object slots on
-                            view 0 (same colours)
+      attn_mask.png         slot-attention argmax on view 0, the empty option
+                            as background (same colours)
     """
     out = Path(out_dir)
     was_training = model.training
@@ -178,8 +178,12 @@ def render_scenes(
             for k in range(alpha.shape[1]):
                 gray = (alpha[v, k].clamp(0.0, 1.0) * 255.0 + 0.5).cpu().numpy()
                 save_png(scene_dir / f"view{v}_slot{k}.png", gray.astype(np.uint8))
-        attn = attn_labels(result, model, mask_idx.shape[1:])
-        save_png(scene_dir / "attn_mask.png", _colorize(attn))
+        # For display the empty option (row 0) stays in: it is the
+        # background. attn_labels leaves it out for the metrics.
+        attn = result["attn"].detach().cpu().numpy()  # (K, s*s)
+        side = model.input_size
+        labels = upsample_labels(attn.argmax(0).reshape(side, side), mask_idx.shape[1:])
+        save_png(scene_dir / "attn_mask.png", _colorize(labels))
     model.train(was_training)
 
 
