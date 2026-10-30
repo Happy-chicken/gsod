@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 # datasets stay local
 data/
+
+# Weights & Biases runs outside a checkpoint directory
+wandb/

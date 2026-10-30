@@ -1,9 +1,16 @@
 #!/usr/bin/env python
-"""Train the GS slot model.
+"""Train the GS slot model (PyTorch Lightning, logged to Weights & Biases).
 
 Examples:
     python train.py --dataset primordia
     python train.py --dataset clevr567          # data/clevr/clevr_567_train
+    WANDB_MODE=offline python train.py ...      # log locally, sync later
+
+Checkpoints stay in the uORF layout (gsod/model/checkpoint.py):
+``{suffix}_net_*.pth`` / ``{suffix}_optimizer_0.pth`` / ``{suffix}_state.json``
+for latest, best and iter_<step>, so test.py and the diagnostics load them
+unchanged; ``--resume`` continues from one of them. Lightning writes no
+checkpoints of its own. The W&B run lives in the checkpoint directory.
 
 The training loop lives here because train.py is the only training entry
 point. Model code stays training-loop-agnostic.
@@ -14,12 +21,13 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import time
-from dataclasses import replace
-from itertools import count
+from dataclasses import asdict, replace
 from pathlib import Path
 
+import lightning as L
 import torch
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.utilities import grad_norm
 from torch.utils.data import DataLoader
 
 from gsod.configs import BaseConfig, config_for
@@ -31,16 +39,113 @@ from gsod.model.evaluate import evaluate
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 
+WANDB_PROJECT = "gsod"
 
-def train(
-    model: GSODModel,
-    device: torch.device,
-    cfg: BaseConfig,
-    *,
-    resume: str | None = None,
-) -> None:
-    """Train one scene per step and render the views the encoder did not see."""
+
+class GSODTraining(L.LightningModule):
+    """One scene per step: view 0 is a random view of the scene, the others
+    are the novel views the encoder does not see."""
+
+    def __init__(
+        self,
+        model: GSODModel,
+        cfg: BaseConfig,
+        val_set,
+        *,
+        resume: str | None = None,
+        start_step: int = 0,
+        best_psnr: float = float("-inf"),
+    ):
+        super().__init__()
+        self.model = model
+        self.cfg = cfg
+        self.criterion = GSODLoss(cfg.loss)
+        self.val_set = val_set
+        self.out = Path(cfg.out_dir)
+        self.resume = resume
+        self.start_step = start_step
+        self.best_psnr = best_psnr
+        self.rng = random.Random(cfg.seed)
+
+    @property
+    def step(self) -> int:
+        """Optimiser steps done, counting those before a resume."""
+        return self.start_step + self.global_step
+
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
+        # LambdaLR's index i counts this run's steps; step i + 1 overall
+        # after a resume offset.
+        schedule = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda i: _lr_factor(self.cfg, self.start_step + i + 1)
+        )
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {"scheduler": schedule, "interval": "step"},
+        }
+
+    def on_fit_start(self) -> None:
+        if self.resume is not None:
+            load_networks(
+                str(self.out), self.resume, {}, self.trainer.optimizers, device=self.device
+            )
+
+    def training_step(self, item: dict, batch_idx: int) -> torch.Tensor:
+        images, cams = item["images"], item["cam2world"]
+        ref = self.rng.randrange(images.shape[0])
+        order = [ref] + [i for i in range(images.shape[0]) if i != ref]
+        images, cams = images[order], cams[order]
+        loss, terms = self.criterion(self.model(images, cams), images)
+        self.log_dict(
+            {f"train/{name}": value for name, value in terms.items() if name != "l1"},
+            batch_size=1,
+        )
+        self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
+        return loss
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        # Before clipping: a norm far above grad_clip means the clipping
+        # scales every other gradient down to almost nothing.
+        norms = grad_norm(self.model, norm_type=2)
+        self.log("train/grad_norm", norms["grad_2.0_norm_total"], batch_size=1)
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        step = self.step  # global_step already counts this step
+        if len(self.val_set) and step % self.cfg.eval_every == 0:
+            with torch.no_grad():
+                metrics = evaluate(self.model, self.val_set, self.device)
+            self.log_dict({f"val/{k}": v for k, v in metrics.items()}, batch_size=1)
+            print(
+                f"step {step} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f} "
+                f"fg_ari {metrics['fg_ari']:.3f} attn_fg_ari {metrics['attn_fg_ari']:.3f}"
+            )
+            if metrics["psnr"] > self.best_psnr:
+                self.best_psnr = metrics["psnr"]
+                self._save("best")
+                print(f"step {step} new best psnr {self.best_psnr:.2f}")
+        if step % self.cfg.save_every == 0:
+            self._save(f"iter_{step}")
+
+    def on_train_end(self) -> None:
+        self._save("latest")
+        print(f"done, wrote {self.out}/latest_*.pth")
+
+    def _save(self, suffix: str) -> None:
+        save_networks(str(self.out), suffix, self.model.networks(), self.trainer.optimizers)
+        (self.out / f"{suffix}_state.json").write_text(
+            json.dumps({"step": self.step, "best_psnr": self.best_psnr})
+        )
+
+
+def _lr_factor(cfg: BaseConfig, step: int) -> float:
+    """Linear warm-up to cfg.lr, then halved every cfg.lr_half_life steps."""
+    warmup = min(1.0, step / max(1, cfg.lr_warmup_steps))
+    return warmup * 0.5 ** (step / cfg.lr_half_life)
+
+
+def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> None:
     out = Path(cfg.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
     dataset_kwargs = dict(
         dataset_mode=cfg.dataset_mode,
         image_size=cfg.dataset_image_size,
@@ -58,8 +163,6 @@ def train(
     print(
         f"data={cfg.data_root} train_scenes={len(train_set)} val_scenes={len(val_set)}"
     )
-
-    rng = random.Random(cfg.seed)
     loader = DataLoader(
         train_set,
         batch_size=None,
@@ -69,89 +172,35 @@ def train(
         generator=torch.Generator().manual_seed(cfg.seed),
     )
 
-    model = model.to(device)
-    criterion = GSODLoss(cfg.loss).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     start_step, best_psnr = 0, float("-inf")
     if resume is not None:
-        load_networks(str(out), resume, model.networks(), [opt], device=device)
+        # Networks now; the optimizer once Lightning has built it (on_fit_start).
+        load_networks(str(out), resume, model.networks(), device="cpu")
         state = json.loads((out / f"{resume}_state.json").read_text())
         start_step, best_psnr = state["step"], state["best_psnr"]
-        print(f"resumed from {out} suffix={resume} at step {start_step}")
-
-    print(f"device={device} steps={cfg.steps} out={out}")
-    batches = _forever(loader)
-    started = time.time()
-    running: dict[str, float] = {}
-    last_step = start_step
-    for step in range(start_step + 1, cfg.steps + 1):
-        last_step = step
-        for group in opt.param_groups:
-            group["lr"] = _learning_rate(cfg, step)
-        item = next(batches)
-        images, cams = item["images"], item["cam2world"]
-        ref = rng.randrange(images.shape[0])
-        order = [ref] + [i for i in range(images.shape[0]) if i != ref]
-        images, cams = images[order].to(device), cams[order].to(device)
-
-        loss, terms = criterion(model(images, cams), images)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        for name, value in terms.items():
-            running[name] = running.get(name, 0.0) + value
-        if cfg.grad_clip > 0:
-            # Logged before clipping: a norm far above grad_clip means the
-            # clipping scales every other gradient down to almost nothing.
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            running["grad_norm"] = running.get("grad_norm", 0.0) + float(norm)
-        opt.step()
-
-        if step % cfg.log_every == 0:
-            parts = " ".join(f"{k} {v / cfg.log_every:.4f}" for k, v in running.items())
-            print(f"step {step} {parts} elapsed {time.time() - started:.1f}s")
-            running = {}
-
-        if len(val_set) and step % cfg.eval_every == 0:
-            metrics = evaluate(model, val_set, device)
-            print(
-                f"step {step} val mse {metrics['mse']:.5f} psnr {metrics['psnr']:.2f} "
-                f"fg_ari {metrics['fg_ari']:.3f} attn_fg_ari {metrics['attn_fg_ari']:.3f}"
-            )
-            if metrics["psnr"] > best_psnr:
-                best_psnr = metrics["psnr"]
-                _save(out, "best", model, opt, step, best_psnr)
-                print(f"step {step} new best psnr {best_psnr:.2f}")
-
-        if step % cfg.save_every == 0:
-            _save(out, f"iter_{step}", model, opt, step, best_psnr)
-
-    _save(out, "latest", model, opt, last_step, best_psnr)
-    print(f"done, wrote {out}/latest_*.pth")
-
-
-def _learning_rate(cfg: BaseConfig, step: int) -> float:
-    """Linear warm-up to cfg.lr, then halved every cfg.lr_half_life steps."""
-    warmup = min(1.0, step / max(1, cfg.lr_warmup_steps))
-    return cfg.lr * warmup * 0.5 ** (step / cfg.lr_half_life)
-
-
-def _forever(loader: DataLoader):
-    for _ in count():
-        yield from loader
-
-
-def _save(
-    out: Path,
-    suffix: str,
-    model: GSODModel,
-    opt: torch.optim.Optimizer,
-    step: int,
-    best_psnr: float,
-) -> None:
-    save_networks(str(out), suffix, model.networks(), [opt])
-    (out / f"{suffix}_state.json").write_text(
-        json.dumps({"step": step, "best_psnr": best_psnr})
+        print(f"resuming from {out} suffix={resume} at step {start_step}")
+    module = GSODTraining(
+        model, cfg, val_set, resume=resume, start_step=start_step, best_psnr=best_psnr
     )
+
+    logger = WandbLogger(
+        project=WANDB_PROJECT, name=out.name, save_dir=str(out), config=asdict(cfg)
+    )
+    trainer = L.Trainer(
+        accelerator="gpu",
+        devices=1,
+        max_steps=cfg.steps - start_step,
+        max_epochs=-1,
+        gradient_clip_val=cfg.grad_clip if cfg.grad_clip > 0 else None,
+        logger=logger,
+        log_every_n_steps=cfg.log_every,
+        enable_checkpointing=False,
+        limit_val_batches=0,
+        num_sanity_val_steps=0,
+        default_root_dir=str(out),
+    )
+    print(f"steps={cfg.steps} out={out}")
+    trainer.fit(module, loader)
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,7 +268,6 @@ def main() -> None:
         raise RuntimeError(
             "CUDA training requested but torch.cuda.is_available() is False"
         )
-    device = torch.device("cuda")
 
     meta = dataset_meta(
         cfg.data_root,
@@ -230,7 +278,7 @@ def main() -> None:
     # Seed before building the model so cfg.seed also fixes its initialisation.
     torch.manual_seed(cfg.seed)
     model = build_model(cfg, meta)
-    train(model, device, cfg, resume=args.resume)
+    train(model, cfg, resume=args.resume)
 
 
 if __name__ == "__main__":
