@@ -3,11 +3,13 @@
 Metrics (nan without GT masks), averaged per scene:
     seg     ari, fg_ari (2D, input view), nv_ari (3D, novel views)  [uORF]
     recon   psnr, ssim (novel views)
-    diag    attn_fg_ari        attention vs GT (grouping vs decoding)
+    diag    attn_fg_ari        attention argmax (background included) vs GT
             obj_recall         GT objects with an owning slot
             n_duplicate        objects split over slots
             fg_on_bg           GT background drawn by object slots
             gt_outside_region  object pixels outside its slot's region
+            pixel_gate         pixel-path gate of object slots
+            pixel_coverage     object pixels its slot may read
 
 Slot roles: object, duplicate, haze (on background), empty, draws (no GT).
 """
@@ -19,14 +21,22 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from gsod.model.gsod import GSODModel
+from gsod.model.gsod import GSODModel, pixel_access
 from gsod.model.losses import ssim
 from gsod.utils.metrics import ari, fg_ari, psnr, upsample_labels
 from gsod.utils.visualize import Tiles, scene_images
 
 SEGMENTATION_KEYS = ("ari", "fg_ari", "nv_ari")
 RECONSTRUCTION_KEYS = ("psnr", "ssim")
-DIAGNOSTIC_KEYS = ("attn_fg_ari", "obj_recall", "n_duplicate", "fg_on_bg", "gt_outside_region")
+DIAGNOSTIC_KEYS = (
+    "attn_fg_ari",
+    "obj_recall",
+    "n_duplicate",
+    "fg_on_bg",
+    "gt_outside_region",
+    "pixel_gate",
+    "pixel_coverage",
+)
 METRIC_KEYS = SEGMENTATION_KEYS + RECONSTRUCTION_KEYS + DIAGNOSTIC_KEYS
 
 SLOT_COLUMNS = (
@@ -38,6 +48,7 @@ SLOT_COLUMNS = (
     "draw",
     "occupancy",
     "count",
+    "gate",
     "extent_x",
     "extent_y",
     "gt_outside",
@@ -97,6 +108,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     attn = np_(result["attn"])
     count = attn[1:].sum(-1)
     occupancy = (attn[1:] ** 2).sum(-1) / np.maximum(count, 1e-8)
+    readable, gate = pixel_access(result["attn"][1:])
     return {
         "scene": int(item.get("scene", -1)),
         "target": np_(images),
@@ -110,6 +122,8 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "count": count,
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
+        "readable": readable.cpu().numpy().reshape(-1, side, side),  # (K-1, s, s)
+        "gate": np_(gate),  # (K-1,)
         "extent": np_(result["extent"]),  # (K-1, 3)
         "region_box": _project_boxes(
             np_(result["corners"]),
@@ -136,16 +150,23 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
     attn = np.stack([upsample_labels(a, size) for a in rec["attn"]])  # nearest
     bg = gt[0] == 0
     roles = [row["role"] for row in rows]
+    objects = [r for r in rows if r["role"] == "object"]
+    readable = np.stack([upsample_labels(m, size) for m in rec["readable"]])
     out.update(
         {
             "ari": ari(gt[0], mask[0]),
             "fg_ari": fg_ari(gt[0], mask[0]),
             "nv_ari": _nanmean([ari(gt[v], mask[v]) for v in range(1, gt.shape[0])]),
-            "attn_fg_ari": fg_ari(gt[0], attn[1:].argmax(0) + 1),
+            # Background row included, as in the rendered mask.
+            "attn_fg_ari": fg_ari(gt[0], attn.argmax(0)),
             "obj_recall": object_recall(gt[0], mask[0]),
             "n_duplicate": float(roles.count("duplicate")),
             "fg_on_bg": float(1.0 - rec["alpha"][0, 0][bg].mean()) if bg.any() else NAN,
-            "gt_outside_region": _nanmean([r["gt_outside"] for r in rows if r["role"] == "object"]),
+            "gt_outside_region": _nanmean([r["gt_outside"] for r in objects]),
+            "pixel_gate": _nanmean([r["gate"] for r in objects]),
+            "pixel_coverage": _nanmean(
+                [readable[r["slot"] - 1][gt[0] == r["gt_object"]].mean() for r in objects]
+            ),
         }
     )
     return out
@@ -167,6 +188,7 @@ def slot_table(rec: dict) -> list[dict]:
             "draw": float(rec["draw"][k - 1]),
             "occupancy": float(rec["occupancy"][k - 1]),
             "count": float(rec["count"][k - 1]),
+            "gate": float(rec["gate"][k - 1]),
             "extent_x": float(rec["extent"][k - 1, 0]),
             "extent_y": float(rec["extent"][k - 1, 1]),
             "gt_outside": NAN,
