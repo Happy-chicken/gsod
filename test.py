@@ -108,7 +108,7 @@ def main() -> None:
     print(f"{args.split} split ({len(dataset)} scenes)")
     print(f"  2D   ARI {m['ari']:.4f}   FG-ARI {m['fg_ari']:.4f}")
     print(f"  3D   NV-ARI {m['nv_ari']:.4f}")
-    print(f"  novel views   PSNR {m['psnr']:.2f}   SSIM {m['ssim']:.4f}")
+    print(f"  novel views   PSNR {m['psnr']:.2f}   SSIM {m['ssim']:.4f}   LPIPS {m['lpips']:.4f}")
     print("  diag  " + "   ".join(f"{k} {m[k]:.3f}" for k in DIAGNOSTIC_KEYS))
 
     # Worst NV-ARI first (scenes without GT last).

@@ -2,7 +2,7 @@
 
 Metrics (nan without GT masks), averaged per scene:
     seg     ari, fg_ari (2D, input view), nv_ari (3D, novel views)  [uORF]
-    recon   psnr, ssim (novel views)
+    recon   psnr, ssim, lpips (novel views; lpips: AlexNet, as uORF)
     diag    attn_fg_ari        attention argmax (background included) vs GT
             obj_recall         GT objects with an owning slot
             n_duplicate        objects split over slots
@@ -26,8 +26,19 @@ from gsod.model.losses import ssim
 from gsod.utils.metrics import ari, fg_ari, psnr, upsample_labels
 from gsod.utils.visualize import Tiles, scene_images
 
+_LPIPS = {}
+
+
+def _lpips(device: torch.device):
+    """The LPIPS (AlexNet) network on device, loaded once; needs `pip install lpips`."""
+    if device not in _LPIPS:
+        import lpips
+
+        _LPIPS[device] = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    return _LPIPS[device]
+
 SEGMENTATION_KEYS = ("ari", "fg_ari", "nv_ari")
-RECONSTRUCTION_KEYS = ("psnr", "ssim")
+RECONSTRUCTION_KEYS = ("psnr", "ssim", "lpips")
 DIAGNOSTIC_KEYS = (
     "attn_fg_ari",
     "obj_recall",
@@ -99,6 +110,9 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     rgb = result["rgb"].clamp(0, 1)
     n_views = images.shape[0]
     novel_ssim = [float(ssim(rgb[v : v + 1], images[v : v + 1])) for v in range(1, n_views)]
+    novel_lpips = NAN
+    if n_views > 1:  # inputs in [-1, 1]
+        novel_lpips = float(_lpips(images.device)(2 * rgb[1:] - 1, 2 * images[1:] - 1).mean())
 
     def np_(x):
         return x.detach().float().cpu().numpy()
@@ -134,6 +148,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
             tuple(images.shape[-2:]),
         ),  # (K-1, 4) view 0's u0, v0, u1, v1
         "ssim": _nanmean(novel_ssim),
+        "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
     }
 
@@ -144,6 +159,7 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
     if rec["rgb"].shape[0] > 1:
         out["psnr"] = psnr(float(np.mean((rec["rgb"][1:] - rec["target"][1:]) ** 2)))
         out["ssim"] = rec["ssim"]
+        out["lpips"] = rec["lpips"]
     gt = rec["gt"]
     if gt is None:
         return out
