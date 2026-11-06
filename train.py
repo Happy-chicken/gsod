@@ -16,9 +16,12 @@ uORF layout for latest, best and epoch_<n>;
     monitor  the first MONITOR_SCENES test scenes (Primordia: val), with GT
              masks: watched only
 
-W&B: train/* (losses, gradient norm, background attention share), val/*
-(val PSNR; monitor ARI, FG-ARI, NV-ARI), diag/* and slots/* (gsod/utils/visualize.py),
-images.
+W&B (metrics: gsod/model/evaluate.py):
+    train/*  losses, gradient norm, schedules
+    val/*    psnr, ssim (val)
+    seg/*    ari, fg_ari (2D, input view), nv_ari (3D, novel views) (monitor)
+    diag/*   where a low score comes from (monitor)
+    slots/table, images (monitor)
 """
 
 from __future__ import annotations
@@ -39,35 +42,21 @@ from torch.utils.data import DataLoader, Subset
 from gsod.configs import DATASETS, BaseConfig, config_for
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model
-from gsod.model.evaluate import SEGMENTATION_KEYS, evaluate
+from gsod.model.evaluate import (
+    DIAGNOSTIC_KEYS,
+    RECONSTRUCTION_KEYS,
+    SEGMENTATION_KEYS,
+    evaluate,
+)
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
-from gsod.utils.visualize import report, wandb_histograms, wandb_images, wandb_slot_table
+from gsod.utils.visualize import wandb_images, wandb_slot_table
 
 WANDB_PROJECT = "gsod"
 # Monitor scenes (fixed, comparable across epochs) and how many are drawn.
 MONITOR_SCENES = 50
 IMAGE_SCENES = 4
-DIAG_CHARTS = (
-    "obj_recall_view0",
-    "bg_on_objects",
-    "bg_attn_on_bg",
-    "fg_on_bg",
-    "occ_object",
-    "occ_object_min",
-    "occ_other",
-    "n_object",
-    "n_duplicate",
-    "n_haze",
-    "n_visible",
-    "render_dominance",
-    "slot_cos_mean",
-    "extent_mean",
-    "extent_at_min",
-    "extent_at_max",
-    "gt_outside_region",
-)
 
 
 class GSODTraining(L.LightningModule):
@@ -139,7 +128,6 @@ class GSODTraining(L.LightningModule):
         loss, terms = self.criterion(outputs, images)
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
         self.log("train/view0", terms["view0"], batch_size=1)
-        self.log("train/bg_attn", outputs["attn"][0].detach().mean(), batch_size=1)
         self.log("train/draw_power", self.model.draw_power, batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
         return loss
@@ -157,28 +145,27 @@ class GSODTraining(L.LightningModule):
             self._save(f"epoch_{epoch}", epoch)
 
     def _validate(self, epoch: int) -> None:
-        """val PSNR (keeps the best checkpoint); the monitor scenes' FG-ARI,
-        statistics, slot table, histograms and images (one pass over them)."""
+        """val: psnr, ssim (keeps the best checkpoint); monitor (GT masks):
+        segmentation, diagnostics, slot table and images."""
         if not len(self.val_set):
             return
-        with torch.no_grad():
-            metrics = evaluate(self.model, self.val_set, self.device)
-            rep = report(self.model, self.monitor_set, self.device, IMAGE_SCENES)
+        monitor = evaluate(self.model, self.monitor_set, self.device, IMAGE_SCENES)
+        val = monitor if self.monitor_set is self.val_set else evaluate(
+            self.model, self.val_set, self.device
+        )
         self.logger.log_metrics(
             {
-                "val/psnr": metrics["psnr"],
-                # Segmentation on the monitor scenes (GT masks): 2D ari /
-                # fg_ari on the input view, 3D nv_ari on the novel views.
-                **{f"val/{key}": rep.stats.get(key, float("nan")) for key in SEGMENTATION_KEYS},
-                **{f"diag/{key}": rep.stats.get(key, float("nan")) for key in DIAG_CHARTS},
-                "slots/table": wandb_slot_table(rep.rows),
-                **wandb_histograms(rep.rows),
-                **wandb_images(rep.images),
+                **{f"val/{key}": val.metrics[key] for key in RECONSTRUCTION_KEYS},
+                **{f"seg/{key}": monitor.metrics[key] for key in SEGMENTATION_KEYS},
+                **{f"diag/{key}": monitor.metrics[key] for key in DIAGNOSTIC_KEYS},
+                "slots/table": wandb_slot_table(monitor.slots),
+                **wandb_images(monitor.images),
             },
             step=self.global_step,
         )
-        if metrics["psnr"] > self.best_psnr:
-            self.best_psnr = metrics["psnr"]
+        psnr = val.metrics["psnr"]
+        if psnr > self.best_psnr:
+            self.best_psnr = psnr
             self._save("best", epoch)
             summary = self.logger.experiment.summary
             summary["best_psnr"] = self.best_psnr

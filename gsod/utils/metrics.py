@@ -4,8 +4,9 @@ Conventions follow the object-discovery literature (Slot Attention, uORF):
 
 * ARI     -- adjusted Rand index over all pixels (background included).
 * FG-ARI  -- ARI over ground-truth foreground pixels only (gt > 0).
-* PSNR is split into foreground / background pixels, because the background
-  is most of the image and dominates the plain PSNR.
+* PSNR    -- of a mean squared error, images in [0, 1].
+
+Which views and how they are averaged: gsod/model/evaluate.py.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import math
 
 import numpy as np
 
-__all__ = ["ari", "fg_ari", "upsample_labels", "SquaredError"]
+__all__ = ["ari", "fg_ari", "psnr", "upsample_labels"]
 
 
 def _comb2(x: np.ndarray) -> np.ndarray:
@@ -65,30 +66,8 @@ def upsample_labels(labels: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return labels[rows[:, None], cols[None, :]]
 
 
-class SquaredError:
-    """Accumulates squared error separately on fg / bg / all pixels."""
-
-    def __init__(self) -> None:
-        self.sums = {"all": 0.0, "fg": 0.0, "bg": 0.0}
-        self.counts = {"all": 0, "fg": 0, "bg": 0}
-
-    def add(self, pred: np.ndarray, target: np.ndarray, gt_mask: np.ndarray | None) -> None:
-        """pred/target: (3, H, W) in [0, 1]; gt_mask: (H, W) labels or None."""
-        err = ((np.asarray(pred, np.float64) - np.asarray(target, np.float64)) ** 2).sum(0)
-        self.sums["all"] += float(err.sum())
-        self.counts["all"] += err.size * 3
-        if gt_mask is not None:
-            fg = np.asarray(gt_mask) > 0
-            self.sums["fg"] += float(err[fg].sum())
-            self.counts["fg"] += int(fg.sum()) * 3
-            self.sums["bg"] += float(err[~fg].sum())
-            self.counts["bg"] += int((~fg).sum()) * 3
-
-    def mse(self, key: str = "all") -> float:
-        return self.sums[key] / self.counts[key] if self.counts[key] else float("nan")
-
-    def psnr(self, key: str = "all") -> float:
-        mse = self.mse(key)
-        if math.isnan(mse):
-            return mse
-        return -10.0 * math.log10(max(mse, 1e-12))
+def psnr(mse: float) -> float:
+    """PSNR (dB) of a mean squared error, images in [0, 1]; nan stays nan."""
+    if math.isnan(mse):
+        return mse
+    return -10.0 * math.log10(max(mse, 1e-12))

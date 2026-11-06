@@ -1,11 +1,15 @@
 #!/usr/bin/env python
 """Evaluate and render a trained checkpoint.
 
-W&B (job_type "test"): test/* and diag/* (summary), slots/*, images, and
-worst_* (the WORST_SCENES lowest NV-ARI scenes). Segmentation as uORF:
-2D ARI / FG-ARI on the input view, 3D NV-ARI on the novel views.
+Metrics (gsod/model/evaluate.py): seg/* ari, fg_ari (2D, input view),
+nv_ari (3D, novel views); recon/* psnr, ssim (novel views); diag/* where a
+low score comes from.
+
+W&B (job_type "test"): seg/*, recon/*, diag/* (summary), slots/table,
+images, and worst_* (the WORST_SCENES lowest NV-ARI scenes).
 Output directory (default <checkpoint>/renders/<split>_<suffix>):
-scenes.csv (worst first), slots.csv, sc####/*.png (unless --no-render).
+metrics.json, scenes.csv (worst NV-ARI first), slots.csv, sc####/*.png
+(unless --no-render).
 
 Examples:
     python test.py --dataset primordia --split test
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -26,20 +31,17 @@ import wandb
 from gsod.configs import DATASETS, config_for
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model
-from gsod.model.evaluate import evaluate
-from gsod.utils.io import latest_run_dir, load_networks
-from gsod.utils.visualize import (
+from gsod.model.evaluate import (
+    DIAGNOSTIC_KEYS,
+    RECONSTRUCTION_KEYS,
+    SEGMENTATION_KEYS,
     SLOT_COLUMNS,
     collect,
-    panels,
-    report,
-    save_panels,
-    scene_images,
+    evaluate,
     slot_table,
-    wandb_histograms,
-    wandb_images,
-    wandb_slot_table,
 )
+from gsod.utils.io import latest_run_dir, load_networks
+from gsod.utils.visualize import panels, save_panels, scene_images, wandb_images, wandb_slot_table
 
 WANDB_PROJECT = "gsod"
 IMAGE_SCENES = 16
@@ -101,31 +103,30 @@ def main() -> None:
     )
     if cfg.dataset_mode == "primordia":
         dataset = WithGTMasks(dataset, data_root)
-    per_scene: list[dict] = []
-    with torch.no_grad():
-        metrics = evaluate(model, dataset, device, per_scene=per_scene)
-        rep = report(model, dataset, device, IMAGE_SCENES)
-    print(f"{args.split} split:", {k: round(v, 4) for k, v in metrics.items()})
-    print(
-        f"  2D  ARI {metrics['ari']:.4f}  FG-ARI {metrics['fg_ari']:.4f}"
-        f"   3D  NV-ARI {metrics['nv_ari']:.4f}"
-    )
+    result = evaluate(model, dataset, device, IMAGE_SCENES)
+    groups = {
+        "seg": SEGMENTATION_KEYS,
+        "recon": RECONSTRUCTION_KEYS,
+        "diag": DIAGNOSTIC_KEYS,
+    }
+    summary = {
+        f"{group}/{key}": result.metrics[key] for group, keys in groups.items() for key in keys
+    }
+    m = result.metrics
+    print(f"{args.split} split ({len(dataset)} scenes)")
+    print(f"  2D   ARI {m['ari']:.4f}   FG-ARI {m['fg_ari']:.4f}")
+    print(f"  3D   NV-ARI {m['nv_ari']:.4f}")
+    print(f"  novel views   PSNR {m['psnr']:.2f}   SSIM {m['ssim']:.4f}")
+    print("  diag  " + "   ".join(f"{k} {m[k]:.3f}" for k in DIAGNOSTIC_KEYS))
 
-    # One row per scene, worst NV-ARI first (scenes without GT last).
-    stats = {int(s["scene"]): s for s in rep.per_scene}
-    scenes = []
-    for row in per_scene:
-        extra = stats.get(row["scene"], {})
-        scenes.append({**{k: v for k, v in extra.items() if k != "scene"}, **row})
-    key = "nv_ari"
-    scenes.sort(key=lambda r: (math.isnan(r.get(key, math.nan)), r.get(key, math.nan)))
+    # Worst NV-ARI first (scenes without GT last).
+    scenes = sorted(
+        result.per_scene, key=lambda r: (math.isnan(r["nv_ari"]), r["nv_ari"])
+    )
     worst = {}
-    model.eval()
-    with torch.no_grad():
-        for row in scenes[:WORST_SCENES]:
-            i = row["index"]
-            rec = collect(model, dataset[i], device)
-            worst.update(scene_images(rec, slot_table(rec), prefix="worst_"))
+    for row in scenes[:WORST_SCENES]:
+        rec = collect(model, dataset[row["index"]], device)
+        worst.update(scene_images(rec, slot_table(rec), prefix="worst_"))
 
     run = wandb.init(
         project=WANDB_PROJECT,
@@ -134,13 +135,11 @@ def main() -> None:
         dir=str(checkpoint),
         config={"checkpoint": str(checkpoint), "suffix": args.suffix, "split": args.split},
     )
-    run.summary.update({f"test/{k}": v for k, v in metrics.items()})
-    run.summary.update({f"diag/{k}": v for k, v in rep.stats.items()})
+    run.summary.update(summary)
     run.log(
         {
-            "slots/table": wandb_slot_table(rep.rows),
-            **wandb_histograms(rep.rows),
-            **wandb_images(rep.images),
+            "slots/table": wandb_slot_table(result.slots),
+            **wandb_images(result.images),
             **wandb_images(worst),
         }
     )
@@ -148,14 +147,14 @@ def main() -> None:
 
     out = Path(args.out or f"{checkpoint}/renders/{args.split}_{args.suffix}")
     out.mkdir(parents=True, exist_ok=True)
+    (out / "metrics.json").write_text(json.dumps(summary, indent=2))
     _write_csv(out / "scenes.csv", scenes)
-    _write_csv(out / "slots.csv", rep.rows, columns=list(SLOT_COLUMNS))
-    print(f"wrote {out}/scenes.csv (worst first) and {out}/slots.csv")
+    _write_csv(out / "slots.csv", result.slots, columns=list(SLOT_COLUMNS))
+    print(f"wrote {out}/metrics.json, scenes.csv (worst first) and slots.csv")
     if not args.no_render:
-        with torch.no_grad():
-            for i in range(len(dataset)):
-                rec = collect(model, dataset[i], device)
-                save_panels(panels(rec, slot_table(rec)), out / f"sc{rec['scene']:04d}")
+        for i in range(len(dataset)):
+            rec = collect(model, dataset[i], device)
+            save_panels(panels(rec, slot_table(rec)), out / f"sc{rec['scene']:04d}")
         print(f"wrote the panels of {len(dataset)} scenes to {out}")
 
 
