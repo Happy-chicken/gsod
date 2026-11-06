@@ -21,6 +21,7 @@ def build_model(cfg: BaseConfig, meta: dict) -> GSODModel:
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         focal_ratio=tuple(meta["focal_ratio"]),
         near=cfg.near,
+        pixel_features=cfg.pixel_features,
     )
 
 

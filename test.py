@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import math
+from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
@@ -61,6 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--out", default=None, help="output directory for PNGs")
     parser.add_argument("--no-render", action="store_true", help="skip the PNG renders")
+    parser.add_argument(
+        "--pixel-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override the run's config.json (runs without one: required "
+        "--no-pixel-features for checkpoints from before pixel features)",
+    )
     return parser.parse_args()
 
 
@@ -81,6 +89,9 @@ def main() -> None:
         )
     device = torch.device("cuda")
 
+    cfg = run_config(cfg, Path(checkpoint))
+    if args.pixel_features is not None:
+        cfg = replace(cfg, pixel_features=args.pixel_features)
     meta = dataset_meta(
         data_root,
         dataset_mode=cfg.dataset_mode,
@@ -156,6 +167,31 @@ def main() -> None:
             rec = collect(model, dataset[i], device)
             save_panels(panels(rec, slot_table(rec)), out / f"sc{rec['scene']:04d}")
         print(f"wrote the panels of {len(dataset)} scenes to {out}")
+
+
+# Model fields read from a run's config.json (the rest stays the profile's).
+MODEL_FIELDS = (
+    "input_size",
+    "z_dim",
+    "num_slots",
+    "attn_iter",
+    "gaussians_per_slot",
+    "decoder_hidden_dim",
+    "near",
+    "pixel_features",
+)
+
+
+def run_config(cfg, checkpoint: Path):
+    """cfg with the model fields of the run's config.json (train.py writes
+    it); unchanged, with a warning, for runs without one."""
+    path = checkpoint / "config.json"
+    if not path.is_file():
+        print(f"no {path}: building the model from the {cfg.dataset_mode} profile")
+        return cfg
+    saved = json.loads(path.read_text())
+    known = {f.name for f in fields(cfg)}
+    return replace(cfg, **{k: saved[k] for k in MODEL_FIELDS if k in saved and k in known})
 
 
 def _write_csv(path: Path, rows: list[dict], columns: list[str] | None = None) -> None:

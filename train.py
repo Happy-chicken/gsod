@@ -6,6 +6,13 @@ Examples:
     python train.py --dataset clevr567          # data/clevr/clevr_567_train
     WANDB_MODE=offline python train.py ...      # log locally, sync later
 
+    # Quick run (~10k steps): 500 scenes, schedules in epochs scale along.
+    python train.py --dataset room_diverse --train-scenes 500 --val-scenes 50 \
+        --monitor-scenes 20 --epochs 20 --eval-every 2 --save-every 10
+    # Decoder capacity check: overfit 8 scenes (view-0 render should be sharp).
+    python train.py --dataset room_diverse --train-scenes 8 --val-scenes 8 \
+        --monitor-scenes 8 --epochs 1000 --eval-every 100 --save-every 500
+
 One scene per step; schedules, validation and saving are in epochs; the
 learning rate warms up linearly, then decays (cosine). Checkpoints use the
 uORF layout for latest, best and epoch_<n>;
@@ -13,8 +20,11 @@ uORF layout for latest, best and epoch_<n>;
 
     val      held out of the training folder: val/psnr picks the best
              checkpoint
-    monitor  the first MONITOR_SCENES test scenes (Primordia: val), with GT
-             masks: watched only
+    monitor  the first cfg.monitor_scenes test scenes (Primordia: val),
+             with GT masks: watched only
+
+The run's config is written to <out>/config.json; test.py builds the model
+from it.
 
 W&B (metrics: gsod/model/evaluate.py):
     train/*  losses, gradient norm, schedules
@@ -54,8 +64,7 @@ from gsod.utils.io import latest_run_dir, load_networks, save_networks
 from gsod.utils.visualize import wandb_images, wandb_slot_table
 
 WANDB_PROJECT = "gsod"
-# Monitor scenes (fixed, comparable across epochs) and how many are drawn.
-MONITOR_SCENES = 50
+# Monitor scenes drawn as images at every validation.
 IMAGE_SCENES = 4
 
 
@@ -193,6 +202,13 @@ def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
     return cfg.lr_final + (1.0 - cfg.lr_final) * 0.5 * (1.0 + math.cos(math.pi * t))
 
 
+def _first(dataset, n: int | None):
+    """The first n scenes of dataset (all when n is None or larger)."""
+    if n is None or n >= len(dataset):
+        return dataset
+    return Subset(dataset, range(n))
+
+
 def _has_masks(dataset) -> bool:
     return bool(len(dataset)) and dataset[0].get("masks") is not None
 
@@ -208,17 +224,19 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
         val_fraction=cfg.val_fraction,
         seed=cfg.seed,
     )
-    train_set = make_dataset(cfg.data_root, "train", **dataset_kwargs)
+    train_set = _first(make_dataset(cfg.data_root, "train", **dataset_kwargs), cfg.train_scenes)
     # CLEVR-567 reads *_mask.png when present (and skips them otherwise);
     # Primordia masks live in the scene folders and need the wrapper.
     val_set = make_dataset(cfg.data_root, "val", load_masks=True, **dataset_kwargs)
     if cfg.dataset_mode == "primordia":
         val_set = WithGTMasks(val_set, cfg.data_root)
+    val_set = _first(val_set, cfg.val_scenes)
     monitor_set, monitor_root = val_set, f"{cfg.data_root} (val)"
     if cfg.test_root:
         test_set = make_dataset(cfg.test_root, "test", load_masks=True, **dataset_kwargs)
-        monitor_set = Subset(test_set, range(min(MONITOR_SCENES, len(test_set))))
+        monitor_set = _first(test_set, cfg.monitor_scenes)
         monitor_root = f"{cfg.test_root} (test, first {len(monitor_set)})"
+    (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
     print(f"train: {cfg.data_root} ({len(train_set)} scenes)")
     print(f"val: {cfg.data_root} ({len(val_set)} scenes, GT masks: {_has_masks(val_set)})")
     print(f"monitor: {monitor_root} (GT masks: {_has_masks(monitor_set)})")
@@ -292,6 +310,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-iter", type=int, default=None)
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
+    parser.add_argument(
+        "--pixel-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="decoders read view 0's tokens through their slot's attention",
+    )
+    parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
+    parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
+    parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
 
@@ -320,6 +347,10 @@ def main() -> None:
         "attn_iter",
         "gaussians_per_slot",
         "decoder_hidden_dim",
+        "pixel_features",
+        "train_scenes",
+        "val_scenes",
+        "monitor_scenes",
     ]
     values = {
         field: getattr(args, field)

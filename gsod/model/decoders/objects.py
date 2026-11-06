@@ -11,6 +11,13 @@ opacity, rgb (from the attention's mean colour) and sh1 (degree-1 SH,
 starting at 0). Opacities are normalised so the most opaque is 1: how far a
 slot is drawn is the draw factor alone (gsod.draw_factor). Everything is in
 the scene frame (utils/geometry.py): lengths in units of R.
+
+Pixel features (pixel_features=True): the latent alone is a 64-d bottleneck
+that holds no thin parts or texture, so the queries then also attend to view
+0's encoder tokens (feature, colour, position in the slot's region), each
+slot through its own attention (logit bias log a_k): a slot reads the pixels
+it holds, not another object's. The output projection starts at zero, so
+training starts from the latent-only decoder.
 """
 
 from __future__ import annotations
@@ -124,6 +131,30 @@ class ObjectHead(nn.Module):
         }
 
 
+class MaskedCrossAttention(nn.Module):
+    """Multi-head cross-attention with a per-slot additive logit bias over
+    the tokens (broadcast over heads and queries)."""
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.h = n_heads
+        self.q = nn.Linear(d_model, d_model)
+        self.kv = nn.Linear(d_model, 2 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        with torch.no_grad():
+            self.out.weight.zero_()
+            self.out.bias.zero_()
+
+    def forward(self, x: torch.Tensor, tokens: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        """x (K, G, d), tokens (K, N, d), bias (K, N) -> (K, G, d)."""
+        K, G, d = x.shape
+        N, h = tokens.shape[1], self.h
+        q = self.q(x).view(K, G, h, d // h).transpose(1, 2)
+        k, v = self.kv(tokens).view(K, N, 2, h, d // h).permute(2, 0, 3, 1, 4)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=bias[:, None, None, :].to(q.dtype))
+        return self.out(o.transpose(1, 2).reshape(K, G, d))
+
+
 class ObjectDecoder(nn.Module):
     """Object slots -> their regions and Gaussians, scene frame."""
 
@@ -136,8 +167,10 @@ class ObjectDecoder(nn.Module):
         n_heads: int = 4,
         n_tokens: int = 8,
         query_std: float = 2.0,
+        pixel_features: bool = False,
     ):
-        """Works for any number of slots; hidden_dim is the attention width."""
+        """Works for any number of slots; hidden_dim is the attention width;
+        pixel_features: also attend to view 0's tokens (module docstring)."""
         super().__init__()
         d_model = int(hidden_dim)
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -162,25 +195,50 @@ class ObjectDecoder(nn.Module):
             nn.Linear(2 * d_model, d_model),
         )
         self.head = ObjectHead(z_dim, d_model)
+        self.pixel_features = bool(pixel_features)
+        if self.pixel_features:
+            # Token: encoder feature, colour, position in the region (3 each).
+            self.token_in = nn.Linear(z_dim + 6, d_model)
+            self.norm_tok = nn.LayerNorm(d_model)
+            self.norm_pix = nn.LayerNorm(d_model)
+            self.pixel_cross = MaskedCrossAttention(d_model, n_heads)
 
     @property
     def extent_range(self) -> tuple[float, float]:
         """The regions' xy half width range (units of R)."""
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
 
-    def _attend(self, q, k, v):
-        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
-        return q + self.ffn(self.norm_ff(q))
+    def _pixel_tokens(self, pixels: dict, centre: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
+        """Per slot (K, N, d): each token's feature, colour and position in
+        the slot's region (units of its half sizes, clamped)."""
+        K = centre.shape[0]
+        rel = ((pixels["points"][None] - centre[:, None]) / extent[:, None]).clamp(-4.0, 4.0)
+        shared = torch.cat([pixels["features"], pixels["colours"]], -1)
+        tokens = self.token_in(torch.cat([shared[None].expand(K, -1, -1), rel], -1))
+        return self.norm_tok(tokens)
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
+        self,
+        slots: torch.Tensor,
+        anchor: torch.Tensor,
+        ray: torch.Tensor,
+        colour: torch.Tensor,
+        pixels: dict[str, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); per slot the attention's anchor, view 0's unit ray
-        through it and the colour there (K, 3) -> Gaussians (K, G, ...) and
-        the region's centre and half sizes (K, 3), scene frame."""
+        through it and the colour there (K, 3); with pixel_features, pixels:
+        view 0's tokens "features" (N, C), "colours" (N, 3), "points" (N, 3,
+        scene frame) and the slots' "attn" (K, N) -> Gaussians (K, G, ...)
+        and the region's centre and half sizes (K, 3), scene frame."""
         K = slots.shape[0]
         centre, extent = self.head.region(slots, anchor, ray)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
-        return self.head(self._attend(q, k, v), slots, centre, extent, colour), centre, extent
+        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
+        if self.pixel_features:
+            tokens = self._pixel_tokens(pixels, centre, extent)
+            bias = pixels["attn"].clamp_min(1e-6).log()
+            q = q + self.pixel_cross(self.norm_pix(q), tokens, bias)
+        q = q + self.ffn(self.norm_ff(q))
+        return self.head(q, slots, centre, extent, colour), centre, extent

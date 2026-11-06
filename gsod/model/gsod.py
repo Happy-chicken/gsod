@@ -19,6 +19,10 @@ the world before splatting.
 
 Slot indices in every output: 0 background (in slot_alpha: the uncovered
 share of the pixel), 1..K-1 objects. Only view 0 is encoded.
+
+pixel_features: both decoders also read view 0's encoder tokens, each
+through its own slot's attention (decoders/objects.py, background.py), for
+the thin parts and textures a slot latent cannot hold.
 """
 
 from __future__ import annotations
@@ -31,7 +35,14 @@ from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, points_to_world, scene_frame, to_world
+from gsod.utils.geometry import (
+    SceneFrame,
+    camera_directions,
+    points_to_world,
+    scene_frame,
+    to_world,
+    yaw_matrix,
+)
 from gsod.utils.splatter import GsplatSplatter
 
 # A slot's transparent part counts as this much of a layer at the far depth.
@@ -143,6 +154,7 @@ class GSODModel(nn.Module):
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
+        pixel_features: bool = False,
     ):
         """num_slots: K, the background slot included."""
         super().__init__()
@@ -159,8 +171,13 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
-        self.decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
-        self.background = BackgroundDecoder(z_dim, decoder_hidden_dim)
+        self.pixel_features = bool(pixel_features)
+        self.decoder = ObjectDecoder(
+            z_dim, gaussians_per_slot, decoder_hidden_dim, pixel_features=self.pixel_features
+        )
+        self.background = BackgroundDecoder(
+            z_dim, decoder_hidden_dim, pixel_features=self.pixel_features
+        )
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks"""
@@ -178,28 +195,80 @@ class GSODModel(nn.Module):
         return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self,
+        slots: torch.Tensor,
+        attn: torch.Tensor,
+        colours: torch.Tensor,
+        frame: SceneFrame,
+        tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), their attention (K-1, s*s), token colours
-        (s*s, 3) -> Gaussians (K-1, G, ...) in the world, with each region's
-        half sizes "extent" (K-1, 3, units of R) and world "corners" (K-1, 8, 3)."""
+        (s*s, 3), encoder tokens (s*s, C; read with pixel_features) ->
+        Gaussians (K-1, G, ...) in the world, with each region's half sizes
+        "extent" (K-1, 3, units of R) and world "corners" (K-1, 8, 3)."""
         points = token_points(frame, self.input_size, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)  # view 0's ray through each anchor
-        gaussians, centre, extent = self.decoder(slots, anchor=anchor, ray=ray, colour=colour)
+        pixels = None
+        if self.pixel_features:
+            pixels = {"features": tokens, "colours": colours, "points": points, "attn": attn}
+        gaussians, centre, extent = self.decoder(
+            slots, anchor=anchor, ray=ray, colour=colour, pixels=pixels
+        )
         signs = torch.tensor(_CORNERS, dtype=centre.dtype, device=centre.device)
         corners = points_to_world(centre[:, None] + extent[:, None] * signs, frame)
         return {"gaussians": to_world(gaussians, frame), "extent": extent, "corners": corners}
 
-    def decode_background(
-        self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+    def floor_pixels(
+        self, maps: torch.Tensor, attn: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
-        """Background slot (C,), its attention (s*s,), token colours (s*s, 3)
-        -> floor discs (N, ...) in the world and the "fill" colour (3,)."""
-        side = self.input_size
-        gaussians = self.background(
-            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame.yaw
+        """Where each floor disc projects in view 0: maps (C + 3, s, s)
+        (encoder features, colours), the background's attention (s, s) ->
+        per disc "features" (N, C), "colours" (N, 3) sampled there (bilinear)
+        and "w" (N,) = attention there (detached) * in view."""
+        mu = self.background.floor_mu  # world-aligned scene frame
+        to_frame = yaw_matrix(-frame.yaw).to(mu.dtype)
+        cam = (mu @ to_frame.T - frame.origin) @ frame.rot  # view 0's camera coordinates
+        z = cam[:, 2]
+        front = z > 1e-3
+        z = torch.where(front, z, torch.ones_like(z))
+        # grid_sample coordinates (align_corners=False): pixel centres at
+        # integers, the principal point at the image centre.
+        grid = torch.stack(
+            [2.0 * self.focal_ratio[0] * cam[:, 0] / z, 2.0 * self.focal_ratio[1] * cam[:, 1] / z], -1
         )
+        inside = front & (grid.abs() <= 1.0).all(-1)
+        grid = torch.where(inside[:, None], grid, torch.zeros_like(grid))
+        stacked = torch.cat([maps, attn.detach()[None]], 0)
+        sampled = F.grid_sample(
+            stacked[None], grid[None, None], mode="bilinear", align_corners=False
+        )[0, :, 0].T  # (N, C + 4)
+        c = maps.shape[0] - 3
+        return {
+            "features": sampled[:, :c],
+            "colours": sampled[:, c : c + 3],
+            "w": sampled[:, -1] * inside.to(sampled.dtype),
+        }
+
+    def decode_background(
+        self,
+        bg_slot: torch.Tensor,
+        attn: torch.Tensor,
+        colours: torch.Tensor,
+        frame: SceneFrame,
+        tokens: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Background slot (C,), its attention (s*s,), token colours (s*s, 3),
+        encoder tokens (s*s, C; read with pixel_features) -> floor discs
+        (N, ...) in the world and the "fill" colour (3,)."""
+        side = self.input_size
+        attn_map = attn.reshape(side, side)
+        colour_map = colours.T.reshape(3, side, side)
+        pixels = None
+        if self.pixel_features:
+            maps = torch.cat([tokens.T.reshape(-1, side, side), colour_map], 0)
+            pixels = self.floor_pixels(maps, attn_map, frame)
+        gaussians = self.background(bg_slot, attn_map, colour_map, frame.yaw, pixels=pixels)
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
 
@@ -251,12 +320,14 @@ class GSODModel(nn.Module):
         itself: objects and background (decode_objects / decode_background),
         draw (K-1,) the object slots' draw factors, attn (K, s*s), slots
         (K-1, C), frame (view 0's SceneFrame)."""
-        bg_slot, slots, attn = (x[0] for x in self.slot_attention(self.encode(images[0:1])))
+        tokens = self.encode(images[0:1])
+        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
+        tokens = tokens[0]  # (s*s, C)
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, frame),
-            "background": self.decode_background(bg_slot, attn[0], colours, frame),
+            "objects": self.decode_objects(slots, attn[1:], colours, frame, tokens),
+            "background": self.decode_background(bg_slot, attn[0], colours, frame, tokens),
             "draw": draw_factor(attn[1:], self.draw_power),
             "attn": attn,
             "slots": slots,
