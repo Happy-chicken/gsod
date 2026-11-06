@@ -1,7 +1,8 @@
 """Slot model: view 0 -> slots -> Gaussians -> splatted into every view.
 
     encode / slot attention   view 0 -> background slot + K-1 object slots
-    decode_objects            object slot -> region + Gaussians
+    decode_objects            object slot (+ the pixels it owns) -> region +
+                              Gaussians
     decode_background         background slot -> floor discs + fill colour
     render                    per-slot layers (scaled by draw factor), soft
                               depth order, over the background
@@ -43,6 +44,24 @@ def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
     occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
     share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
     return share.pow(power) * count / (count + COUNT_HALF)
+
+
+# Pixel access: a token is read by the object slot holding attention above
+# PIXEL_ATTN (so at most one); a slot reads once its occupancy passes
+# PIXEL_OCCUPANCY; in training the whole path is dropped with PIXEL_DROPOUT,
+# so the slot latent alone must still reconstruct (grouping pressure).
+PIXEL_ATTN = 0.5
+PIXEL_OCCUPANCY = 0.7
+PIXEL_DROPOUT = 0.5
+
+
+def pixel_access(attn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Object-slot attention (K, N) -> token mask (K, N), gate (K,); detached."""
+    attn = attn.detach()
+    mask = attn > PIXEL_ATTN
+    occupancy = attn.pow(2).sum(-1) / attn.sum(-1).clamp_min(1e-8)
+    gate = torch.sigmoid((occupancy - PIXEL_OCCUPANCY) / 0.05) * mask.any(-1)
+    return mask, gate
 
 
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
@@ -145,15 +164,26 @@ class GSODModel(nn.Module):
         return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self,
+        slots: torch.Tensor,
+        attn: torch.Tensor,
+        colours: torch.Tensor,
+        frame: SceneFrame,
+        features: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
-        -> world Gaussians (K-1, G, ...), region half sizes "extent" (K-1, 3)
-        and world "corners" (K-1, 8, 3)."""
+        and features (s*s, C) -> world Gaussians (K-1, G, ...), region half
+        sizes "extent" (K-1, 3) and world "corners" (K-1, 8, 3)."""
         points = token_points(frame, self.input_size, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        gaussians, centre, extent = self.decoder(slots, anchor=anchor, ray=ray, colour=colour)
+        pixels = None
+        if not self.training or float(torch.rand(())) >= PIXEL_DROPOUT:
+            mask, gate = pixel_access(attn)
+            pixels = {"features": features, "colours": colours, "points": points, "mask": mask, "gate": gate}
+        gaussians, centre, extent = self.decoder(
+            slots, anchor=anchor, ray=ray, colour=colour, pixels=pixels
+        )
         signs = torch.tensor(_CORNERS, dtype=centre.dtype, device=centre.device)
         corners = points_to_world(centre[:, None] + extent[:, None] * signs, frame)
         return {"gaussians": to_world(gaussians, frame), "extent": extent, "corners": corners}
@@ -209,11 +239,12 @@ class GSODModel(nn.Module):
     ) -> dict:
         """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4) -> render
         outputs, or with render=False the decoded scene."""
-        bg_slot, slots, attn = (x[0] for x in self.slot_attention(self.encode(images[0:1])))
+        tokens = self.encode(images[0:1])
+        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, frame),
+            "objects": self.decode_objects(slots, attn[1:], colours, frame, tokens[0]),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:], self.draw_power),
             "attn": attn,

@@ -2,7 +2,8 @@
 
 The region sits around the attention anchor (shifted along view 0's ray),
 sized from the slot latent. G shared learned queries attend to tokens from
-the slot latent. Opacities are max-normalised: visibility is the draw
+the slot latent, then to the view-0 pixels the slot owns (gsod.pixel_access),
+scaled by its gate. Opacities are max-normalised: visibility is the draw
 factor alone. Scene frame, lengths in units of R.
 """
 
@@ -110,6 +111,29 @@ class ObjectHead(nn.Module):
         }
 
 
+class MaskedCrossAttention(nn.Module):
+    """Cross-attention with a per-slot logit bias; output starts at zero."""
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.h = n_heads
+        self.q = nn.Linear(d_model, d_model)
+        self.kv = nn.Linear(d_model, 2 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        with torch.no_grad():
+            self.out.weight.zero_()
+            self.out.bias.zero_()
+
+    def forward(self, x: torch.Tensor, tokens: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        """x (K, G, d), tokens (K, N, d), bias (K, N) -> (K, G, d)."""
+        K, G, d = x.shape
+        N, h = tokens.shape[1], self.h
+        q = self.q(x).view(K, G, h, d // h).transpose(1, 2)
+        k, v = self.kv(tokens).view(K, N, 2, h, d // h).permute(2, 0, 3, 1, 4)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=bias[:, None, None, :].to(q.dtype))
+        return self.out(o.transpose(1, 2).reshape(K, G, d))
+
+
 class ObjectDecoder(nn.Module):
     """Object slots -> regions and Gaussians, scene frame."""
 
@@ -146,24 +170,45 @@ class ObjectDecoder(nn.Module):
             nn.Linear(2 * d_model, d_model),
         )
         self.head = ObjectHead(z_dim, d_model)
+        # Pixel tokens: encoder feature, colour, position in the region.
+        self.token_in = nn.Linear(z_dim + 6, d_model)
+        self.norm_tok = nn.LayerNorm(d_model)
+        self.norm_pix = nn.LayerNorm(d_model)
+        self.pixel_cross = MaskedCrossAttention(d_model, n_heads)
 
     @property
     def extent_range(self) -> tuple[float, float]:
         """xy half width range (units of R)."""
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
 
-    def _attend(self, q, k, v):
-        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
-        return q + self.ffn(self.norm_ff(q))
+    def _read_pixels(self, q, pixels, centre, extent):
+        """q (K, G, d) -> gated read of each slot's own pixels (K, G, d)."""
+        K = q.shape[0]
+        rel = ((pixels["points"][None] - centre[:, None]) / extent[:, None]).clamp(-4.0, 4.0)
+        shared = torch.cat([pixels["features"], pixels["colours"]], -1)
+        tokens = self.norm_tok(self.token_in(torch.cat([shared[None].expand(K, -1, -1), rel], -1)))
+        bias = (pixels["mask"].to(q.dtype) - 1.0) * 1e4  # 0 owned, -1e4 not
+        read = self.pixel_cross(self.norm_pix(q), tokens, bias)
+        return pixels["gate"].to(q.dtype)[:, None, None] * read
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
+        self,
+        slots: torch.Tensor,
+        anchor: torch.Tensor,
+        ray: torch.Tensor,
+        colour: torch.Tensor,
+        pixels: dict[str, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians (K, G, ...),
-        region centre and half sizes (K, 3)."""
+        """slots (K, C); anchor, ray, colour (K, 3); pixels (None: skipped):
+        features (N, C), colours, points (N, 3), mask (K, N), gate (K,) ->
+        Gaussians (K, G, ...), region centre and half sizes (K, 3)."""
         K = slots.shape[0]
         centre, extent = self.head.region(slots, anchor, ray)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
-        return self.head(self._attend(q, k, v), slots, centre, extent, colour), centre, extent
+        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
+        if pixels is not None:
+            q = q + self._read_pixels(q, pixels, centre, extent)
+        q = q + self.ffn(self.norm_ff(q))
+        return self.head(q, slots, centre, extent, colour), centre, extent
