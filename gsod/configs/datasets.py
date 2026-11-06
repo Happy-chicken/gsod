@@ -46,8 +46,6 @@ class RoomDiverseConfig(BaseConfig):
     test_root: str | None = "data/room_diverse/room_diverse_test"
     num_slots: int = 5
     epochs: int = 40
-    lr_warmup_epochs: float = 2
-    draw_ramp_epochs: float = 4
     eval_every: int = 2
     save_every: int = 5
     out_dir: str = field(default_factory=lambda: default_out_dir("room_diverse"))

@@ -37,6 +37,8 @@ _ANCHOR_SHARPNESS = 2.0
 # draw_factor: occupancy drawn fully; token count drawn at half.
 FULL_OCCUPANCY = 0.8
 COUNT_HALF = 1.0
+# Background pixel weight = attention ** this.
+_BG_PIXEL_SHARPNESS = 4.0
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
@@ -129,6 +131,7 @@ class GSODModel(nn.Module):
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
         self.draw_power = 1.0
+        self.bg_pixel_gate = 1.0  # train.py ramps both
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -206,7 +209,8 @@ class GSODModel(nn.Module):
         return {
             "features": sampled[:, :c],
             "colours": sampled[:, c : c + 3],
-            "w": sampled[:, -1] * inside.to(sampled.dtype),
+            # Sharpened: only confident background is read.
+            "w": self.bg_pixel_gate * sampled[:, -1].pow(_BG_PIXEL_SHARPNESS) * inside.to(sampled.dtype),
         }
 
     def decode_background(

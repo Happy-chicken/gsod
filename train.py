@@ -101,13 +101,15 @@ class GSODTraining(L.LightningModule):
         ref = self.rng.randrange(images.shape[0])
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order], cams[order]
-        epoch = self.start_epoch + self.global_step / self.steps_per_epoch
-        self.model.draw_power = min(1.0, epoch / max(self.cfg.draw_ramp_epochs, 1e-8))
+        progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
+        self.model.draw_power = _ramp(progress, 0.0, self.cfg.draw_ramp)
+        self.model.bg_pixel_gate = _ramp(progress, *self.cfg.bg_pixel_ramp)
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
         self.log("train/view0", terms["view0"], batch_size=1)
         self.log("train/draw_power", self.model.draw_power, batch_size=1)
+        self.log("train/bg_pixel_gate", self.model.bg_pixel_gate, batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
         return loss
 
@@ -161,9 +163,14 @@ class GSODTraining(L.LightningModule):
         )
 
 
+def _ramp(x: float, start: float, end: float) -> float:
+    """0 before start, 1 after end, linear between."""
+    return min(1.0, max(0.0, (x - start) / max(end - start, 1e-8)))
+
+
 def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
     """Linear warm-up, then cosine decay to cfg.lr_final."""
-    warm = max(cfg.lr_warmup_epochs, 1e-8)
+    warm = max(cfg.lr_warmup * cfg.epochs, 1e-8)
     if epoch < warm:
         return epoch / warm
     t = min(1.0, (epoch - warm) / max(cfg.epochs - warm, 1e-8))
