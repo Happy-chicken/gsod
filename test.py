@@ -1,15 +1,9 @@
 #!/usr/bin/env python
 """Evaluate and render a trained checkpoint.
 
-Metrics (gsod/model/evaluate.py): seg/* ari, fg_ari (2D, input view),
-nv_ari (3D, novel views); recon/* psnr, ssim (novel views); diag/* where a
-low score comes from.
-
-W&B (job_type "test"): seg/*, recon/*, diag/* (summary), slots/table,
-images, and worst_* (the WORST_SCENES lowest NV-ARI scenes).
-Output directory (default <checkpoint>/renders/<split>_<suffix>):
-metrics.json, scenes.csv (worst NV-ARI first), slots.csv, sc####/*.png
-(unless --no-render).
+Metrics: gsod/model/evaluate.py. The model is built from the run's
+config.json. Writes metrics.json, scenes.csv (worst NV-ARI first),
+slots.csv and sc####/*.png to <checkpoint>/renders/<split>_<suffix>.
 
 Examples:
     python test.py --dataset primordia --split test
@@ -66,8 +60,7 @@ def parse_args() -> argparse.Namespace:
         "--pixel-features",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="override the run's config.json (runs without one: required "
-        "--no-pixel-features for checkpoints from before pixel features)",
+        help="override config.json (old runs: --no-pixel-features)",
     )
     return parser.parse_args()
 
@@ -169,7 +162,6 @@ def main() -> None:
         print(f"wrote the panels of {len(dataset)} scenes to {out}")
 
 
-# Model fields read from a run's config.json (the rest stays the profile's).
 MODEL_FIELDS = (
     "input_size",
     "z_dim",
@@ -183,8 +175,7 @@ MODEL_FIELDS = (
 
 
 def run_config(cfg, checkpoint: Path):
-    """cfg with the model fields of the run's config.json (train.py writes
-    it); unchanged, with a warning, for runs without one."""
+    """cfg with the model fields of the run's config.json, if any."""
     path = checkpoint / "config.json"
     if not path.is_file():
         print(f"no {path}: building the model from the {cfg.dataset_mode} profile")

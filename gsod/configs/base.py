@@ -37,8 +37,7 @@ class BaseConfig:
     decoder_hidden_dim: int = 128
     # Near clipping distance used when projecting Gaussians.
     near: float = 0.1
-    # Decoders also read view 0's encoder tokens through their slot's
-    # attention (gsod/model/gsod.py); False: the slot latent alone.
+    # Decoders also read view 0's tokens (gsod/model/gsod.py).
     pixel_features: bool = True
 
     # --- optimisation ----------------------------------------------------------
@@ -77,10 +76,10 @@ class BaseConfig:
     n_views: int = 4
     # fraction of the training root held out for validation.
     val_fraction: float = 0.1
-    # Quick runs: use only the first N training / val scenes (None: all).
+    # Quick runs: first N scenes (None: all).
     train_scenes: int | None = None
     val_scenes: int | None = None
-    # Test scenes (first N, with GT masks) for segmentation during training.
+    # First N test scenes scored for segmentation during training.
     monitor_scenes: int = 50
 
     # Dataset root (Primordia: meta.json; multi-view: a flat directory).

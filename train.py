@@ -6,32 +6,18 @@ Examples:
     python train.py --dataset clevr567          # data/clevr/clevr_567_train
     WANDB_MODE=offline python train.py ...      # log locally, sync later
 
-    # Quick run (~10k steps): 500 scenes, schedules in epochs scale along.
     python train.py --dataset room_diverse --train-scenes 500 --val-scenes 50 \
-        --monitor-scenes 20 --epochs 20 --eval-every 2 --save-every 10
-    # Decoder capacity check: overfit 8 scenes (view-0 render should be sharp).
-    python train.py --dataset room_diverse --train-scenes 8 --val-scenes 8 \
-        --monitor-scenes 8 --epochs 1000 --eval-every 100 --save-every 500
+        --monitor-scenes 20 --epochs 20 --eval-every 2   # quick run
 
 One scene per step; schedules, validation and saving are in epochs; the
 learning rate warms up linearly, then decays (cosine). Checkpoints use the
 uORF layout for latest, best and epoch_<n>;
 --resume continues from one.
 
-    val      held out of the training folder: val/psnr picks the best
-             checkpoint
-    monitor  the first cfg.monitor_scenes test scenes (Primordia: val),
-             with GT masks: watched only
+    val      held out of the training folder; val/psnr picks "best"
+    monitor  first cfg.monitor_scenes test scenes (GT masks): seg/*, diag/*
 
-The run's config is written to <out>/config.json; test.py builds the model
-from it.
-
-W&B (metrics: gsod/model/evaluate.py):
-    train/*  losses, gradient norm, schedules
-    val/*    psnr, ssim (val)
-    seg/*    ari, fg_ari (2D, input view), nv_ari (3D, novel views) (monitor)
-    diag/*   where a low score comes from (monitor)
-    slots/table, images (monitor)
+Writes <out>/config.json (read by test.py).
 """
 
 from __future__ import annotations

@@ -20,9 +20,8 @@ the world before splatting.
 Slot indices in every output: 0 background (in slot_alpha: the uncovered
 share of the pixel), 1..K-1 objects. Only view 0 is encoded.
 
-pixel_features: both decoders also read view 0's encoder tokens, each
-through its own slot's attention (decoders/objects.py, background.py), for
-the thin parts and textures a slot latent cannot hold.
+pixel_features: both decoders also read view 0's tokens through their slot's
+attention.
 """
 
 from __future__ import annotations
@@ -202,10 +201,9 @@ class GSODModel(nn.Module):
         frame: SceneFrame,
         tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Object slots (K-1, C), their attention (K-1, s*s), token colours
-        (s*s, 3), encoder tokens (s*s, C; read with pixel_features) ->
-        Gaussians (K-1, G, ...) in the world, with each region's half sizes
-        "extent" (K-1, 3, units of R) and world "corners" (K-1, 8, 3)."""
+        """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
+        and features (s*s, C) -> world Gaussians (K-1, G, ...), region half
+        sizes "extent" (K-1, 3) and world "corners" (K-1, 8, 3)."""
         points = token_points(frame, self.input_size, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)  # view 0's ray through each anchor
@@ -222,18 +220,15 @@ class GSODModel(nn.Module):
     def floor_pixels(
         self, maps: torch.Tensor, attn: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
-        """Where each floor disc projects in view 0: maps (C + 3, s, s)
-        (encoder features, colours), the background's attention (s, s) ->
-        per disc "features" (N, C), "colours" (N, 3) sampled there (bilinear)
-        and "w" (N,) = attention there (detached) * in view."""
+        """maps (C + 3, s, s) (features, colours), background attention (s, s)
+        -> per floor disc, sampled where it projects in view 0: "features",
+        "colours" and weight "w" (attention, 0 out of view)."""
         mu = self.background.floor_mu  # world-aligned scene frame
         to_frame = yaw_matrix(-frame.yaw).to(mu.dtype)
-        cam = (mu @ to_frame.T - frame.origin) @ frame.rot  # view 0's camera coordinates
+        cam = (mu @ to_frame.T - frame.origin) @ frame.rot  # view 0 camera
         z = cam[:, 2]
         front = z > 1e-3
         z = torch.where(front, z, torch.ones_like(z))
-        # grid_sample coordinates (align_corners=False): pixel centres at
-        # integers, the principal point at the image centre.
         grid = torch.stack(
             [2.0 * self.focal_ratio[0] * cam[:, 0] / z, 2.0 * self.focal_ratio[1] * cam[:, 1] / z], -1
         )
@@ -258,9 +253,8 @@ class GSODModel(nn.Module):
         frame: SceneFrame,
         tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Background slot (C,), its attention (s*s,), token colours (s*s, 3),
-        encoder tokens (s*s, C; read with pixel_features) -> floor discs
-        (N, ...) in the world and the "fill" colour (3,)."""
+        """Background slot (C,), attention (s*s,), token colours and features
+        -> world floor discs (N, ...) and "fill" (3,)."""
         side = self.input_size
         attn_map = attn.reshape(side, side)
         colour_map = colours.T.reshape(3, side, side)

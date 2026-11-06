@@ -44,9 +44,7 @@ class RoomChairConfig(BaseConfig):
 
 @dataclass
 class RoomDiverseConfig(BaseConfig):
-    """Room-Diverse: 4 chairs (diverse ShapeNet shapes) + the background
-    (diverse floor textures and walls); 5000 training scenes, 5x Room-Chair,
-    so fewer epochs give a similar number of steps."""
+    """Room-Diverse: 4 chairs + the background; 5x Room-Chair's scenes."""
 
     dataset_mode: str = "room_diverse"
     data_root: str = "data/room_diverse/room_diverse_train"

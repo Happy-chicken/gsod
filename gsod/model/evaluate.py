@@ -1,32 +1,15 @@
-"""Evaluation: one pass over a split -> metrics, per-scene rows, the slot
-table and image panels. Shared by train.py and test.py.
+"""Evaluation over a split: metrics, per-scene rows, slot table, images.
 
-Metrics (Evaluation.metrics; nan when undefined, e.g. without GT masks),
-each scene weighted once (its novel views averaged first):
+Metrics (nan without GT masks), averaged per scene:
+    seg     ari, fg_ari (2D, input view), nv_ari (3D, novel views)  [uORF]
+    recon   psnr, ssim (novel views)
+    diag    attn_fg_ari        attention vs GT (grouping vs decoding)
+            obj_recall         GT objects with an owning slot
+            n_duplicate        objects split over slots
+            fg_on_bg           GT background drawn by object slots
+            gt_outside_region  object pixels outside its slot's region
 
-  Segmentation (uORF, Yu et al. ICLR 2022): the rendered slot mask (argmax
-  of the compositing weights) vs GT, at render size
-    ari          2D  input view (view 0), all pixels
-    fg_ari       2D  input view, GT object pixels
-    nv_ari       3D  novel views 1..V-1, all pixels
-
-  Reconstruction, novel views
-    psnr, ssim
-
-  Diagnostics: where a low score comes from (input view, need GT)
-    attn_fg_ari        slot attention (argmax over the object slots) vs GT:
-                       low too -> the grouping fails; high -> the decoding
-    obj_recall         share of GT objects of which one slot owns >= half
-                       (every object counts the same: lost small objects)
-    n_duplicate        slots on an object another slot draws better (splits)
-    fg_on_bg           share of the GT background drawn by object slots (haze)
-    gt_outside_region  share of an object's pixels outside its slot's
-                       region (regions too small)
-
-Slot table (Evaluation.slots, columns SLOT_COLUMNS), one row per object
-slot; role: object (the best slot on a GT object), duplicate (on a GT object
-another slot draws better), haze (mostly on the GT background), empty (draws
-fewer than MIN_SLOT_PIXELS in view 0), draws (no GT to tell).
+Slot roles: object, duplicate, haze (on background), empty, draws (no GT).
 """
 
 from __future__ import annotations
@@ -69,10 +52,6 @@ NAN = float("nan")
 
 @dataclass
 class Evaluation:
-    """metrics: METRIC_KEYS averaged over the scenes; per_scene: index,
-    scene id and METRIC_KEYS of every scene; slots: the slot table of every
-    scene; images: panels of the first n_images scenes (scene_images)."""
-
     metrics: dict[str, float] = field(default_factory=dict)
     per_scene: list[dict] = field(default_factory=list)
     slots: list[dict] = field(default_factory=list)
@@ -81,8 +60,7 @@ class Evaluation:
 
 @torch.no_grad()
 def evaluate(model: GSODModel, dataset, device: torch.device, n_images: int = 0) -> Evaluation:
-    """Every scene of dataset, once (deterministic: object slots are seeded
-    from the tokens, not sampled)."""
+    """Every scene once; images of the first n_images."""
     was_training = model.training
     model.eval()
     out = Evaluation()
@@ -103,7 +81,7 @@ def evaluate(model: GSODModel, dataset, device: torch.device, n_images: int = 0)
 # -- one scene ----------------------------------------------------------------
 @torch.no_grad()
 def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
-    """One forward pass -> what the metrics and panels read, as numpy."""
+    """One forward pass, as numpy."""
     images = item["images"].to(device)
     result = model(images, item["cam2world"].to(device))
     rgb = result["rgb"].clamp(0, 1)
@@ -115,8 +93,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
 
     side = model.input_size
     gt = item.get("masks")
-    # Object slots: count (sum of attention), occupancy (mean share of the
-    # tokens held), as in gsod.draw_factor.
+    # As in gsod.draw_factor.
     attn = np_(result["attn"])
     count = attn[1:].sum(-1)
     occupancy = (attn[1:] ** 2).sum(-1) / np.maximum(count, 1e-8)
@@ -146,7 +123,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
 
 
 def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
-    """METRIC_KEYS of one scene (see the module docstring)."""
+    """METRIC_KEYS of one scene."""
     out = dict.fromkeys(METRIC_KEYS, NAN)
     if rec["rgb"].shape[0] > 1:
         out["psnr"] = psnr(float(np.mean((rec["rgb"][1:] - rec["target"][1:]) ** 2)))
@@ -164,7 +141,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
             "ari": ari(gt[0], mask[0]),
             "fg_ari": fg_ari(gt[0], mask[0]),
             "nv_ari": _nanmean([ari(gt[v], mask[v]) for v in range(1, gt.shape[0])]),
-            # Object slots only: the background row can win on object tokens.
             "attn_fg_ari": fg_ari(gt[0], attn[1:].argmax(0) + 1),
             "obj_recall": object_recall(gt[0], mask[0]),
             "n_duplicate": float(roles.count("duplicate")),
@@ -225,8 +201,7 @@ def slot_table(rec: dict) -> list[dict]:
 
 
 def object_recall(gt: np.ndarray, labels: np.ndarray) -> float:
-    """Share of the GT objects of which one object slot owns at least
-    OBJECT_FOUND of the pixels."""
+    """Share of GT objects one slot owns >= OBJECT_FOUND of."""
     found = []
     for o in np.unique(gt):
         if o == 0:
@@ -239,8 +214,7 @@ def object_recall(gt: np.ndarray, labels: np.ndarray) -> float:
 
 
 def _project_boxes(corners, cam2world, focal, size) -> np.ndarray:
-    """Regions' world corners (K, 8, 3) -> their bounding rectangles in view
-    0's pixels (K, 4): u0, v0, u1, v1."""
+    """World corners (K, 8, 3) -> view-0 pixel boxes (K, 4): u0, v0, u1, v1."""
     h, w = size
     c = (corners - cam2world[:3, 3]) @ cam2world[:3, :3]
     z = np.maximum(c[..., 2], 1e-6)

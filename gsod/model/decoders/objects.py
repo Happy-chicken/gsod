@@ -12,12 +12,8 @@ starting at 0). Opacities are normalised so the most opaque is 1: how far a
 slot is drawn is the draw factor alone (gsod.draw_factor). Everything is in
 the scene frame (utils/geometry.py): lengths in units of R.
 
-Pixel features (pixel_features=True): the latent alone is a 64-d bottleneck
-that holds no thin parts or texture, so the queries then also attend to view
-0's encoder tokens (feature, colour, position in the slot's region), each
-slot through its own attention (logit bias log a_k): a slot reads the pixels
-it holds, not another object's. The output projection starts at zero, so
-training starts from the latent-only decoder.
+pixel_features: the queries also attend to view 0's tokens, biased by
+log(slot attention), so a slot reads only its own pixels.
 """
 
 from __future__ import annotations
@@ -132,8 +128,7 @@ class ObjectHead(nn.Module):
 
 
 class MaskedCrossAttention(nn.Module):
-    """Multi-head cross-attention with a per-slot additive logit bias over
-    the tokens (broadcast over heads and queries)."""
+    """Cross-attention with a per-slot logit bias; output starts at zero."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
@@ -169,8 +164,7 @@ class ObjectDecoder(nn.Module):
         query_std: float = 2.0,
         pixel_features: bool = False,
     ):
-        """Works for any number of slots; hidden_dim is the attention width;
-        pixel_features: also attend to view 0's tokens (module docstring)."""
+        """hidden_dim: the attention width."""
         super().__init__()
         d_model = int(hidden_dim)
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -197,7 +191,6 @@ class ObjectDecoder(nn.Module):
         self.head = ObjectHead(z_dim, d_model)
         self.pixel_features = bool(pixel_features)
         if self.pixel_features:
-            # Token: encoder feature, colour, position in the region (3 each).
             self.token_in = nn.Linear(z_dim + 6, d_model)
             self.norm_tok = nn.LayerNorm(d_model)
             self.norm_pix = nn.LayerNorm(d_model)
@@ -209,8 +202,7 @@ class ObjectDecoder(nn.Module):
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
 
     def _pixel_tokens(self, pixels: dict, centre: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
-        """Per slot (K, N, d): each token's feature, colour and position in
-        the slot's region (units of its half sizes, clamped)."""
+        """(K, N, d): token feature, colour, position in the slot's region."""
         K = centre.shape[0]
         rel = ((pixels["points"][None] - centre[:, None]) / extent[:, None]).clamp(-4.0, 4.0)
         shared = torch.cat([pixels["features"], pixels["colours"]], -1)
@@ -225,11 +217,9 @@ class ObjectDecoder(nn.Module):
         colour: torch.Tensor,
         pixels: dict[str, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); per slot the attention's anchor, view 0's unit ray
-        through it and the colour there (K, 3); with pixel_features, pixels:
-        view 0's tokens "features" (N, C), "colours" (N, 3), "points" (N, 3,
-        scene frame) and the slots' "attn" (K, N) -> Gaussians (K, G, ...)
-        and the region's centre and half sizes (K, 3), scene frame."""
+        """slots (K, C); anchor, ray, colour (K, 3); pixels: features (N, C),
+        colours, points (N, 3), attn (K, N) -> Gaussians (K, G, ...), region
+        centre and half sizes (K, 3)."""
         K = slots.shape[0]
         centre, extent = self.head.region(slots, anchor, ray)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
