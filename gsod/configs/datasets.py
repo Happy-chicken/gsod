@@ -42,10 +42,29 @@ class RoomChairConfig(BaseConfig):
     out_dir: str = field(default_factory=lambda: default_out_dir("room_chair"))
 
 
+@dataclass
+class RoomDiverseConfig(BaseConfig):
+    """Room-Diverse: 4 chairs (diverse ShapeNet shapes) + the background
+    (diverse floor textures and walls); 5000 training scenes, 5x Room-Chair,
+    so fewer epochs give a similar number of steps."""
+
+    dataset_mode: str = "room_diverse"
+    data_root: str = "data/room_diverse/room_diverse_train"
+    test_root: str | None = "data/room_diverse/room_diverse_test"
+    num_slots: int = 5
+    epochs: int = 40
+    lr_warmup_epochs: float = 2
+    draw_ramp_epochs: float = 4
+    eval_every: int = 2
+    save_every: int = 5
+    out_dir: str = field(default_factory=lambda: default_out_dir("room_diverse"))
+
+
 PROFILES: dict[str, type[BaseConfig]] = {
     "primordia": PrimordiaConfig,
     "clevr567": Clevr567Config,
     "room_chair": RoomChairConfig,
+    "room_diverse": RoomDiverseConfig,
 }
 DATASETS = tuple(PROFILES)
 
