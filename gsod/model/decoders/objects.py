@@ -1,13 +1,14 @@
 """Object decoder: object slot -> region + G Gaussians in it.
 
 The region sits around the attention anchor (shifted along view 0's ray),
-sized from the slot latent. Two kinds of queries attend to tokens from the
-slot latent and share one head:
+sized from the slot latent. Two paths attend to tokens from the slot latent:
     free    G learned queries -> Gaussians anywhere in the region (the whole
             object, occluded parts included); opacities max-normalised
-    pixel   one per view-0 token whose ray crosses the region above the
+    pixel   one query per view-0 token whose ray crosses the region above the
             floor -> a Gaussian on that ray inside the region (visible
-            detail); opacity free, 0 where the ray misses
+            detail); opacity free, 0 where the ray misses. Own layers; reads
+            the slot tokens, region and features detached, so it cannot
+            change the grouping
 Scene frame, lengths in units of R.
 """
 
@@ -123,7 +124,24 @@ class ObjectHead(nn.Module):
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
-    def pixels(
+
+class PixelHead(nn.Module):
+    """Raw parameters: depth on the ray 1, opacity 1, scale 3, quat 4, rgb 3, sh1 9."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        r_max = OBJECT_RADIUS[1]
+        self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
+        self.project = _projection(d_model, 21)
+        lo, hi = (math.log(s) for s in self.scale_range)
+        with torch.no_grad():
+            bias = self.project[-1].bias
+            bias[1] = PIXEL_OPACITY_BIAS
+            bias[2:5] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
+            bias[5] = 1.0  # identity quaternion (wxyz)
+            self.project[-1].weight[12:].zero_()  # view-independent at first
+
+    def forward(
         self,
         feat: torch.Tensor,
         origin: torch.Tensor,
@@ -133,17 +151,17 @@ class ObjectHead(nn.Module):
         hit: torch.Tensor,
         colours: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Pixel queries: feat (K, N, d), rays, their span in the region
-        (K, N) -> Gaussians (K, N, ...) on the rays."""
+        """feat (K, N, d), rays, their span in the region (K, N) -> Gaussians
+        (K, N, ...) on the rays."""
         raw = self.project(feat)
         t = t_in + (t_out - t_in) * torch.sigmoid(raw[..., 0])
         return {
             "mu": origin + t[..., None] * dirs,
-            "opacity": torch.sigmoid(raw[..., 10] + PIXEL_OPACITY_BIAS) * hit,
-            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
-            "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
-            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
+            "opacity": torch.sigmoid(raw[..., 1]) * hit,
+            "scale": _log_uniform(raw[..., 2:5], *self.scale_range),
+            "quat": F.normalize(raw[..., 5:9], dim=-1),
+            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 9:12]),
+            "sh1": raw[..., 12:21].unflatten(-1, (3, 3)),
         }
 
 
@@ -183,8 +201,17 @@ class ObjectDecoder(nn.Module):
             nn.Linear(2 * d_model, d_model),
         )
         self.head = ObjectHead(z_dim, d_model)
-        # Pixel queries: token feature, colour, ray entry and exit in the region.
+        # Pixel path. Query: token feature, colour, ray entry and exit in the region.
         self.pixel_in = nn.Linear(z_dim + 9, d_model)
+        self.pixel_norm_q = nn.LayerNorm(d_model)
+        self.pixel_cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.pixel_norm_ff = nn.LayerNorm(d_model)
+        self.pixel_ffn = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model),
+        )
+        self.pixel_head = PixelHead(d_model)
 
     @property
     def extent_range(self) -> tuple[float, float]:
@@ -205,7 +232,7 @@ class ObjectDecoder(nn.Module):
             return (origin + t[..., None] * dirs - centre[:, None]) / extent[:, None]
 
         K = centre.shape[0]
-        shared = torch.cat([pixels["features"], pixels["colours"]], -1)
+        shared = torch.cat([pixels["features"].detach(), pixels["colours"]], -1)
         q = self.pixel_in(torch.cat([shared[None].expand(K, -1, -1), rel(t_in), rel(t_out)], -1))
         return q, (origin, dirs, t_in, t_out, hit.to(q.dtype), pixels["colours"])
 
@@ -230,11 +257,13 @@ class ObjectDecoder(nn.Module):
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
+        free = self.head(self._attend(q, k, v), centre, extent, colour)
         if pixels is None:
-            return self.head(self._attend(q, k, v), centre, extent, colour), centre, extent, None
-        pixel_q, rays = self._pixel_queries(pixels, centre, extent)
-        q = self._attend(torch.cat([q, pixel_q], 1), k, v)
-        free = self.head(q[:, : self.n_gaussians], centre, extent, colour)
-        pix = self.head.pixels(q[:, self.n_gaussians :], *rays)
+            return free, centre, extent, None
+        # Detached: pixel errors cannot move the region or the slot.
+        q, rays = self._pixel_queries(pixels, centre.detach(), extent.detach())
+        q = q + self.pixel_cross(self.pixel_norm_q(q), k.detach(), v.detach(), need_weights=False)[0]
+        q = q + self.pixel_ffn(self.pixel_norm_ff(q))
+        pix = self.pixel_head(q, *rays)
         gaussians = {name: torch.cat([free[name], pix[name]], 1) for name in free}
         return gaussians, centre, extent, pix["opacity"]
