@@ -6,10 +6,10 @@ Metrics (nan without GT masks), averaged per scene:
     diag    attn_fg_ari        attention argmax (background included) vs GT
             obj_recall         GT objects with an owning slot
             n_duplicate        objects split over slots
+            n_merged           slots holding several objects
             fg_on_bg           GT background drawn by object slots
             gt_outside_region  object pixels outside its slot's region
-            pixel_gate         pixel-path gate of object slots
-            pixel_coverage     object pixels its slot may read
+            pixel_drawn        object pixels its slot's pixel Gaussians draw
 
 Slot roles: object, duplicate, haze (on background), empty, draws (no GT).
 """
@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from gsod.model.gsod import GSODModel, pixel_access
+from gsod.model.gsod import GSODModel
 from gsod.model.losses import ssim
 from gsod.utils.metrics import ari, fg_ari, psnr, upsample_labels
 from gsod.utils.visualize import Tiles, scene_images
@@ -32,10 +32,10 @@ DIAGNOSTIC_KEYS = (
     "attn_fg_ari",
     "obj_recall",
     "n_duplicate",
+    "n_merged",
     "fg_on_bg",
     "gt_outside_region",
-    "pixel_gate",
-    "pixel_coverage",
+    "pixel_drawn",
 )
 METRIC_KEYS = SEGMENTATION_KEYS + RECONSTRUCTION_KEYS + DIAGNOSTIC_KEYS
 
@@ -48,11 +48,12 @@ SLOT_COLUMNS = (
     "draw",
     "occupancy",
     "count",
-    "gate",
     "extent_x",
     "extent_y",
     "gt_outside",
 )
+# Share of a GT object's pixels a slot must hold to count as holding it.
+MERGED_SHARE = 0.3
 # Share of a GT object's pixels one object slot must own for it to be found.
 OBJECT_FOUND = 0.5
 # An object slot owning fewer view-0 pixels than this draws nothing.
@@ -108,7 +109,9 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     attn = np_(result["attn"])
     count = attn[1:].sum(-1)
     occupancy = (attn[1:] ** 2).sum(-1) / np.maximum(count, 1e-8)
-    readable, gate = pixel_access(result["attn"][1:])
+    pixel = result["pixel_opacity"]
+    # Pixel Gaussian opacities, scaled by the draw factor as in the render.
+    pixel = None if pixel is None else np_(pixel * result["draw"][:, None]).reshape(-1, side, side)
     return {
         "scene": int(item.get("scene", -1)),
         "target": np_(images),
@@ -122,8 +125,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "count": count,
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
-        "readable": readable.cpu().numpy().reshape(-1, side, side),  # (K-1, s, s)
-        "gate": np_(gate),  # (K-1,)
+        "pixel": pixel,  # (K-1, s, s) or None
         "extent": np_(result["extent"]),  # (K-1, 3)
         "region_box": _project_boxes(
             np_(result["corners"]),
@@ -151,7 +153,14 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
     bg = gt[0] == 0
     roles = [row["role"] for row in rows]
     objects = [r for r in rows if r["role"] == "object"]
-    readable = np.stack([upsample_labels(m, size) for m in rec["readable"]])
+    holds = [
+        sum((mask[0][gt[0] == o] == r["slot"]).mean() > MERGED_SHARE for o in np.unique(gt[0]) if o > 0)
+        for r in rows
+    ]
+    drawn = NAN
+    if rec["pixel"] is not None:
+        pixel = np.stack([upsample_labels(p, size) for p in rec["pixel"]])  # nearest
+        drawn = _nanmean([(pixel[r["slot"] - 1][gt[0] == r["gt_object"]] > 0.5).mean() for r in objects])
     out.update(
         {
             "ari": ari(gt[0], mask[0]),
@@ -161,12 +170,10 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
             "attn_fg_ari": fg_ari(gt[0], attn.argmax(0)),
             "obj_recall": object_recall(gt[0], mask[0]),
             "n_duplicate": float(roles.count("duplicate")),
+            "n_merged": float(sum(h >= 2 for h in holds)),
             "fg_on_bg": float(1.0 - rec["alpha"][0, 0][bg].mean()) if bg.any() else NAN,
             "gt_outside_region": _nanmean([r["gt_outside"] for r in objects]),
-            "pixel_gate": _nanmean([r["gate"] for r in objects]),
-            "pixel_coverage": _nanmean(
-                [readable[r["slot"] - 1][gt[0] == r["gt_object"]].mean() for r in objects]
-            ),
+            "pixel_drawn": drawn,
         }
     )
     return out
@@ -188,7 +195,6 @@ def slot_table(rec: dict) -> list[dict]:
             "draw": float(rec["draw"][k - 1]),
             "occupancy": float(rec["occupancy"][k - 1]),
             "count": float(rec["count"][k - 1]),
-            "gate": float(rec["gate"][k - 1]),
             "extent_x": float(rec["extent"][k - 1, 0]),
             "extent_y": float(rec["extent"][k - 1, 1]),
             "gt_outside": NAN,
