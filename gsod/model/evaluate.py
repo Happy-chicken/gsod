@@ -15,6 +15,11 @@ from gsod.data_loader.primordia import PrimordiaScenes
 from gsod.model.gsod import GSODModel
 from gsod.utils.metrics import SquaredError, ari, fg_ari, upsample_labels
 
+# The headline segmentation metrics (uORF): 2D ari / fg_ari on the input
+# view, 3D nv_ari on the novel views.
+SEGMENTATION_KEYS = ("ari", "fg_ari", "nv_ari")
+
+
 def run_model(model: GSODModel, item: dict, device: torch.device) -> dict:
     """One forward pass (deterministic: object slots are seeded from the
     tokens, not sampled)."""
@@ -39,17 +44,22 @@ def evaluate(
     per_scene: list[dict] | None = None,
 ) -> dict[str, float]:
     """Metrics over every scene; per_scene, if given, gets each scene's
-    index, id and novel-view psnr.
+    index, id, novel-view psnr and ari / fg_ari / nv_ari.
 
-    Keys (nan when undefined, e.g. no GT masks):
+    Keys (nan when undefined, e.g. no GT masks). Segmentation follows uORF
+    (Yu et al., ICLR 2022), rendered slot masks vs GT, all at render size:
+      ari                     2D: input view (view 0), all pixels
+      fg_ari                  2D: input view, GT object pixels
+      nv_ari                  3D: novel views 1..V-1, all pixels
+      nv_fg_ari               novel views, GT object pixels
+    Reconstruction:
       mse, psnr               novel views, all pixels
       psnr_fg, psnr_bg        novel views, GT object / background pixels
-      psnr_view0              reference view, all pixels
-      ari, fg_ari             novel views, rendered slot mask vs GT
-      ari_view0, fg_ari_view0 reference view, rendered slot mask vs GT
-      attn_fg_ari             reference view, slot-attention argmax over the
+      psnr_view0              input view, all pixels
+    Attention (diagnostics):
+      attn_fg_ari             input view, slot-attention argmax over the
                               object slots vs GT
-      attn_render_ari         reference view, slot-attention vs rendered mask
+      attn_render_ari         input view, slot-attention vs rendered mask
                               (on GT object pixels)
     """
     was_training = model.training
@@ -68,14 +78,19 @@ def evaluate(
         size = pred_mask.shape[1:]
         attn = attn_labels(result, model, size)
 
+        scene_seg: dict[str, list[float]] = defaultdict(list)
         for v in range(rgb.shape[0]):
             gt_v = None if gt is None else gt[v]
             (err_ref if v == 0 else err_novel).add(rgb[v], target[v], gt_v)
             if gt_v is None:
                 continue
-            suffix = "_view0" if v == 0 else ""
-            scores["ari" + suffix].append(ari(gt_v, pred_mask[v]))
-            scores["fg_ari" + suffix].append(fg_ari(gt_v, pred_mask[v]))
+            prefix = "" if v == 0 else "nv_"
+            scene_seg[prefix + "ari"].append(ari(gt_v, pred_mask[v]))
+            scene_seg[prefix + "fg_ari"].append(fg_ari(gt_v, pred_mask[v]))
+        # Each scene counts once: its novel views are averaged first.
+        seg = {key: _nanmean(values) for key, values in scene_seg.items()}
+        for key, value in seg.items():
+            scores[key].append(value)
         if gt is not None:
             scores["attn_fg_ari"].append(fg_ari(gt[0], attn))
         # Object pixels only (all pixels without GT): otherwise the shared
@@ -85,7 +100,14 @@ def evaluate(
         if per_scene is not None:
             mse = float(np.mean((rgb[1:] - target[1:]) ** 2)) if rgb.shape[0] > 1 else math.nan
             psnr = -10.0 * math.log10(max(mse, 1e-10)) if not math.isnan(mse) else math.nan
-            per_scene.append({"index": i, "scene": int(item.get("scene", i)), "psnr": psnr})
+            per_scene.append(
+                {
+                    "index": i,
+                    "scene": int(item.get("scene", i)),
+                    "psnr": psnr,
+                    **{key: seg.get(key, math.nan) for key in SEGMENTATION_KEYS},
+                }
+            )
 
     model.train(was_training)
     out = {
@@ -95,14 +117,11 @@ def evaluate(
         "psnr_bg": err_novel.psnr("bg"),
         "psnr_view0": err_ref.psnr(),
     }
-    for key in (
-        "ari",
-        "fg_ari",
-        "ari_view0",
-        "fg_ari_view0",
-        "attn_fg_ari",
-        "attn_render_ari",
-    ):
-        values = [x for x in scores.get(key, []) if not math.isnan(x)]
-        out[key] = float(np.mean(values)) if values else float("nan")
+    for key in (*SEGMENTATION_KEYS, "nv_fg_ari", "attn_fg_ari", "attn_render_ari"):
+        out[key] = _nanmean(scores.get(key, []))
     return out
+
+
+def _nanmean(values: list[float]) -> float:
+    values = [x for x in values if not math.isnan(x)]
+    return float(np.mean(values)) if values else float("nan")

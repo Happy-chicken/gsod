@@ -17,7 +17,7 @@ uORF layout for latest, best and epoch_<n>;
              masks: watched only
 
 W&B: train/* (losses, gradient norm, background attention share), val/*
-(val PSNR, monitor FG-ARI), diag/* and slots/* (gsod/utils/visualize.py),
+(val PSNR; monitor ARI, FG-ARI, NV-ARI), diag/* and slots/* (gsod/utils/visualize.py),
 images.
 """
 
@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader, Subset
 from gsod.configs import DATASETS, BaseConfig, config_for
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model
-from gsod.model.evaluate import evaluate
+from gsod.model.evaluate import SEGMENTATION_KEYS, evaluate
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
@@ -167,8 +167,9 @@ class GSODTraining(L.LightningModule):
         self.logger.log_metrics(
             {
                 "val/psnr": metrics["psnr"],
-                "val/fg_ari_view0": rep.stats.get("render_fg_ari_view0", float("nan")),
-                "val/fg_ari_novel": rep.stats.get("render_fg_ari_novel", float("nan")),
+                # Segmentation on the monitor scenes (GT masks): 2D ari /
+                # fg_ari on the input view, 3D nv_ari on the novel views.
+                **{f"val/{key}": rep.stats.get(key, float("nan")) for key in SEGMENTATION_KEYS},
                 **{f"diag/{key}": rep.stats.get(key, float("nan")) for key in DIAG_CHARTS},
                 "slots/table": wandb_slot_table(rep.rows),
                 **wandb_histograms(rep.rows),

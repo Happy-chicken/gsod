@@ -14,6 +14,7 @@ background), empty (draws ~nothing in view 0), draws (no GT to tell).
 Statistics:
     attention   slot_cos_mean, attn_fg_ari, attn_dominance, bg_attn_on_bg,
                 occ_object, occ_object_min, occ_other
+    segment     ari, fg_ari (input view), nv_ari, nv_fg_ari (novel views)
     render      render_dominance, attn_render_ari, n_duplicate,
                 obj_recall_view0, bg_on_objects, fg_on_bg, n_haze
     centres     centre_min_dist
@@ -312,14 +313,18 @@ def scene_stats(rec: dict, rows: list[dict]) -> dict[str, float]:
     }
     if gt is not None:
         bg = gt[0] == 0
-        novel = [fg_ari(gt[v], rec["mask_idx"][v]) for v in range(1, gt.shape[0])]
-        novel = [x for x in novel if not np.isnan(x)]
+        views = range(1, gt.shape[0])
+        nv_ari = [ari(gt[v], rec["mask_idx"][v]) for v in views]
+        nv_fg_ari = [fg_ari(gt[v], rec["mask_idx"][v]) for v in views]
         on_object = [r["occupancy"] for r in rows if r["role"] in ("object", "duplicate")]
         out.update(
             {
                 "attn_fg_ari": fg_ari(gt[0], attn_lab),
-                "render_fg_ari_view0": fg_ari(gt[0], rec["mask_idx"][0]),
-                "render_fg_ari_novel": _mean(novel),
+                # uORF's metrics: 2D on the input view, 3D on novel views.
+                "ari": ari(gt[0], rec["mask_idx"][0]),
+                "fg_ari": fg_ari(gt[0], rec["mask_idx"][0]),
+                "nv_ari": _mean([x for x in nv_ari if not np.isnan(x)]),
+                "nv_fg_ari": _mean([x for x in nv_fg_ari if not np.isnan(x)]),
                 "obj_recall_view0": object_recall(gt[0], rec["mask_idx"][0]),
                 # The background's attention on the GT background, and the
                 # share of the GT background drawn by object slots (a haze).

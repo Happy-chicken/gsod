@@ -2,7 +2,8 @@
 """Evaluate and render a trained checkpoint.
 
 W&B (job_type "test"): test/* and diag/* (summary), slots/*, images, and
-worst_* (the WORST_SCENES lowest novel-view FG-ARI scenes).
+worst_* (the WORST_SCENES lowest NV-ARI scenes). Segmentation as uORF:
+2D ARI / FG-ARI on the input view, 3D NV-ARI on the novel views.
 Output directory (default <checkpoint>/renders/<split>_<suffix>):
 scenes.csv (worst first), slots.csv, sc####/*.png (unless --no-render).
 
@@ -105,15 +106,18 @@ def main() -> None:
         metrics = evaluate(model, dataset, device, per_scene=per_scene)
         rep = report(model, dataset, device, IMAGE_SCENES)
     print(f"{args.split} split:", {k: round(v, 4) for k, v in metrics.items()})
+    print(
+        f"  2D  ARI {metrics['ari']:.4f}  FG-ARI {metrics['fg_ari']:.4f}"
+        f"   3D  NV-ARI {metrics['nv_ari']:.4f}"
+    )
 
-    # One row per scene, worst novel-view FG-ARI first (scenes without GT
-    # last).
+    # One row per scene, worst NV-ARI first (scenes without GT last).
     stats = {int(s["scene"]): s for s in rep.per_scene}
     scenes = []
     for row in per_scene:
         extra = stats.get(row["scene"], {})
-        scenes.append({**row, **{k: v for k, v in extra.items() if k != "scene"}})
-    key = "render_fg_ari_novel"
+        scenes.append({**{k: v for k, v in extra.items() if k != "scene"}, **row})
+    key = "nv_ari"
     scenes.sort(key=lambda r: (math.isnan(r.get(key, math.nan)), r.get(key, math.nan)))
     worst = {}
     model.eval()
