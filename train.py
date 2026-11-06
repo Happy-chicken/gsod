@@ -103,13 +103,11 @@ class GSODTraining(L.LightningModule):
         images, cams = images[order], cams[order]
         progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
         self.model.draw_power = _ramp(progress, 0.0, self.cfg.draw_ramp)
-        self.model.bg_pixel_gate = _ramp(progress, *self.cfg.bg_pixel_ramp)
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
         self.log("train/view0", terms["view0"], batch_size=1)
         self.log("train/draw_power", self.model.draw_power, batch_size=1)
-        self.log("train/bg_pixel_gate", self.model.bg_pixel_gate, batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
         return loss
 
@@ -282,12 +280,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-iter", type=int, default=None)
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
-    parser.add_argument(
-        "--pixel-features",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="decoders read view 0's tokens through their slot's attention",
-    )
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
@@ -319,7 +311,6 @@ def main() -> None:
         "attn_iter",
         "gaussians_per_slot",
         "decoder_hidden_dim",
-        "pixel_features",
         "train_scenes",
         "val_scenes",
         "monitor_scenes",

@@ -52,12 +52,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--out", default=None, help="output directory for PNGs")
     parser.add_argument("--no-render", action="store_true", help="skip the PNG renders")
-    parser.add_argument(
-        "--pixel-features",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="override config.json (old runs: --no-pixel-features)",
-    )
     return parser.parse_args()
 
 
@@ -79,8 +73,6 @@ def main() -> None:
     device = torch.device("cuda")
 
     cfg = run_config(cfg, Path(checkpoint))
-    if args.pixel_features is not None:
-        cfg = replace(cfg, pixel_features=args.pixel_features)
     meta = dataset_meta(
         data_root,
         dataset_mode=cfg.dataset_mode,
@@ -166,7 +158,6 @@ MODEL_FIELDS = (
     "gaussians_per_slot",
     "decoder_hidden_dim",
     "near",
-    "pixel_features",
 )
 
 

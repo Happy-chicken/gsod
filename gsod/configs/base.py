@@ -24,7 +24,6 @@ class BaseConfig:
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
     near: float = 0.1
-    pixel_features: bool = True  # decoders also read view 0's tokens
 
     # --- optimisation (one scene per step; ramps as fractions of training)
     epochs: int = 100
@@ -32,7 +31,6 @@ class BaseConfig:
     lr_warmup: float = 0.06
     lr_final: float = 0.02
     draw_ramp: float = 0.1  # draw factor power 0 -> 1
-    bg_pixel_ramp: tuple[float, float] = (0.1, 0.3)  # background pixel gate 0 -> 1
     grad_clip: float = 1.0  # 0 = off
     seed: int = 0
     log_every: int = 100  # steps

@@ -2,8 +2,7 @@
 
 The region sits around the attention anchor (shifted along view 0's ray),
 sized from the slot latent. G shared learned queries attend to tokens from
-the slot latent (and, with pixel_features, to view 0's tokens biased by
-log(slot attention)). Opacities are max-normalised: visibility is the draw
+the slot latent. Opacities are max-normalised: visibility is the draw
 factor alone. Scene frame, lengths in units of R.
 """
 
@@ -111,29 +110,6 @@ class ObjectHead(nn.Module):
         }
 
 
-class MaskedCrossAttention(nn.Module):
-    """Cross-attention with a per-slot logit bias; output starts at zero."""
-
-    def __init__(self, d_model: int, n_heads: int):
-        super().__init__()
-        self.h = n_heads
-        self.q = nn.Linear(d_model, d_model)
-        self.kv = nn.Linear(d_model, 2 * d_model)
-        self.out = nn.Linear(d_model, d_model)
-        with torch.no_grad():
-            self.out.weight.zero_()
-            self.out.bias.zero_()
-
-    def forward(self, x: torch.Tensor, tokens: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        """x (K, G, d), tokens (K, N, d), bias (K, N) -> (K, G, d)."""
-        K, G, d = x.shape
-        N, h = tokens.shape[1], self.h
-        q = self.q(x).view(K, G, h, d // h).transpose(1, 2)
-        k, v = self.kv(tokens).view(K, N, 2, h, d // h).permute(2, 0, 3, 1, 4)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=bias[:, None, None, :].to(q.dtype))
-        return self.out(o.transpose(1, 2).reshape(K, G, d))
-
-
 class ObjectDecoder(nn.Module):
     """Object slots -> regions and Gaussians, scene frame."""
 
@@ -146,7 +122,6 @@ class ObjectDecoder(nn.Module):
         n_heads: int = 4,
         n_tokens: int = 8,
         query_std: float = 2.0,
-        pixel_features: bool = False,
     ):
         """hidden_dim: the attention width."""
         super().__init__()
@@ -171,46 +146,24 @@ class ObjectDecoder(nn.Module):
             nn.Linear(2 * d_model, d_model),
         )
         self.head = ObjectHead(z_dim, d_model)
-        self.pixel_features = bool(pixel_features)
-        if self.pixel_features:
-            self.token_in = nn.Linear(z_dim + 6, d_model)
-            self.norm_tok = nn.LayerNorm(d_model)
-            self.norm_pix = nn.LayerNorm(d_model)
-            self.pixel_cross = MaskedCrossAttention(d_model, n_heads)
 
     @property
     def extent_range(self) -> tuple[float, float]:
         """xy half width range (units of R)."""
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
 
-    def _pixel_tokens(self, pixels: dict, centre: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
-        """(K, N, d): token feature, colour, position in the slot's region."""
-        K = centre.shape[0]
-        rel = ((pixels["points"][None] - centre[:, None]) / extent[:, None]).clamp(-4.0, 4.0)
-        shared = torch.cat([pixels["features"], pixels["colours"]], -1)
-        tokens = self.token_in(torch.cat([shared[None].expand(K, -1, -1), rel], -1))
-        return self.norm_tok(tokens)
+    def _attend(self, q, k, v):
+        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
+        return q + self.ffn(self.norm_ff(q))
 
     def forward(
-        self,
-        slots: torch.Tensor,
-        anchor: torch.Tensor,
-        ray: torch.Tensor,
-        colour: torch.Tensor,
-        pixels: dict[str, torch.Tensor] | None = None,
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3); pixels: features (N, C),
-        colours, points (N, 3), attn (K, N) -> Gaussians (K, G, ...), region
-        centre and half sizes (K, 3)."""
+        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians (K, G, ...),
+        region centre and half sizes (K, 3)."""
         K = slots.shape[0]
         centre, extent = self.head.region(slots, anchor, ray)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
-        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
-        if self.pixel_features:
-            tokens = self._pixel_tokens(pixels, centre, extent)
-            bias = pixels["attn"].clamp_min(1e-6).log()
-            q = q + self.pixel_cross(self.norm_pix(q), tokens, bias)
-        q = q + self.ffn(self.norm_ff(q))
-        return self.head(q, slots, centre, extent, colour), centre, extent
+        return self.head(self._attend(q, k, v), slots, centre, extent, colour), centre, extent
