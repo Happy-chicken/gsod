@@ -1,15 +1,4 @@
-"""Image panels of one scene and their W&B forms (train.py, test.py);
-the metrics and the slot table are in gsod/model/evaluate.py.
-
-    panels(record, rows)   captioned tiles: input, render, foreground,
-                           background, GT / render masks, each slot's
-                           contribution, view 0's attention
-    save_panels            as PNGs
-    scene_images           W&B keys "scene####_view<v>/<panel>"
-    wandb_*                W&B images and the slot table
-
-Masks: per-pixel argmax; background dark grey, slot k PALETTE[(k-1) % 8].
-"""
+"""Image panels of one scene, as PNGs or W&B images."""
 
 from __future__ import annotations
 
@@ -21,8 +10,7 @@ import numpy as np
 from gsod.utils.io import save_png
 from gsod.utils.metrics import upsample_labels
 
-# Mask colours: label / slot 0 (background) dark grey, k >= 1
-# PALETTE[(k-1) % 8].
+# Mask colours: background dark grey, label k PALETTE[(k-1) % 8].
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
 PALETTE = np.array(
     [
@@ -70,9 +58,7 @@ def _slot_caption(row: dict) -> str:
 
 
 def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
-    """One scene's captioned tiles: {view: {panel: tiles}}; panels: images
-    (input, render, foreground, background, GT / render masks), slots (each
-    slot's contribution), attention (view 0: mask and each row)."""
+    """{view: {panel: captioned tiles}}: images, slots, attention."""
     size = rec["mask_idx"].shape[1:]
     gt = rec["gt"]
 
@@ -104,7 +90,7 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
 
 
 def save_panels(view_panels: dict[str, dict[str, Tiles]], scene_dir: str | Path) -> None:
-    """Write one scene's panels as PNGs: <scene_dir>/<view>_<panel>_<i>_<caption>.png."""
+    """Panels -> <scene_dir>/<view>_<panel>_<i>_<caption>.png."""
     for view, named in view_panels.items():
         for name, tiles in named.items():
             for i, (image, caption) in enumerate(tiles):
@@ -113,9 +99,7 @@ def save_panels(view_panels: dict[str, dict[str, Tiles]], scene_dir: str | Path)
 
 
 def scene_images(rec: dict, rows: list[dict], prefix: str = "") -> dict[str, Tiles]:
-    """One scene's panels keyed "<prefix>scene####_view<v>/<panel>": W&B
-    sections are one level deep (the key up to the slash), so each scene has
-    one section per view."""
+    """Panels keyed "<prefix>scene####_view<v>/<panel>"."""
     out = {}
     for view, named in panels(rec, rows).items():
         section = f"{prefix}scene{rec['scene']:04d}_{view}"
@@ -123,7 +107,7 @@ def scene_images(rec: dict, rows: list[dict], prefix: str = "") -> dict[str, Til
     return out
 
 
-# -- W&B (imported on use: only train.py and test.py need wandb) -------------
+# -- W&B ----------------------------------------------------------------------
 def wandb_images(tiles_by_key: dict) -> dict:
     """{key: [(image, caption), ...]} -> {key: [wandb.Image, ...]}."""
     import wandb
@@ -135,8 +119,7 @@ def wandb_images(tiles_by_key: dict) -> dict:
 
 
 def wandb_slot_table(rows: list[dict]):
-    """The slot table (gsod/model/evaluate.py) as a W&B table, to sort and
-    filter in the UI (e.g. role == "haze" and draw > 0.5)."""
+    """Slot table rows -> W&B table."""
     import wandb
 
     columns = list(rows[0]) if rows else []

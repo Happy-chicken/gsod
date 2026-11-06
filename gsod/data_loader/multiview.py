@@ -1,11 +1,5 @@
-"""Multi-view scenes in a flat directory, one item per scene with its views
-stacked (CLEVR-567, Room-Chair, Room-Diverse, ...).
-
-Files: ``<anything>sc0000<anything>.png`` per view, with ``<stem>_RT.txt``
-(cam2world, OpenCV axes), optional ``<stem>_mask.png`` (one grey value per
-object) and ``<stem>_depth.npy``. Images are resized to ``image_size`` and
-returned in [0, 1].
-"""
+"""Multi-view scenes in a flat directory (uORF format): ``*sc0000*.png``
+with ``_RT.txt`` (cam2world), optional ``_mask.png`` and ``_depth.npy``."""
 
 from __future__ import annotations
 
@@ -20,14 +14,13 @@ from torch.utils.data import Dataset
 
 __all__ = ["MultiViewScenes", "DEFAULT_FOCAL_RATIO", "scene_files"]
 
-# Focal ratios (fx / W, fy / H) of the CLEVR-567 / Room-* renders (a 320x240
-# camera); they hold for any resize of the image.
+# fx / W, fy / H of the CLEVR-567 / Room-* renders.
 DEFAULT_FOCAL_RATIO = (350.0 / 320.0, 350.0 / 240.0)
 
 _SCENE_RE = re.compile(r"sc(\d+)")
 _NUM_RE = re.compile(r"(\d+)")
 
-# Auxiliary PNGs next to the views (not views themselves).
+# Auxiliary PNGs (not views).
 _AUX_SUFFIXES = (
     "_mask.png",
     "_mask_for_moving.png",
@@ -66,10 +59,7 @@ def _load_rgb(path: Path, size: tuple[int, int]) -> torch.Tensor:
 
 
 def _load_mask(path: Path, size: tuple[int, int]) -> torch.Tensor:
-    """Mask PNG -> (H, W) int64 labels (0 = background), one label per grey
-    value; the background is the most frequent value (not uORF's
-    second-darkest, which breaks when the darkest object is hidden).
-    """
+    """Mask PNG -> (H, W) labels; the most frequent grey is background (0)."""
     mask = Image.open(path).convert("L").resize((size[1], size[0]), Image.NEAREST)
     gray = np.asarray(mask, dtype=np.int64)
     values, labels, counts = np.unique(gray, return_inverse=True, return_counts=True)
@@ -79,16 +69,8 @@ def _load_mask(path: Path, size: tuple[int, int]) -> torch.Tensor:
 
 
 class MultiViewScenes(Dataset):
-    """One item per scene, all views stacked as tensors.
-
-    Item:
-        scene: int
-        images: (V,3,H,W) float32 in [0,1]
-        cam2world: (V,4,4) float32
-        depths: (V,H,W) float32 or None when no depth files exist
-        masks: (V,H,W) int64, 0 = background; only when load_masks and every
-            view has a *_mask.png
-    """
+    """Item: scene, images (V, 3, H, W), cam2world (V, 4, 4), depths or None,
+    masks (V, H, W) when load_masks and every view has one."""
 
     def __init__(
         self,

@@ -1,19 +1,10 @@
-"""Object decoder: each object slot -> its region and Gaussians in it.
+"""Object decoder: object slot -> region + G Gaussians in it.
 
-ObjectHead sets the region from the slot latent around the attention's
-anchor: shifted far along view 0's ray (depth), a little across it (half
-occlusion, height), so a slot draws where its attention points; half sizes
-from the slot latent (attention holds only an object's core, not its size),
-largest at first. G learned queries (shared by all slots, one per Gaussian)
-attend to tokens projected from the slot latent, and the head turns each
-(slot, query) feature into a Gaussian in the region: mu, scale, quat,
-opacity, rgb (from the attention's mean colour) and sh1 (degree-1 SH,
-starting at 0). Opacities are normalised so the most opaque is 1: how far a
-slot is drawn is the draw factor alone (gsod.draw_factor). Everything is in
-the scene frame (utils/geometry.py): lengths in units of R.
-
-pixel_features: the queries also attend to view 0's tokens, biased by
-log(slot attention), so a slot reads only its own pixels.
+The region sits around the attention anchor (shifted along view 0's ray),
+sized from the slot latent. G shared learned queries attend to tokens from
+the slot latent (and, with pixel_features, to view 0's tokens biased by
+log(slot attention)). Opacities are max-normalised: visibility is the draw
+factor alone. Scene frame, lengths in units of R.
 """
 
 from __future__ import annotations
@@ -24,19 +15,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# Object radii r_min, r_max in units of R: one guess for every dataset
-# (largest objects: 0.25 R on Room-Chair, 0.14 on CLEVR-567, 0.18 on
-# Primordia); each region's size is predicted within the range.
+# Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
-# Where objects can be: within R of c, plus a turned cube's reach.
+# Half side of the area objects can be in.
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
-# Largest region half width and half height in units of r_max (a cube
-# turned about z reaches sqrt(2) r).
+# Largest region half width / height (units of r_max).
 OBJECT_WIDTH = 1.5
 OBJECT_HEIGHT = 1.2
-# Regions start at this share of their size range.
+# Initial region size (share of its range).
 EXTENT_INIT = 0.9
-# Gaussian scales in units of r_max: range and initial value.
+# Gaussian scale range and initial value (units of r_max).
 SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 
@@ -61,16 +49,14 @@ def _projection(d_model: int, n_params: int) -> nn.Sequential:
 
 
 class ObjectHead(nn.Module):
-    """Raw parameters: position 3, scale 3, quat 4, opacity 1, colour residual
-    3, degree-1 SH 9."""
+    """Raw parameters: mu 3, scale 3, quat 4, opacity 1, rgb 3, sh1 9."""
 
     def __init__(self, z_dim: int, d_model: int):
         super().__init__()
         r_min, r_max = OBJECT_RADIUS
         self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
         self.project = _projection(d_model, 23)
-        # Region from the slot latent: shift along (ray, across, up) and half
-        # sizes per axis within [lo, hi].
+        # Region shift along (ray, across, up) and half sizes.
         self.shift = nn.Linear(z_dim, 3)
         self.size = nn.Linear(z_dim, 3)
         self.register_buffer("shift_bound", torch.tensor(
@@ -82,7 +68,7 @@ class ObjectHead(nn.Module):
         with torch.no_grad():
             bias = self.project[-1].bias
             bias[3:6] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
-            bias[6] = 1.0  # identity quaternion (w first, gsplat convention)
+            bias[6] = 1.0  # identity quaternion (wxyz)
             self.project[-1].weight[14:].zero_()  # view-independent at first
             self.shift.weight.zero_()
             self.shift.bias.zero_()
@@ -92,8 +78,7 @@ class ObjectHead(nn.Module):
     def region(
         self, slots: torch.Tensor, centre: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), attention centre and unit view-0 ray (K, 3) -> the
-        region's centre and half sizes (K, 3)."""
+        """slots (K, C), anchor, ray (K, 3) -> region centre, half sizes (K, 3)."""
         up = torch.zeros_like(ray)
         up[:, 2] = 1.0
         across = F.normalize(torch.cross(up, ray, dim=-1), dim=-1)
@@ -111,8 +96,7 @@ class ObjectHead(nn.Module):
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), slots (K, C), region centre / half sizes / colour
-        (K, 3) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d) -> Gaussians (K, G, ...) in the region."""
         raw = self.project(feat)
         region = torch.logit(colour.clamp(0.02, 0.98))
         opacity = torch.sigmoid(raw[..., 10])
@@ -151,7 +135,7 @@ class MaskedCrossAttention(nn.Module):
 
 
 class ObjectDecoder(nn.Module):
-    """Object slots -> their regions and Gaussians, scene frame."""
+    """Object slots -> regions and Gaussians, scene frame."""
 
     def __init__(
         self,
@@ -172,9 +156,7 @@ class ObjectDecoder(nn.Module):
         self.M = int(n_tokens)
         self.d = int(d_model)
 
-        # Learned Gaussian queries (G, d): their spread sets how far apart a
-        # slot's Gaussians start (std 2.0: ~U(-0.7, 0.7) of the region; a
-        # small std collapses every slot to a point).
+        # Query spread sets the initial Gaussian spread (small: collapse).
         self.queries = nn.Parameter(torch.randn(self.n_gaussians, d_model) * query_std)
         self.k_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.v_proj = nn.Linear(z_dim, n_tokens * d_model)
@@ -198,7 +180,7 @@ class ObjectDecoder(nn.Module):
 
     @property
     def extent_range(self) -> tuple[float, float]:
-        """The regions' xy half width range (units of R)."""
+        """xy half width range (units of R)."""
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
 
     def _pixel_tokens(self, pixels: dict, centre: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:

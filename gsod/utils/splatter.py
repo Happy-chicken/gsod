@@ -1,7 +1,4 @@
-"""gsplat CUDA splatter: one call renders one set of Gaussians (one slot)
-into all views at once (colour, alpha, depth). Colours are view-dependent
-when the Gaussians carry degree-1 SH coefficients ("sh1").
-"""
+"""gsplat splatter: one set of Gaussians -> rgb, alpha, depth in all views."""
 
 from __future__ import annotations
 
@@ -37,9 +34,7 @@ class GsplatSplatter:
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
     ) -> dict[str, torch.Tensor]:
-        """Returns, per view, (V, C, H, W): "rgb" (C = 3) and "depth" (C = 1),
-        both accumulated over the Gaussians (premultiplied by alpha), and
-        "alpha" (C = 1)."""
+        """-> (V, C, H, W) "rgb", "depth" (premultiplied by alpha), "alpha"."""
         if not gaussians["mu"].is_cuda:
             raise RuntimeError(
                 "GsplatSplatter needs CUDA tensors; this project requires CUDA"
@@ -55,8 +50,7 @@ class GsplatSplatter:
         opacity = gaussians["opacity"].float().contiguous()
         colors, sh_degree = sh_coefficients(gaussians)
 
-        # gsplat takes the OpenCV world-to-camera matrix, not the transposed
-        # world_view_transform used by the original 3DGS rasterizer.
+        # gsplat takes OpenCV world-to-camera matrices.
         cam2world = cam2world.to(device=device)
         viewmats = torch.linalg.inv(cam2world.double()).float().contiguous()
         Ks = (
@@ -82,7 +76,6 @@ class GsplatSplatter:
             eps2d=self.eps2d,
             sh_degree=sh_degree,
             packed=self.packed,
-            # Accumulated depth (premultiplied), not the expected depth.
             render_mode="RGB+D",
             rasterize_mode=self.rasterize_mode,
             camera_model="pinhole",
@@ -96,9 +89,7 @@ class GsplatSplatter:
 
 
 def sh_coefficients(gaussians: dict[str, torch.Tensor]) -> tuple[torch.Tensor, int | None]:
-    """gsplat colours: plain "rgb" (N, 3), or with "sh1" (N, 3, 3) (degree-1
-    coefficients, basis rows) the degree-1 SH coefficients (N, 4, 3), whose
-    DC term reproduces "rgb" (gsplat evaluates SH and adds 0.5)."""
+    """gsplat colours: "rgb" (N, 3), or with "sh1" SH coefficients (N, 4, 3)."""
     rgb = gaussians["rgb"].float()
     if "sh1" not in gaussians:
         return rgb.contiguous(), None
@@ -109,12 +100,7 @@ def sh_coefficients(gaussians: dict[str, torch.Tensor]) -> tuple[torch.Tensor, i
 def _intrinsics(
     width: int, height: int, focal_ratio: tuple[float, float], device: torch.device
 ) -> torch.Tensor:
-    """Per-view pinhole intrinsics, with the same pixel centres as the dataset.
-
-    The dataset ray-caster puts pixel (u, v)'s centre at integer coordinates
-    (cx = (W - 1) / 2), while gsplat evaluates pixel (u, v) at (u + 0.5,
-    v + 0.5). Shifting the principal point by +0.5 makes both agree.
-    """
+    """Pinhole intrinsics; +0.5 matches gsplat's pixel centres to the dataset's."""
     fx = float(focal_ratio[0]) * width
     fy = float(focal_ratio[1]) * height
     cx = (width - 1.0) / 2.0 + 0.5

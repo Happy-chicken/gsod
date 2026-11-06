@@ -15,12 +15,7 @@ class Primitive(ABC):
 
     @abstractmethod
     def intersect(self, origin: np.ndarray, direction: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Nearest intersection of ``P`` rays with the surface.
-
-        Returns ``(t, hit, normal)``: distances ``(P,)`` (``inf`` where there is
-        no hit), a boolean mask ``(P,)`` and unit normals ``(P, 3)`` (zero where
-        there is no hit). ``direction`` need not be normalised.
-        """
+        """Nearest hits of P rays -> t (inf if none), hit mask, normals."""
 
 
 class Sphere(Primitive):
@@ -88,8 +83,7 @@ class Cuboid(Primitive):
 
 
 def make_primitive(kind: str, center, size: float) -> Primitive:
-    """Build a ``kind`` primitive: a sphere of radius ``size`` or a cube
-    (``"cuboid"``) of half side length ``size``."""
+    """A sphere of radius ``size`` or a cube of half side ``size``."""
     if kind == "sphere":
         return Sphere(center, size)
     if kind == "cuboid":

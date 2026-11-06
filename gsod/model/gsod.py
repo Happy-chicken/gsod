@@ -1,27 +1,13 @@
-"""Slot model: view 0 -> slots -> Gaussians -> splatting into every view.
+"""Slot model: view 0 -> slots -> Gaussians -> splatted into every view.
 
-    encode            view 0 -> tokens
-    slot attention    tokens -> background slot + K-1 object slots
-    decode_objects    each object slot -> its region and Gaussians in it
-    decode_background background slot -> floor discs + fill colour
-    render            every view: one layer per object slot (scaled by its
-                      draw factor), soft depth order, over the background
+    encode / slot attention   view 0 -> background slot + K-1 object slots
+    decode_objects            object slot -> region + Gaussians
+    decode_background         background slot -> floor discs + fill colour
+    render                    per-slot layers (scaled by draw factor), soft
+                              depth order, over the background
 
-The slots share every token; their roles come from what each can draw: an
-object slot an object-sized region, the background a layer behind every
-object, on the floor plane. The compositing weights w_k sum to the pixel's
-coverage, so slots compete for pixels in the render, and w_k is slot k's
-mask in every view.
-
-Both decoders work in the scene frame, set by view 0's camera
-(utils/geometry.py: lengths in units of R); their Gaussians are mapped into
-the world before splatting.
-
-Slot indices in every output: 0 background (in slot_alpha: the uncovered
-share of the pixel), 1..K-1 objects. Only view 0 is encoded.
-
-pixel_features: both decoders also read view 0's tokens through their slot's
-attention.
+Slot roles come from what each can draw. Decoders work in view 0's scene
+frame (utils/geometry.py). Slot index 0 is the background, 1..K-1 objects.
 """
 
 from __future__ import annotations
@@ -44,52 +30,38 @@ from gsod.utils.geometry import (
 )
 from gsod.utils.splatter import GsplatSplatter
 
-# A slot's transparent part counts as this much of a layer at the far depth.
+# Transparent parts count as a layer at the far depth with this weight.
 _ALPHA_EPS = 1e-3
-# Anchors weight tokens by attn ** this, so a slot with two cores leans to
-# the stronger one instead of the mean of two objects.
+# Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# draw_factor: occupancy at which a slot is drawn fully (below 1: an
-# object's rim tokens are shared, so an owner reaches ~0.83).
+# draw_factor: occupancy drawn fully; token count drawn at half.
 FULL_OCCUPANCY = 0.8
-# draw_factor: token count drawn at half (one token is not an object; a
-# small CLEVR object, ~11 tokens, keeps 0.92).
 COUNT_HALF = 1.0
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
-    """How far each object slot is drawn: attn (K, N) -> (K,) in [0, 1].
+    """attn (K, N) -> (K,) in [0, 1], how far each object slot is drawn:
 
         f = min(1, occupancy / FULL_OCCUPANCY)^power * count / (count + COUNT_HALF)
-        occupancy = sum a^2 / sum a     mean share of its tokens
-        count     = sum a               tokens held
+        occupancy = sum a^2 / sum a,  count = sum a
 
-    Linear in the share, so a split costs coverage: two slots at 0.47 / 0.47
-    on one object get 0.58 each and cover 0.82 of it, and the reconstruction
-    prefers one owner; a slot spread at 0.15 over the floor gets 0.19.
-    power < 1 (0 early in training, train.py) spares slots still finding
-    an object; at 1 a split costs most. GSODModel scales the slot's whole
-    layer by f."""
+    A split object costs coverage, so one owner is preferred."""
     count = attn.sum(-1)
     occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
     share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
     return share.pow(power) * count / (count + COUNT_HALF)
 
 
-# Anchors sit at mid object height (units of R).
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
-# Box corners as signs of the half sizes.
 _CORNERS = [[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
 
 
 def token_points(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
-    """(side*side, 3): where view 0's ray through each token cell's centre
-    reaches mid object height (scene frame), xy clamped to the object region."""
+    """(side*side, 3): each token's view-0 ray at mid object height."""
     h, w = image_size
     idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
-    # Cell centres in pixels (pixel centres at integers, as in the dataset).
     u = (idx + 0.5) * w / side - 0.5
     v = (idx + 0.5) * h / side - 0.5
     vv, uu = torch.meshgrid(v, u, indexing="ij")
@@ -102,9 +74,7 @@ def token_points(
 def attention_anchors(
     attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Where each slot's attention points and the colour there: attn (K, N),
-    token points and colours (N, 3) -> (K, 3) each, means weighted by the
-    sharpened attention."""
+    """attn (K, N), points, colours (N, 3) -> anchor, colour (K, 3)."""
     p = (_ANCHOR_SHARPNESS * attn.log()).softmax(dim=1)
     return p @ points, p @ colours
 
@@ -112,18 +82,13 @@ def attention_anchors(
 def composite(
     layers: list[dict[str, torch.Tensor]], tau: torch.Tensor, far: torch.Tensor, background: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Object-slot layers in a soft depth order over the background image.
-
-    layers: per slot, the splatter output (V, C, H, W) ("rgb", "depth"
-    premultiplied by "alpha"); d_k is slot k's expected depth.
+    """Slot layers in soft depth order over the background:
 
         T_k   = prod_{j != k} (1 - alpha_j * sigmoid((d_k - d_j) / tau))
-        T_bg  = prod_k (1 - alpha_k)
-        image = sum_k T_k * rgb_k + T_bg * background
-        w_k   = T_k * alpha_k              slot k's share of the pixel
+        image = sum_k T_k * rgb_k + prod_k (1 - alpha_k) * background
 
-    Returns image (V, 3, H, W), weights (V, 1 + K, H, W) (T_bg first) and
-    contributions T_k * rgb_k (V, K, 3, H, W).
+    Returns image (V, 3, H, W), weights (V, 1 + K, H, W), contributions
+    (V, K, 3, H, W).
     """
     rgb = torch.stack([layer["rgb"] for layer in layers], 1)  # (V, K, 3, H, W)
     alpha = torch.stack([layer["alpha"] for layer in layers], 1)  # (V, K, 1, H, W)
@@ -163,7 +128,6 @@ class GSODModel(nn.Module):
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
-        # Exponent of the draw factor's share term (train.py ramps it to 1).
         self.draw_power = 1.0
 
         self.encoder = Encoder(3, z_dim=z_dim)
@@ -179,7 +143,7 @@ class GSODModel(nn.Module):
         )
 
     def networks(self) -> dict[str, nn.Module]:
-        """Named networks"""
+        """Named networks (checkpoint files)."""
         return {
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
@@ -206,7 +170,7 @@ class GSODModel(nn.Module):
         sizes "extent" (K-1, 3) and world "corners" (K-1, 8, 3)."""
         points = token_points(frame, self.input_size, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
-        ray = F.normalize(anchor - frame.origin, dim=-1)  # view 0's ray through each anchor
+        ray = F.normalize(anchor - frame.origin, dim=-1)
         pixels = None
         if self.pixel_features:
             pixels = {"features": tokens, "colours": colours, "points": points, "attn": attn}
@@ -267,23 +231,17 @@ class GSODModel(nn.Module):
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
 
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
-        """A scene (forward with render=False) rendered into every view of
-        cam2world (N, 4, 4)."""
+        """A scene (forward(render=False)) rendered into cam2world (N, 4, 4)."""
         obj = scene["objects"]["gaussians"]
         bg = scene["background"]
         draw, slots = scene["draw"], scene["slots"]
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
-        # Each slot's layer scaled as a whole (rgb and depth are premultiplied,
-        # so its expected depth is unchanged): its alpha is at most draw[k].
         layers = []
         for k in range(slots.shape[0]):
             layer = self.splat({name: obj[name][k] for name in obj}, *cams)
             layers.append({name: draw[k] * value for name, value in layer.items()})
-        # The floor, over the fill colour where it does not cover the view.
         floor = self.splat(bg["gaussians"], *cams)
         bg_rgb = floor["rgb"] + (1.0 - floor["alpha"]) * bg["fill"][None, :, None, None]
-        # Soft depth order: a fraction of an object decides who is in front;
-        # nearly transparent parts count as past every object.
         frame = scene["frame"]
         tau = 0.25 * OBJECT_RADIUS[1] * frame.scale
         far = (frame.origin.norm() + 2.0 * OBJECT_REGION) * frame.scale
@@ -292,28 +250,25 @@ class GSODModel(nn.Module):
         n_gauss = obj["mu"].shape[1]
         return {
             "rgb": image,  # (N, 3, H, W)
-            "fg_rgb": slot_rgb.sum(1),  # the object slots alone, over black
-            "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W) each slot's contribution
-            "bg_rgb": bg_rgb,  # the background alone
-            "slot_alpha": weights,  # (N, K, H, W); 0 = uncovered (background)
+            "fg_rgb": slot_rgb.sum(1),
+            "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W)
+            "bg_rgb": bg_rgb,
+            "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
-            "attn": scene["attn"],  # (K, s*s) view-0 slot attention; row 0 = background
-            "draw": draw,  # (K-1,) the object slots' draw factors
-            "extent": scene["objects"]["extent"],  # (K-1, 3) region half sizes, units of R
-            "corners": scene["objects"]["corners"],  # (K-1, 8, 3) region corners, world
-            "slots": slots,  # (K-1, C) object slots (masks 1..K-1)
+            "attn": scene["attn"],  # (K, s*s)
+            "draw": draw,  # (K-1,)
+            "extent": scene["objects"]["extent"],  # (K-1, 3)
+            "corners": scene["objects"]["corners"],  # (K-1, 8, 3)
+            "slots": slots,  # (K-1, C)
             "slot_ids": torch.arange(1, slots.shape[0] + 1, device=slots.device).repeat_interleave(n_gauss),
-            "gaussians": {name: obj[name].flatten(0, 1) for name in obj},  # world, objects only
+            "gaussians": {name: obj[name].flatten(0, 1) for name in obj},  # objects, world
         }
 
     def forward(
         self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True
     ) -> dict:
-        """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4): the scene from
-        view 0 rendered into every view, or with render=False the scene
-        itself: objects and background (decode_objects / decode_background),
-        draw (K-1,) the object slots' draw factors, attn (K, s*s), slots
-        (K-1, C), frame (view 0's SceneFrame)."""
+        """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4) -> render
+        outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
         bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         tokens = tokens[0]  # (s*s, C)

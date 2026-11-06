@@ -1,13 +1,4 @@
-"""Segmentation and reconstruction metrics (numpy, framework-independent).
-
-Conventions follow the object-discovery literature (Slot Attention, uORF):
-
-* ARI     -- adjusted Rand index over all pixels (background included).
-* FG-ARI  -- ARI over ground-truth foreground pixels only (gt > 0).
-* PSNR    -- of a mean squared error, images in [0, 1].
-
-Which views and how they are averaged: gsod/model/evaluate.py.
-"""
+"""ARI, FG-ARI and PSNR (numpy)."""
 
 from __future__ import annotations
 
@@ -23,12 +14,7 @@ def _comb2(x: np.ndarray) -> np.ndarray:
 
 
 def ari(gt: np.ndarray, pred: np.ndarray, mask: np.ndarray | None = None) -> float:
-    """Adjusted Rand index between two label maps of the same shape.
-
-    mask (bool) restricts the pixels that are scored. Returns nan when fewer
-    than two pixels are scored. Matches sklearn.metrics.adjusted_rand_score,
-    including its degenerate cases (both single-cluster -> 1.0).
-    """
+    """Adjusted Rand index (as sklearn) over mask pixels; nan if < 2."""
     gt = np.asarray(gt).ravel()
     pred = np.asarray(pred).ravel()
     if mask is not None:

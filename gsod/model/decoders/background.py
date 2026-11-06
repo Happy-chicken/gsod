@@ -1,18 +1,8 @@
-"""Background decoder: the background slot -> flat discs on the floor plane,
-colour a field over floor positions (as uORF's background NeRF).
-Everything behind the objects, walls included, is drawn on the floor; what
-the floor does not cover gets one fill colour. Positions are in the scene
-frame (units of R about c) but world-aligned (not turned by view 0's yaw).
-
-    grid    fixed discs: fine over the object region, coarse past the cameras
-    colour  MLP(PE(x), z, a): rgb, SH, opacity
-    fill    z, a -> one colour
-
-z the slot latent, a view 0's azimuth (cos, sin). Nothing pixel-aligned,
-so the background cannot draw a missed object.
-
-pixel_features: each disc also reads view 0 where it projects, weighted by
-the (detached) background attention there, so objects stay unreadable.
+"""Background decoder: background slot -> discs on the floor plane, colour
+MLP(PE(x), latent, view-0 azimuth), plus one fill colour. Walls are drawn
+on the floor too. Nothing pixel-aligned, so it cannot draw a missed object;
+with pixel_features each disc also reads view 0 where it projects, weighted
+by the (detached) background attention. Scene frame, world-aligned.
 """
 
 from __future__ import annotations
@@ -26,9 +16,8 @@ from gsod.model.decoders.objects import OBJECT_REGION
 
 # (inner, outer) grid sides, by pixel_features.
 _GRID_SIDES = {False: (51, 41), True: (101, 61)}
-_HALF = 3.0  # past view 0's camera (2.2-2.7 R away on every dataset)
+_HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
-# Background discs: thickness (units of R) and initial opacity.
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
 
@@ -71,7 +60,7 @@ class BackgroundHead(nn.Module):
         return torch.sigmoid(self.opacity_out(feat)[:, 0])
 
     def fill(self, scene: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
-        """scene (d_scene,) -> the colour (3,) where no disc covers the view."""
+        """scene (d_scene,) -> fill colour (3,)."""
         return torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + self.fill_out(scene))
 
     def colour(self, feat: torch.Tensor, mean: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -84,8 +73,7 @@ class BackgroundHead(nn.Module):
 
 
 def floor_grid(inner_side: int, outer_side: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Disc centres (N, 3) on the floor and their spacing (N,): fine over the
-    object region, coarse outside it."""
+    """Disc centres (N, 3) and spacing (N,): fine inside the object region."""
     def grid(half: float, side: int):
         lin = torch.linspace(-half, half, side)
         y, x = torch.meshgrid(lin, lin, indexing="ij")
@@ -101,8 +89,7 @@ def floor_grid(inner_side: int, outer_side: int) -> tuple[torch.Tensor, torch.Te
 
 
 class BackgroundDecoder(nn.Module):
-    """Background slot -> floor discs (N, ...), scene frame (world-aligned),
-    and a fill colour."""
+    """Background slot -> floor discs and a fill colour."""
 
     def __init__(self, z_dim: int, hidden_dim: int, pixel_features: bool = False):
         super().__init__()
@@ -126,7 +113,6 @@ class BackgroundDecoder(nn.Module):
         """latent (C,), attn (s, s) background attention, colours (3, s, s),
         yaw: view 0's azimuth; pixels: GSODModel.floor_pixels -> Gaussians
         and "fill" (3,)."""
-        # Base colour: the mean of the tokens the background holds.
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
         scene = torch.cat([latent, azimuth])  # (C + 2,)

@@ -34,12 +34,8 @@ class Scene:
 
 
 def raycast(scene: Scene, camera: Camera) -> dict[str, np.ndarray]:
-    """Render one view of ``scene`` analytically.
-
-    Returns ``rgb`` ``(H, W, 3) uint8``, ``mask`` ``(H, W) int8`` (object index,
-    0 = background) and ``depth`` ``(H, W) float32`` (hit distance along the
-    unit ray, 0 = background).
-    """
+    """One view -> rgb (H, W, 3), mask (H, W, 0 = background), depth (ray
+    distance, 0 = background)."""
     height, width = camera.image_size
     origins, directions = camera.rays()
 

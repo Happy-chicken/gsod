@@ -1,5 +1,4 @@
-"""Configuration: BaseConfig and LossConfig (base.py), the dataset profiles
-(datasets.py). The project trains on CUDA."""
+"""Configuration: base config and dataset profiles."""
 
 from gsod.configs.base import BaseConfig, LossConfig
 from gsod.configs.datasets import (

@@ -1,23 +1,11 @@
 #!/usr/bin/env python
-"""Train the GS slot model (PyTorch Lightning, Weights & Biases).
+"""Train the GS slot model (Lightning, W&B). One scene per step.
 
-Examples:
-    python train.py --dataset primordia
-    python train.py --dataset clevr567          # data/clevr/clevr_567_train
-    WANDB_MODE=offline python train.py ...      # log locally, sync later
-
+    python train.py --dataset clevr567
     python train.py --dataset room_diverse --train-scenes 500 --val-scenes 50 \
         --monitor-scenes 20 --epochs 20 --eval-every 2   # quick run
 
-One scene per step; schedules, validation and saving are in epochs; the
-learning rate warms up linearly, then decays (cosine). Checkpoints use the
-uORF layout for latest, best and epoch_<n>;
---resume continues from one.
-
-    val      held out of the training folder; val/psnr picks "best"
-    monitor  first cfg.monitor_scenes test scenes (GT masks): seg/*, diag/*
-
-Writes <out>/config.json (read by test.py).
+val/psnr picks "best"; monitor (test scenes with GT) gives seg/*, diag/*.
 """
 
 from __future__ import annotations
@@ -50,13 +38,11 @@ from gsod.utils.io import latest_run_dir, load_networks, save_networks
 from gsod.utils.visualize import wandb_images, wandb_slot_table
 
 WANDB_PROJECT = "gsod"
-# Monitor scenes drawn as images at every validation.
 IMAGE_SCENES = 4
 
 
 class GSODTraining(L.LightningModule):
-    """One scene per step: view 0 is a random view of the scene, the others
-    are the novel views the encoder does not see."""
+    """View 0 is a random view of the scene; the others are novel views."""
 
     def __init__(
         self,
@@ -90,8 +76,6 @@ class GSODTraining(L.LightningModule):
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
-        # LambdaLR's index i counts this run's steps; the schedule reads the
-        # (fractional) epoch after step i + 1, offset by a resume.
         start = self.start_epoch * self.steps_per_epoch
         schedule = torch.optim.lr_scheduler.LambdaLR(
             opt,
@@ -128,7 +112,7 @@ class GSODTraining(L.LightningModule):
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        # Before clipping (far above grad_clip: clipping shrinks everything).
+        # Before clipping.
         norms = grad_norm(self.model, norm_type=2)
         self.log("train/grad_norm", norms["grad_2.0_norm_total"], batch_size=1)
 
@@ -140,8 +124,7 @@ class GSODTraining(L.LightningModule):
             self._save(f"epoch_{epoch}", epoch)
 
     def _validate(self, epoch: int) -> None:
-        """val: psnr, ssim (keeps the best checkpoint); monitor (GT masks):
-        segmentation, diagnostics, slot table and images."""
+        """val: psnr, ssim (best checkpoint); monitor: seg, diag, images."""
         if not len(self.val_set):
             return
         monitor = evaluate(self.model, self.monitor_set, self.device, IMAGE_SCENES)
@@ -171,7 +154,7 @@ class GSODTraining(L.LightningModule):
         print(f"done, wrote {self.out}/latest_*.pth")
 
     def _save(self, suffix: str, epoch: int) -> None:
-        """epoch: the epochs done at this checkpoint (where --resume starts)."""
+        """epoch: epochs done (where --resume starts)."""
         save_networks(str(self.out), suffix, self.model.networks(), self.trainer.optimizers)
         (self.out / f"{suffix}_state.json").write_text(
             json.dumps({"epoch": epoch, "best_psnr": self.best_psnr})
@@ -179,8 +162,7 @@ class GSODTraining(L.LightningModule):
 
 
 def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
-    """Linear warm-up to cfg.lr, then cosine decay to cfg.lr_final * cfg.lr
-    at cfg.epochs."""
+    """Linear warm-up, then cosine decay to cfg.lr_final."""
     warm = max(cfg.lr_warmup_epochs, 1e-8)
     if epoch < warm:
         return epoch / warm
@@ -189,7 +171,7 @@ def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
 
 
 def _first(dataset, n: int | None):
-    """The first n scenes of dataset (all when n is None or larger)."""
+    """The first n scenes (all if n is None)."""
     if n is None or n >= len(dataset):
         return dataset
     return Subset(dataset, range(n))
@@ -211,8 +193,6 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
         seed=cfg.seed,
     )
     train_set = _first(make_dataset(cfg.data_root, "train", **dataset_kwargs), cfg.train_scenes)
-    # CLEVR-567 reads *_mask.png when present (and skips them otherwise);
-    # Primordia masks live in the scene folders and need the wrapper.
     val_set = make_dataset(cfg.data_root, "val", load_masks=True, **dataset_kwargs)
     if cfg.dataset_mode == "primordia":
         val_set = WithGTMasks(val_set, cfg.data_root)
@@ -237,7 +217,7 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
 
     start_epoch, best_psnr = 0, float("-inf")
     if resume is not None:
-        # Networks now; the optimizer once Lightning has built it (on_fit_start).
+        # Optimizer state is loaded in on_fit_start.
         load_networks(str(out), resume, model.networks(), device="cpu")
         state = json.loads((out / f"{resume}_state.json").read_text())
         start_epoch, best_psnr = state["epoch"], state["best_psnr"]
@@ -256,7 +236,6 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
     logger = WandbLogger(
         project=WANDB_PROJECT, name=out.name, save_dir=str(out), config=asdict(cfg)
     )
-    # Lightning's counters (the x axis) get no charts of their own.
     for counter in ("trainer/global_step", "epoch"):
         logger.experiment.define_metric(counter, hidden=True)
     trainer = L.Trainer(
@@ -360,7 +339,6 @@ def main() -> None:
         image_size=cfg.dataset_image_size,
         focal_ratio=cfg.dataset_focal_ratio,
     )
-    # Seed before building the model so cfg.seed also fixes its initialisation.
     torch.manual_seed(cfg.seed)
     model = build_model(cfg, meta)
     train(model, cfg, resume=args.resume)

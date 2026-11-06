@@ -1,10 +1,4 @@
-"""Attach GT instance masks to Primordia items (evaluation only).
-
-Each view is matched to its frame on disk by its camera matrix, so any view
-order works; img*_mask.png is resized (nearest) to the item's resolution:
-``WithGTMasks(PrimordiaScenes(...), root)[i]["masks"]`` is (N, H, W) int64,
-0 = background.
-"""
+"""Attach GT masks (N, H, W) to Primordia items, matched by camera."""
 
 from __future__ import annotations
 
@@ -43,8 +37,7 @@ class WithGTMasks:
         return len(self.dataset)
 
     def __getattr__(self, name):
-        # Forward everything else (split lists, meta, ...) to the dataset.
-        # Guard: before __init__ ran (unpickling), self.dataset is missing too.
+        # Forward to the dataset (guarded for unpickling).
         if name == "dataset":
             raise AttributeError(name)
         return getattr(self.dataset, name)

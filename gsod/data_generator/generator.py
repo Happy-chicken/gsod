@@ -36,7 +36,7 @@ class SceneGenConfig:
     azimuth_jitter: float = 3.0
     target_height: float = 0.4
 
-    # Objects rest on this plane; it is not drawn (one uniform background).
+    # Objects rest on this (undrawn) plane.
     floor_z: float = 0.0
     background_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
@@ -85,10 +85,7 @@ def sample_scene(cfg: SceneGenConfig, rng: np.random.Generator) -> Scene:
 
 
 def sample_views(cfg: SceneGenConfig, rng: np.random.Generator) -> np.ndarray:
-    """Draw n_views orbiting cameras around the scene centre.
-
-    Returns (n_views, 4, 4) cam2world matrices.
-    """
+    """n_views orbiting cameras -> (n_views, 4, 4) cam2world."""
     start = float(rng.uniform(0.0, 360.0))
     azimuths = np.linspace(0.0, 360.0, cfg.n_views, endpoint=False)
     azimuths = azimuths + start + rng.normal(0.0, cfg.azimuth_jitter, size=cfg.n_views)

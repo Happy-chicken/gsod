@@ -1,15 +1,5 @@
-"""Files: run directories, checkpoints, PNG previews and 3DGS .ply exports.
-
-Checkpoints (uORF's BaseModel layout), per suffix (e.g. 'latest' or
-'epoch_25'): {suffix}_net_{name}.pth per network, {suffix}_optimizer_{i}.pth
-per optimizer, {suffix}_lr_scheduler_{i}.pth per scheduler.
-
-PNG: a dependency-free 8-bit RGB writer.
-
-PLY (SuperSplat, SIBR and other viewers): x y z, nx ny nz (0), f_dc_0..2,
-f_rest_0..44 (SH degree 3, channel-major; only degree 1 is filled), opacity
-(logit), scale_0..2 (log), rot_0..3 (wxyz).
-"""
+"""Run directories, checkpoints (uORF layout: {suffix}_net_{name}.pth),
+PNG writer and 3DGS .ply export."""
 
 from __future__ import annotations
 
@@ -80,9 +70,7 @@ def load_networks(
     schedulers: Sequence = (),
     device: str | torch.device = "cuda",
 ) -> dict[str, object]:
-    """Load weights with strict=False, as uORF does; returns the load result
-    per network. Missing network files are reported and skipped; optimizer
-    and scheduler state is restored only when its file exists."""
+    """Load weights (strict=False); missing files are skipped."""
     save_dir = Path(save_dir)
     result: dict[str, object] = {}
     for name, net in networks.items():
@@ -144,8 +132,7 @@ _REST = 15  # SH coefficients per channel beyond DC, degree 3
 
 
 def ply_fields(gaussians: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
-    """mu, scale, quat, opacity, rgb and optional sh1 (N, 3 basis, 3 rgb) ->
-    3DGS fields, each (N,) or (N, k)."""
+    """Gaussians -> 3DGS .ply fields."""
     g = {k: v.detach().float().cpu() for k, v in gaussians.items()}
     n = g["mu"].shape[0]
     rest = torch.zeros(n, 3, _REST)

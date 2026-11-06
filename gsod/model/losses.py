@@ -1,10 +1,7 @@
-"""Training loss: reconstruction only, no masks.
+"""Reconstruction loss (no masks):
 
-    total = l1 * L1 + ssim * (1 - SSIM)    novel views 1..V-1
-          + view0 * L1                     view 0
-
-L1 rather than MSE (L2 over-penalises splatting speckle); D-SSIM as in 3DGS.
-The novel views carry the 3D signal.
+    total = l1 * L1 + ssim * (1 - SSIM)   novel views
+          + view0 * L1                    view 0
 """
 
 from __future__ import annotations
@@ -53,8 +50,7 @@ class GSODLoss(nn.Module):
     def forward(
         self, outputs: dict[str, torch.Tensor], images: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """outputs: model output; images: (V,3,H,W). Returns (total, per-term
-        values for logging)."""
+        """-> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered, target = outputs["rgb"][1:], images[1:]
         terms: dict[str, torch.Tensor] = {

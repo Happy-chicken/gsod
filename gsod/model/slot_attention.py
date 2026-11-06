@@ -1,25 +1,9 @@
-"""Slot attention with a background slot and K-1 object slots, as in uORF
-(Yu et al., ICLR 2022).
+"""Slot attention: a background slot + K-1 object slots (uORF).
 
-The background has its own initial query, query projection, GRU and
-residual MLP; key and value projections are shared. Logits are one shared
-learned temperature times cos(query, key), softmax over the K slots: no
-slot wins by the scale of its query, only by its direction. The slots'
-roles come from what each can draw (gsod.py), not from the attention.
-
-    attention row 0     background (returned as its own slot)
-    attention rows 1..  object slots (returned slots 0..K-2)
-
-Initialisation:
-    background    a learned query, BO-QSA (Jia et al., ICLR 2023): refined on
-                  detached slots, the last iteration's gradient passed
-                  straight through to it
-    object slots  seeded from the input: tokens unlike the background query,
-                  spread out by farthest point sampling (``seed_tokens``),
-                  their features projected; refined BO-QSA style too. No
-                  noise, and a slot is what its seed lands on, not its index
-                  (a query per slot specialised: one held background tokens
-                  it cannot draw)
+Logits: learned temperature * cos(query, key), softmax over slots. The
+background has its own query, GRU and MLP; object slots are seeded from
+tokens unlike the background query (farthest point sampling). Both are
+refined BO-QSA style (detached iterations, straight-through last step).
 """
 
 from __future__ import annotations
@@ -31,7 +15,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
 
-# The shared temperature: initial value and bounds.
 _TAU_INIT, _TAU_MIN, _TAU_MAX = 5.0, 1.0, 50.0
 
 
@@ -75,14 +58,10 @@ class SlotAttention(nn.Module):
         self.log_tau = nn.Parameter(torch.tensor(math.log(_TAU_INIT)))
 
         self.n_objects = num_slots - 1
-        # Object slots: seed token features, projected; the background: its
-        # own query.
         self.seed_proj = nn.Linear(in_dim, slot_dim)
         self.bg_query = nn.Parameter(torch.empty(1, 1, slot_dim))
         init.xavier_uniform_(self.bg_query)
 
-        # Shared key / value projections; the background has its own query
-        # projection, GRU and residual MLP (uORF).
         self.to_k = nn.Linear(in_dim, slot_dim, bias=False)
         self.to_v = nn.Linear(in_dim, slot_dim, bias=False)
         hidden_dim = max(slot_dim, hidden_dim)
@@ -92,9 +71,7 @@ class SlotAttention(nn.Module):
         self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
         self.to_res = self._residual_mlp(slot_dim, hidden_dim)
         self.to_res_bg = self._residual_mlp(slot_dim, hidden_dim)
-        # Soft position embedding + feature MLP (Locatello et al. 2020): a
-        # slot holds a spatially coherent group, so it cannot merge two
-        # far-apart objects that look alike.
+        # Soft position embedding + feature MLP (Locatello et al. 2020).
         self.pos_proj = nn.Linear(4, in_dim)
         self.feat_mlp = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -131,8 +108,7 @@ class SlotAttention(nn.Module):
         return self.log_tau.exp().clamp(_TAU_MIN, _TAU_MAX)
 
     def _update(self, gru, res, updates, prev):
-        """One slot update: GRU from the attention-weighted values, then the
-        residual MLP. updates, prev: (b, n, D)."""
+        """GRU then residual MLP; updates, prev: (b, n, D)."""
         b, n, d = prev.shape
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, n, d)
         return slots + res(slots)
@@ -146,7 +122,6 @@ class SlotAttention(nn.Module):
         tau = self.temperature()
 
         bg_init = self.bg_query.expand(b, -1, -1)
-        # Object seeds: tokens unlike the background's initial query, spread out.
         q_bg = F.normalize(self.to_q_bg(bg_init), dim=-1)  # (b, 1, D)
         objectness = 1.0 - torch.einsum("bid,bjd->bj", q_bg, k.detach())
         idx = seed_tokens(objectness, grid[0, :, :2], self.n_objects)  # (b, K-1)
@@ -156,8 +131,7 @@ class SlotAttention(nn.Module):
 
         attn = None
         for it in range(self.iters):
-            # BO-QSA: earlier iterations are not back-propagated; the last one
-            # passes its gradient straight through to the initial slots.
+            # BO-QSA: straight-through gradient to the initial slots.
             bg, fg = bg.detach(), fg.detach()
             if it == self.iters - 1:
                 bg = bg + bg_init - bg_init.detach()

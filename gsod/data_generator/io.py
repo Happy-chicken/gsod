@@ -1,21 +1,5 @@
-"""On-disk format for the Primordia dataset.
-
-Responsibility: serialize already-rendered scenes to per-scene folders and read
-them back. No geometry, no randomness, no rendering.
-
-Layout (one folder per scene, one set of files per view)::
-
-    <root>/
-      meta.json                 # config, split, per-scene object counts
-      sc0000/
-        img0.png                # RGB image
-        img0_mask.png           # per-pixel labels (0 = background, i = object i)
-        img0_RT.txt             # cam2world, 4x4
-        img0_depth.npy          # depth, HxWx1 float32
-        img1.png ...
-      sc0001/
-        ...
-"""
+"""Primordia on-disk format: <root>/meta.json and sc####/img{v}.png,
+img{v}_mask.png, img{v}_RT.txt, img{v}_depth.npy."""
 
 from __future__ import annotations
 

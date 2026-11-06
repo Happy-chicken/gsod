@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Point gsplat's JIT build at a CUDA 12.4 toolkit.
-#
-# Set CUDA_HOME to override; otherwise probe the usual locations. Some conda
-# toolkits keep the CUDA headers/libs under targets/<arch>/ instead of
-# include/ and lib64/, so add those to the compiler search paths as well.
+# Point gsplat's JIT build at a CUDA 12.4 toolkit (CUDA_HOME overrides).
 
 if [[ -z "${CUDA_HOME:-}" ]]; then
     for candidate in /usr/local/cuda-12.4 /usr/local/cuda "$HOME/cuda-12.4"; do

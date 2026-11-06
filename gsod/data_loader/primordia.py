@@ -19,11 +19,7 @@ __all__ = ["PrimordiaScenes", "hit_distance_to_depth"]
 
 
 def hit_distance_to_depth(depth: np.ndarray, focal_ratio) -> np.ndarray:
-    """Convert stored hit distances (along unit rays) to camera-space z.
-
-    The renderer produces z (distance along the optical axis). For a pixel with
-    normalised image coords (x, y), the unit ray has z = 1 / sqrt(x^2 + y^2 + 1).
-    """
+    """Hit distances along unit rays -> camera-space z."""
     h, w = depth.shape[-2:]
     fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
     us = np.arange(w, dtype=np.float64)
@@ -35,13 +31,8 @@ def hit_distance_to_depth(depth: np.ndarray, focal_ratio) -> np.ndarray:
 
 
 class PrimordiaScenes(Dataset):
-    """Scenes of one split. Item i is a dict with the scene index and
-
-    images:    (V, 3, H, W) float32 in [0, 1]
-    cam2world: (V, 4, 4) float32
-    depths:    (V, H, W) float32 camera-space z, 0 where there is no surface;
-               None unless load_depth (training does not use depth)
-    """
+    """Item: scene, images (V, 3, H, W), cam2world (V, 4, 4), depths
+    (camera z) or None."""
 
     def __init__(self, root, split: str = "train", *, load_depth: bool = False):
         self.root = Path(root)

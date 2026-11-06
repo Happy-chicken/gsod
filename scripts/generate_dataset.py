@@ -1,16 +1,11 @@
 #!/usr/bin/env python
-"""Generate the Primordia synthetic dataset.
-
-Glues the three responsibilities together: sample (generator) -> render
-(analytic ray-cast) -> serialize (io). No geometry or camera maths lives here.
-"""
+"""Generate the Primordia dataset: sample -> ray-cast -> write."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-# Run from anywhere: the gsod package lives one level up.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse

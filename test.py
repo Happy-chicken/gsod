@@ -1,14 +1,10 @@
 #!/usr/bin/env python
-"""Evaluate and render a trained checkpoint.
+"""Evaluate and render a checkpoint (model from the run's config.json).
 
-Metrics: gsod/model/evaluate.py. The model is built from the run's
-config.json. Writes metrics.json, scenes.csv (worst NV-ARI first),
-slots.csv and sc####/*.png to <checkpoint>/renders/<split>_<suffix>.
+    python test.py --dataset clevr567 --split test --suffix best
 
-Examples:
-    python test.py --dataset primordia --split test
-    python test.py --dataset clevr567 --split test   # data/clevr/clevr_567_test
-    python test.py --dataset primordia --suffix epoch_50
+Writes metrics.json, scenes.csv, slots.csv, sc####/*.png to
+<checkpoint>/renders/<split>_<suffix>.
 """
 
 from __future__ import annotations

@@ -1,17 +1,9 @@
-"""Geometry: cameras, the floor and the scene frame.
+"""Cameras, the floor and the scene frame.
 
-Conventions: world right-handed, +z up, the floor at z = 0; cameras OpenCV
-(looking down +z, +x right, +y down), cam2world a 4x4 camera -> world
-transform; pixel centres at integer coordinates, the principal point at the
-image centre.
-
-The scene frame, set by view 0's camera: the model predicts in it and maps
-its Gaussians into the world before splatting. Like uORF's nss2cam0, it is
-the world turned about +z so that view 0 looks along +x; it is centred at c,
-where view 0's optical axis meets the floor, and scaled by 1 / R, the radius
-of the largest disc about c that view 0's floor footprint holds. Every
-length the model assumes is a constant in units of R, so no scene
-statistics are needed (view 0 must look down at the floor).
+World: +z up, floor at z = 0; cameras OpenCV, cam2world 4x4; pixel centres
+at integers. Scene frame (like uORF's nss2cam0): world turned so view 0
+looks along +x, centred where its optical axis meets the floor, scaled by
+1 / R (R: radius of the largest floor disc view 0 sees about that point).
 """
 
 from __future__ import annotations
@@ -25,8 +17,7 @@ import torch
 
 # -- cameras and the floor ----------------------------------------------------
 def camera_directions(u, v, size: tuple[int, int], focal_ratio):
-    """Camera-frame ray directions (..., 3) (z = 1) through pixels (u, v):
-    numpy arrays or torch tensors (the result is the same kind)."""
+    """Camera-frame ray directions (..., 3), z = 1 (numpy or torch)."""
     h, w = size
     x = (u - (w - 1) / 2) / (focal_ratio[0] * w)
     y = (v - (h - 1) / 2) / (focal_ratio[1] * h)
@@ -36,8 +27,7 @@ def camera_directions(u, v, size: tuple[int, int], focal_ratio):
 
 
 def floor_hits(origin, directions, floor_z: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Where rays origin + t * directions (..., 3) meet z = floor_z: xy
-    (..., 2), t (...,) and whether the ray goes down (elsewhere t = 0)."""
+    """Rays meeting z = floor_z -> xy, t, and whether the ray goes down."""
     origin = np.asarray(origin, dtype=np.float64)
     dz = directions[..., 2]
     down = dz < -1e-6
@@ -69,11 +59,7 @@ class Camera:
 
 
 def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
-    """Build a cam2world (4x4) that looks from eye at target.
-
-    up chooses the camera roll; it must not be parallel to the view
-    direction. +z is up by default.
-    """
+    """cam2world (4x4) looking from eye at target; up sets the roll."""
     eye = np.asarray(eye, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     up = np.asarray(up, dtype=np.float64)
@@ -102,11 +88,7 @@ def orbit(
     azimuth_deg: float,
     up=(0.0, 0.0, 1.0),
 ) -> np.ndarray:
-    """cam2world of a camera on a sphere of radius around center.
-
-    elevation_deg is measured from the horizontal plane, azimuth_deg
-    from the world +x axis (counter-clockwise around up).
-    """
+    """cam2world on a sphere around center (azimuth from +x, CCW)."""
     elevation = np.deg2rad(elevation_deg)
     azimuth = np.deg2rad(azimuth_deg)
     offset = radius * np.array(
@@ -121,14 +103,12 @@ def orbit(
 
 
 # -- the scene frame ----------------------------------------------------------
-# Image border points per edge sampled for R.
 _BORDER_SAMPLES = 64
 
 
 class SceneFrame(NamedTuple):
-    """yaw: view 0's world azimuth; centre (3,) c and scale R: the frame's
-    origin and unit in the world; origin (3,) and rot (3, 3): view 0's camera
-    in the frame (columns: camera axes, OpenCV)."""
+    """yaw, centre c, scale R in the world; origin, rot: view 0's camera in
+    the frame."""
 
     yaw: torch.Tensor
     centre: torch.Tensor
@@ -145,8 +125,7 @@ def scene_frame(
     forward = rot[:, 2]
     yaw = torch.atan2(forward[1], forward[0])
     centre = o - (o[2] / forward[2]) * forward
-    # R: the nearest point of the footprint's boundary (the image border cast
-    # onto the floor; border rays above the horizon do not bound it).
+    # R: nearest image-border point cast onto the floor.
     h, w = image_size
     s = torch.linspace(0.0, 1.0, _BORDER_SAMPLES, device=o.device, dtype=o.dtype)
     zero, one = torch.zeros_like(s), torch.ones_like(s)
@@ -186,18 +165,14 @@ def quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def rotate_sh1(sh1: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
-    """Degree-1 SH (..., 3, 3) (basis rows, gsplat order) rotated by rot.
-
-    The degree-1 term is C1 (-y c1 + z c2 - x c3) = C1 d . w with
-    w = (-c3, -c1, c2), so the coefficients rotate as the vector w."""
+    """Degree-1 SH (..., 3, 3) rotated by rot (coefficients as w = (-c3, -c1, c2))."""
     c1, c2, c3 = sh1.unbind(-2)
     w = torch.einsum("ij,...jc->...ic", rot.to(sh1.dtype), torch.stack([-c3, -c1, c2], -2))
     return torch.stack([-w[..., 1, :], w[..., 2, :], -w[..., 0, :]], -2)
 
 
 def points_to_world(points: torch.Tensor, frame: SceneFrame, rotate: bool = True) -> torch.Tensor:
-    """Points (..., 3) from the scene frame into the world; rotate=False for
-    a frame that is only centred and scaled (world-aligned)."""
+    """Scene frame -> world; rotate=False for world-aligned points."""
     if rotate:
         points = points @ yaw_matrix(frame.yaw).to(points.dtype).T
     return points * frame.scale.to(points.dtype) + frame.centre.to(points.dtype)
@@ -213,8 +188,7 @@ def yaw_quat(angle: torch.Tensor) -> torch.Tensor:
 def rotate_gaussians(
     gaussians: dict[str, torch.Tensor], rot: torch.Tensor, quat: torch.Tensor
 ) -> dict[str, torch.Tensor]:
-    """Gaussians turned by rot (3, 3), whose quaternion is quat (4,):
-    positions, rotations and degree-1 SH."""
+    """Gaussians rotated by rot (3, 3) / quat (4,)."""
     out = {
         **gaussians,
         "mu": gaussians["mu"] @ rot.to(gaussians["mu"].dtype).T,
@@ -228,8 +202,7 @@ def rotate_gaussians(
 def to_world(
     gaussians: dict[str, torch.Tensor], frame: SceneFrame, rotate: bool = True
 ) -> dict[str, torch.Tensor]:
-    """Gaussians from the scene frame into the world: with rotate turned by
-    the yaw, then sizes scaled by R and positions moved to c."""
+    """Gaussians, scene frame -> world."""
     if rotate:
         gaussians = rotate_gaussians(gaussians, yaw_matrix(frame.yaw), yaw_quat(frame.yaw))
     return {
@@ -240,8 +213,7 @@ def to_world(
 
 
 def from_world(gaussians: dict[str, torch.Tensor], frame: SceneFrame) -> dict[str, torch.Tensor]:
-    """Gaussians from the world into the scene frame (to_world's inverse;
-    world-aligned parts are turned too, so the whole scene shares one frame)."""
+    """Gaussians, world -> scene frame (inverse of to_world)."""
     dtype = gaussians["mu"].dtype
     moved = {
         **gaussians,

@@ -1,15 +1,11 @@
 #!/usr/bin/env python
-"""Preview one Primordia scene: save each view's image and mask as its own file.
-
-Writes ``img_v<i>.png`` and ``mask_v<i>.png`` into ``--out`` (no stitching).
-"""
+"""Save one Primordia scene's images and masks (img_v<i>.png, mask_v<i>.png)."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-# Run from anywhere: the gsod package lives one level up.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
@@ -26,7 +22,7 @@ _MASK_BG = np.array([35, 35, 40], dtype=np.uint8)
 
 
 def colorize_mask(mask: np.ndarray) -> np.ndarray:
-    """Map an object-index mask to RGB: 0 -> dark background, i -> palette i-1."""
+    """Label mask -> RGB."""
     mask = np.asarray(mask)
     out = np.broadcast_to(_MASK_BG, (*mask.shape, 3)).copy()
     for index in np.unique(mask):

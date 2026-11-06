@@ -1,17 +1,8 @@
 #!/usr/bin/env python
-"""Export a trained model's Gaussians of some scenes as 3DGS .ply files.
+"""Export scenes' Gaussians as 3DGS .ply (all, objects, background, per
+slot); object opacity is scaled by the draw factor.
 
-Per scene, into --out (default <checkpoint>/ply/<split>_<suffix>):
-scene####.ply (everything), scene####_objects.ply, scene####_background.ply
-and scene####_slot<k>.ply. Object opacities are multiplied by their slot's
-draw factor (the model scales the slot's rendered layer by it; for one
-Gaussian scene this is the closest equivalent). --frame world (default):
-world coordinates; --frame scene: the scene frame:
-c at the origin, R = 1, view 0 looking along +x), the same scale and heading
-for every scene. z up; --y-up turns it to y up for viewers that expect it.
-Runs on CPU (no rendering).
-
-    python scripts/export_ply.py --dataset room_chair --checkpoint <run dir> --scenes 0 1 2
+    python scripts/export.py --dataset room_chair --checkpoint <run dir> --scenes 0 1 2
 """
 
 from __future__ import annotations

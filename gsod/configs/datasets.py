@@ -1,9 +1,4 @@
-"""Dataset profiles: the dataset-specific fields of BaseConfig.
-
-A profile sets where the data is and how many slots a scene needs; the
-scene's scale comes from view 0's camera (gsod/utils/geometry.py). Adding a
-dataset means adding a profile here.
-"""
+"""Dataset profiles: data paths, slot count and schedule overrides."""
 
 from __future__ import annotations
 
@@ -15,7 +10,7 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class PrimordiaConfig(BaseConfig):
-    """Primordia (generated here; meta.json carries its geometry)."""
+    """Primordia (generated here)."""
 
     out_dir: str = field(default_factory=lambda: default_out_dir("primordia"))
 
