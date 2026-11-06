@@ -108,15 +108,6 @@ class ObjectHead(nn.Module):
         extent = self.size_lo + (self.size_hi - self.size_lo) * torch.sigmoid(self.size(slots))
         return centre, extent
 
-    def _shared(self, raw: torch.Tensor, base: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Scale, rotation and colour (residual on base) of either kind."""
-        return {
-            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
-            "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "rgb": torch.sigmoid(torch.logit(base.clamp(0.02, 0.98)) + raw[..., 11:14]),
-            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
-        }
-
     def forward(
         self, feat: torch.Tensor, centre: torch.Tensor, extent: torch.Tensor, colour: torch.Tensor
     ) -> dict[str, torch.Tensor]:
@@ -126,7 +117,10 @@ class ObjectHead(nn.Module):
         return {
             "mu": centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3]),
             "opacity": opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6),
-            **self._shared(raw, colour[:, None]),
+            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
+            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
     def pixels(
@@ -146,7 +140,10 @@ class ObjectHead(nn.Module):
         return {
             "mu": origin + t[..., None] * dirs,
             "opacity": torch.sigmoid(raw[..., 10] + PIXEL_OPACITY_BIAS) * hit,
-            **self._shared(raw, colours[None]),
+            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
+            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
 
