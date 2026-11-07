@@ -8,7 +8,7 @@ Metrics (nan without GT masks), averaged per scene:
             n_duplicate        objects split over slots
             n_merged           slots holding several objects
             fg_on_bg           GT background drawn by object slots
-            gt_outside_region  object pixels outside its slot's region
+            gt_outside_box     object pixels outside its slot's region (view 0)
 
 Slot roles: object, duplicate, haze (on background), empty, draws (no GT).
 """
@@ -44,7 +44,7 @@ DIAGNOSTIC_KEYS = (
     "n_duplicate",
     "n_merged",
     "fg_on_bg",
-    "gt_outside_region",
+    "gt_outside_box",
 )
 METRIC_KEYS = SEGMENTATION_KEYS + RECONSTRUCTION_KEYS + DIAGNOSTIC_KEYS
 
@@ -136,12 +136,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
         "extent": np_(result["extent"]),  # (K-1, 3)
-        "region_box": _project_boxes(
-            np_(result["corners"]),
-            item["cam2world"][0].numpy(),
-            model.focal_ratio,
-            tuple(images.shape[-2:]),
-        ),  # (K-1, 4) view 0's u0, v0, u1, v1
+        "box_mask": result["box_mask"].cpu().numpy(),  # (K-1, H, W) region in view 0
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
@@ -179,7 +174,7 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
             "n_duplicate": float(roles.count("duplicate")),
             "n_merged": float(sum(h >= 2 for h in holds)),
             "fg_on_bg": float(1.0 - rec["alpha"][0, 0][bg].mean()) if bg.any() else NAN,
-            "gt_outside_region": _nanmean([r["gt_outside"] for r in objects]),
+            "gt_outside_box": _nanmean([r["gt_outside"] for r in objects]),
         }
     )
     return out
@@ -214,7 +209,7 @@ def slot_table(rec: dict) -> list[dict]:
                     target = gt[0] == obj
                     row["gt_object"] = obj
                     row["iou"] = float((pixels & target).sum() / (pixels | target).sum())
-                    row["gt_outside"] = _outside(target, rec["region_box"][k - 1])
+                    row["gt_outside"] = float(1.0 - rec["box_mask"][k - 1][target].mean())
                     row["role"] = "object"
                 else:
                     row["role"] = "haze"
@@ -245,25 +240,6 @@ def object_recall(gt: np.ndarray, labels: np.ndarray) -> float:
         best = np.bincount(own).max() if own.size else 0
         found.append(best >= OBJECT_FOUND * (gt == o).sum())
     return float(np.mean(found)) if found else NAN
-
-
-def _project_boxes(corners, cam2world, focal, size) -> np.ndarray:
-    """World corners (K, 8, 3) -> view-0 pixel boxes (K, 4): u0, v0, u1, v1."""
-    h, w = size
-    c = (corners - cam2world[:3, 3]) @ cam2world[:3, :3]
-    z = np.maximum(c[..., 2], 1e-6)
-    u = focal[0] * w * c[..., 0] / z + (w - 1) / 2
-    v = focal[1] * h * c[..., 1] / z + (h - 1) / 2
-    return np.stack([u.min(-1), v.min(-1), u.max(-1), v.max(-1)], -1)
-
-
-def _outside(mask: np.ndarray, box: np.ndarray) -> float:
-    """Share of a mask's pixels outside a pixel rectangle."""
-    v, u = np.nonzero(mask)
-    if not len(u):
-        return NAN
-    inside = (u >= box[0]) & (u <= box[2]) & (v >= box[1]) & (v <= box[3])
-    return float(1.0 - inside.mean())
 
 
 def _nanmean(values) -> float:

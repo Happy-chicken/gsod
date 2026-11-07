@@ -1,7 +1,8 @@
 """Slot model: view 0 -> slots -> Gaussians -> splatted into every view.
 
     encode / slot attention   view 0 -> background slot + K-1 object slots
-    decode_objects            object slot -> region + Gaussians
+    decode_objects            object slot (+ view 0 at its region's cells) ->
+                              region + one Gaussian per cell
     decode_background         background slot -> floor discs + fill colour
     render                    per-slot layers (scaled by draw factor), soft
                               depth order, over the background
@@ -20,7 +21,7 @@ from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, points_to_world, scene_frame, to_world
+from gsod.utils.geometry import SceneFrame, camera_directions, ray_box, scene_frame, to_world
 from gsod.utils.splatter import GsplatSplatter
 
 # Transparent parts count as a layer at the far depth with this weight.
@@ -64,7 +65,6 @@ def oracle_attention(mask: torch.Tensor, num_slots: int, side: int) -> torch.Ten
 
 
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
-_CORNERS = [[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
 
 
 def token_points(
@@ -167,18 +167,42 @@ class GSODModel(nn.Module):
         return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self,
+        slots: torch.Tensor,
+        attn: torch.Tensor,
+        colours: torch.Tensor,
+        features: torch.Tensor,
+        frame: SceneFrame,
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
-        -> world Gaussians (K-1, G, ...), region half sizes "extent" (K-1, 3)
-        and world "corners" (K-1, 8, 3)."""
-        points = token_points(frame, self.input_size, self.image_size, self.focal_ratio)
-        anchor, colour = attention_anchors(attn, points, colours)
+        and features (s*s, C) -> world Gaussians (K-1, G, ...), region
+        "centre" and half sizes "extent" (K-1, 3, scene frame)."""
+        side = self.input_size
+        points = token_points(frame, side, self.image_size, self.focal_ratio)
+        anchor, _ = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        gaussians, centre, extent = self.decoder(slots, anchor=anchor, ray=ray, colour=colour)
-        signs = torch.tensor(_CORNERS, dtype=centre.dtype, device=centre.device)
-        corners = points_to_world(centre[:, None] + extent[:, None] * signs, frame)
-        return {"gaussians": to_world(gaussians, frame), "extent": extent, "corners": corners}
+        view0 = {
+            "features": features.T.reshape(-1, side, side),
+            "colours": colours.T.reshape(3, side, side),
+            "attn": attn.reshape(-1, side, side),
+            "frame": frame,
+            "focal_ratio": self.focal_ratio,
+        }
+        gaussians, centre, extent = self.decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        return {"gaussians": to_world(gaussians, frame), "centre": centre, "extent": extent}
+
+    @torch.no_grad()
+    def box_masks(self, centre: torch.Tensor, extent: torch.Tensor, frame: SceneFrame) -> torch.Tensor:
+        """Regions (K, 3) -> where view 0 sees them (K, H, W), bool."""
+        h, w = self.image_size
+        v, u = torch.meshgrid(
+            torch.arange(h, device=centre.device, dtype=centre.dtype),
+            torch.arange(w, device=centre.device, dtype=centre.dtype),
+            indexing="ij",
+        )
+        dirs = camera_directions(u, v, self.image_size, self.focal_ratio).reshape(-1, 3) @ frame.rot.T
+        t_in, t_out = ray_box(frame.origin, dirs, centre - extent, centre + extent)
+        return (t_out > t_in).reshape(-1, h, w)
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -220,7 +244,8 @@ class GSODModel(nn.Module):
             "attn": scene["attn"],  # (K, s*s)
             "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
-            "corners": scene["objects"]["corners"],  # (K-1, 8, 3)
+            # (K-1, H, W): where view 0 sees each region.
+            "box_mask": self.box_masks(scene["objects"]["centre"], scene["objects"]["extent"], frame),
             "slots": slots,  # (K-1, C)
             "slot_ids": torch.arange(1, slots.shape[0] + 1, device=slots.device).repeat_interleave(n_gauss),
             "gaussians": {name: obj[name].flatten(0, 1) for name in obj},  # objects, world
@@ -243,10 +268,11 @@ class GSODModel(nn.Module):
             fixed = oracle_attention(masks, self.num_slots, self.input_size)[None].to(images.dtype)
         tokens = self.encode(images[0:1])
         bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens, fixed))
+        tokens = tokens[0]  # (s*s, C)
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, frame),
+            "objects": self.decode_objects(slots, attn[1:], colours, tokens, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:], self.draw_power),
             "attn": attn,

@@ -140,6 +140,27 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
+def view0_grid(points: torch.Tensor, frame: SceneFrame, focal_ratio) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scene-frame points (..., 3) -> view-0 grid_sample coordinates (..., 2)
+    (align_corners=False) and whether they are in front of the camera."""
+    cam = (points - frame.origin) @ frame.rot
+    front = cam[..., 2] > 1e-3
+    z = torch.where(front, cam[..., 2], torch.ones_like(cam[..., 2]))
+    grid = torch.stack([2.0 * focal_ratio[0] * cam[..., 0] / z, 2.0 * focal_ratio[1] * cam[..., 1] / z], -1)
+    return grid, front
+
+
+def ray_box(
+    origin: torch.Tensor, dirs: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rays origin (3,) + t * dirs (N, 3) through boxes [lo, hi] (K, 3) ->
+    entry and exit t (K, N); a miss has t_out <= t_in."""
+    safe = torch.where(dirs.abs() < 1e-9, torch.full_like(dirs, 1e-9), dirs)
+    t0 = (lo[:, None] - origin) / safe
+    t1 = (hi[:, None] - origin) / safe
+    return torch.minimum(t0, t1).amax(-1).clamp_min(0.0), torch.maximum(t0, t1).amin(-1)
+
+
 def yaw_matrix(angle: torch.Tensor) -> torch.Tensor:
     """(3, 3) rotation by angle about +z."""
     c, s = torch.cos(angle), torch.sin(angle)
