@@ -173,10 +173,12 @@ class GSODModel(nn.Module):
         colours: torch.Tensor,
         features: torch.Tensor,
         frame: SceneFrame,
+        bg_attn: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
-        and features (s*s, C) -> world Gaussians (K-1, G, ...), region
-        "centre" and half sizes "extent" (K-1, 3, scene frame)."""
+        and features (s*s, C), the background's attention (s*s,) -> world
+        Gaussians (K-1, G, ...), region "centre" and half sizes "extent"
+        (K-1, 3, scene frame)."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, _ = attention_anchors(attn, points, colours)
@@ -185,6 +187,7 @@ class GSODModel(nn.Module):
             "features": features.T.reshape(-1, side, side),
             "colours": colours.T.reshape(3, side, side),
             "attn": attn.reshape(-1, side, side),
+            "bg_attn": bg_attn.reshape(side, side),
             "frame": frame,
             "focal_ratio": self.focal_ratio,
         }
@@ -272,7 +275,7 @@ class GSODModel(nn.Module):
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, tokens, frame),
+            "objects": self.decode_objects(slots, attn[1:], colours, tokens, frame, attn[0]),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:], self.draw_power),
             "attn": attn,

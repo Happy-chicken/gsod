@@ -1,12 +1,15 @@
 """Object decoder: object slot -> region + one Gaussian per region cell.
 
-The region stands on the floor around the attention anchor (shifted along
-view 0's ray), sized from the slot latent. It holds side^3 cells. Each cell
-reads view 0 where it projects (the slot's attention-weighted features, its
-attention and colour; region and attention detached), passes n_layers of
+The region stands just above the floor around the attention anchor (shifted
+along view 0's ray), sized from the slot latent. It holds side^3 cells. Each
+cell reads view 0 where it projects (region and attention detached): the
+slot's attention-weighted features and colour (dim where the slot holds
+little), its attention, and the background's. It passes n_layers of
 self-attention among cells, cross-attention to tokens from the slot latent
 and FFN, and emits a Gaussian near its centre whose opacity starts at the
-sampled attention. Scene frame, lengths in units of R.
+sampled attention. A cell over a background pixel is empty: view 0 sees the
+background through it (visual hull), so its opacity is scaled by
+1 - background attention. Scene frame, lengths in units of R.
 """
 
 from __future__ import annotations
@@ -28,6 +31,11 @@ OBJECT_WIDTH = 1.5
 OBJECT_HEIGHT = 1.2
 # Initial region size (share of its range).
 EXTENT_INIT = 0.9
+# Regions and their Gaussians stay this high above the floor.
+OBJECT_FLOOR = 0.01
+# Sampled features and colours are divided by max(attention, this), so a
+# cell sees little of pixels its slot hardly holds.
+SAMPLE_FLOOR = 0.3
 # Cell Gaussians: scale range in units of the cell's half size, and how far
 # (in cell half sizes) a Gaussian may move from its cell centre.
 CELL_SCALE = (0.25, 4.0)
@@ -83,13 +91,13 @@ class ObjectHead(nn.Module):
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """slots (K, C), anchor, ray (K, 3) -> region centre, half sizes (K, 3).
-        The region stands on the floor: z from 0 to twice its half height."""
+        The region stands on the floor: z from OBJECT_FLOOR up twice its half height."""
         ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
         t = self.shift_bound * torch.tanh(self.shift(slots))
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
         extent = self.size_lo + (self.size_hi - self.size_lo) * torch.sigmoid(self.size(slots))
-        return torch.cat([xy, extent[:, 2:]], -1), extent
+        return torch.cat([xy, OBJECT_FLOOR + extent[:, 2:]], -1), extent
 
     def forward(
         self,
@@ -98,17 +106,19 @@ class ObjectHead(nn.Module):
         cell_half: torch.Tensor,
         attn: torch.Tensor,
         colours: torch.Tensor,
+        keep: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), cell centres (K, G, 3), cell half sizes (K, 3), view-0
-        attention and colours sampled at the cells (K, G), (K, G, 3) -> one
-        Gaussian per cell (K, G, ...); opacity starts at the attention."""
+        attention, colours and visual-hull factor sampled at the cells (K, G),
+        (K, G, 3), (K, G) -> one Gaussian per cell (K, G, ...)."""
         raw = self.project(feat)
         half = cell_half[:, None]
+        mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
         return {
-            "mu": cells + CELL_REACH * half * torch.tanh(raw[..., 0:3]),
+            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(OBJECT_FLOOR)], -1),
             "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "opacity": torch.sigmoid(torch.logit(attn.clamp(0.02, 0.98)) + raw[..., 10]),
+            "opacity": torch.sigmoid(torch.logit(attn.clamp(0.02, 0.98)) + raw[..., 10]) * keep,
             "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
@@ -181,36 +191,40 @@ class ObjectDecoder(nn.Module):
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
 
     @staticmethod
-    def _sample(cells: torch.Tensor, view0: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sample(cells: torch.Tensor, view0: dict):
         """Cells (K, G, 3) -> where each projects in view 0: the slot's
-        features (attention-weighted, K, G, C), attention (K, G), colours (K, G, 3)."""
+        features (K, G, C) and colours (K, G, 3), both attention-weighted, its
+        attention (K, G) and the visual-hull factor 1 - background attention (K, G)."""
         grid, front = view0_grid(cells, view0["frame"], view0["focal_ratio"])
         attn, features, colours = view0["attn"], view0["features"], view0["colours"]
         K, C = attn.shape[0], features.shape[0]
+        a = attn[:, None]
         maps = torch.cat(
-            [attn[:, None] * features[None], attn[:, None], colours[None].expand(K, -1, -1, -1)], 1
+            [a * features[None], a, a * colours[None], view0["bg_attn"][None, None].expand(K, -1, -1, -1)], 1
         )
         out = F.grid_sample(maps, grid[:, None], mode="bilinear", align_corners=False)[:, :, 0]
-        out = out.transpose(1, 2) * front[..., None]  # (K, G, C + 4)
+        out = out.transpose(1, 2) * front[..., None]  # (K, G, C + 5)
         a = out[..., C]
-        return out[..., :C] / a[..., None].clamp_min(1e-4), a, out[..., C + 1 :]
+        norm = a[..., None].clamp_min(SAMPLE_FLOOR)
+        return out[..., :C] / norm, a, out[..., C + 1 : C + 4] / norm, 1.0 - out[..., C + 4]
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: "features" (C, s, s),
-        "colours" (3, s, s), the slots' "attn" (K, s, s), "frame",
-        "focal_ratio" -> Gaussians (K, G, ...), region centre and half sizes (K, 3)."""
+        "colours" (3, s, s), the slots' "attn" (K, s, s), the background's
+        "bg_attn" (s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
+        region centre and half sizes (K, 3)."""
         K = slots.shape[0]
         centre, extent = self.head.region(slots, anchor, ray)
         cells = centre[:, None] + extent[:, None] * self.cell_grid
         # Detached: reading view 0 cannot move the region or regroup.
-        view0 = {**view0, "attn": view0["attn"].detach()}
-        feat, a, colours = self._sample(cells.detach(), view0)
+        view0 = {**view0, "attn": view0["attn"].detach(), "bg_attn": view0["bg_attn"].detach()}
+        feat, a, colours, keep = self._sample(cells.detach(), view0)
         position = self.cell_grid.expand(K, -1, -1)
         q = self.cell_embed + self.cell_in(torch.cat([feat, a[..., None], colours, position], -1))
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, cells, extent / self.side, a, colours), centre, extent
+        return self.head(q, cells, extent / self.side, a, colours, keep), centre, extent
