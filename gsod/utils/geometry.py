@@ -140,6 +140,22 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
+def view0_rays(
+    frame: SceneFrame, image_size: tuple[int, int], focal_ratio, side: int | None = None
+) -> torch.Tensor:
+    """View 0's ray directions (N, 3, scene frame), row-major: through every
+    pixel, or with side through the centres of a side x side token grid."""
+    h, w = image_size
+    kw = {"device": frame.rot.device, "dtype": frame.rot.dtype}
+    if side is None:
+        u, v = torch.arange(w, **kw), torch.arange(h, **kw)
+    else:
+        idx = torch.arange(side, **kw) + 0.5
+        u, v = idx * w / side - 0.5, idx * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
+
+
 def view0_grid(points: torch.Tensor, frame: SceneFrame, focal_ratio) -> tuple[torch.Tensor, torch.Tensor]:
     """Scene-frame points (..., 3) -> view-0 grid_sample coordinates (..., 2)
     (align_corners=False) and whether they are in front of the camera."""
@@ -192,13 +208,6 @@ def rotate_sh1(sh1: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
     return torch.stack([-w[..., 1, :], w[..., 2, :], -w[..., 0, :]], -2)
 
 
-def points_to_world(points: torch.Tensor, frame: SceneFrame, rotate: bool = True) -> torch.Tensor:
-    """Scene frame -> world; rotate=False for world-aligned points."""
-    if rotate:
-        points = points @ yaw_matrix(frame.yaw).to(points.dtype).T
-    return points * frame.scale.to(points.dtype) + frame.centre.to(points.dtype)
-
-
 def yaw_quat(angle: torch.Tensor) -> torch.Tensor:
     """(4,) wxyz quaternion of a rotation by angle about +z."""
     half = 0.5 * angle
@@ -226,9 +235,10 @@ def to_world(
     """Gaussians, scene frame -> world."""
     if rotate:
         gaussians = rotate_gaussians(gaussians, yaw_matrix(frame.yaw), yaw_quat(frame.yaw))
+    mu = gaussians["mu"]
     return {
         **gaussians,
-        "mu": points_to_world(gaussians["mu"], frame, rotate=False),
+        "mu": mu * frame.scale.to(mu.dtype) + frame.centre.to(mu.dtype),
         "scale": gaussians["scale"] * frame.scale.to(gaussians["scale"].dtype),
     }
 

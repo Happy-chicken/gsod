@@ -22,7 +22,7 @@ from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, ray_box, scene_frame, to_world
+from gsod.utils.geometry import SceneFrame, ray_box, scene_frame, to_world, view0_rays
 from gsod.utils.splatter import GsplatSplatter
 
 # Transparent parts count as a layer at the far depth with this weight.
@@ -59,12 +59,7 @@ def token_points(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
     """(side*side, 3): each token's view-0 ray at mid object height."""
-    h, w = image_size
-    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
-    u = (idx + 0.5) * w / side - 0.5
-    v = (idx + 0.5) * h / side - 0.5
-    vv, uu = torch.meshgrid(v, u, indexing="ij")
-    directions = camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
+    directions = view0_rays(frame, image_size, focal_ratio, side)
     t = ((_ANCHOR_HEIGHT - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
     xy = (frame.origin[:2] + t[:, None] * directions[:, :2]).clamp(-OBJECT_REGION, OBJECT_REGION)
     return torch.cat([xy, torch.full_like(xy[:, :1], _ANCHOR_HEIGHT)], -1)
@@ -178,15 +173,9 @@ class GSODModel(nn.Module):
     @torch.no_grad()
     def box_masks(self, centre: torch.Tensor, extent: torch.Tensor, frame: SceneFrame) -> torch.Tensor:
         """Regions (K, 3) -> where view 0 sees them (K, H, W), bool."""
-        h, w = self.image_size
-        v, u = torch.meshgrid(
-            torch.arange(h, device=centre.device, dtype=centre.dtype),
-            torch.arange(w, device=centre.device, dtype=centre.dtype),
-            indexing="ij",
-        )
-        dirs = camera_directions(u, v, self.image_size, self.focal_ratio).reshape(-1, 3) @ frame.rot.T
+        dirs = view0_rays(frame, self.image_size, self.focal_ratio)
         t_in, t_out = ray_box(frame.origin, dirs, centre - extent, centre + extent)
-        return (t_out > t_in).reshape(-1, h, w)
+        return (t_out > t_in).reshape(-1, *self.image_size)
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
