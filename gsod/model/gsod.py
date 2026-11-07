@@ -60,8 +60,10 @@ def token_points(
 ) -> torch.Tensor:
     """(side*side, 3): each token's view-0 ray at mid object height."""
     h, w = image_size
-    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype) + 0.5
-    vv, uu = torch.meshgrid(idx * h / side - 0.5, idx * w / side - 0.5, indexing="ij")
+    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
+    u = (idx + 0.5) * w / side - 0.5
+    v = (idx + 0.5) * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
     directions = camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
     t = ((_ANCHOR_HEIGHT - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
     xy = (frame.origin[:2] + t[:, None] * directions[:, :2]).clamp(-OBJECT_REGION, OBJECT_REGION)
