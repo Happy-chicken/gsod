@@ -129,16 +129,16 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
-        self.decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
-        self.background = BackgroundDecoder(z_dim, decoder_hidden_dim)
+        self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
+        self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
         return {
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
-            "Decoder": self.decoder,
-            "BgDecoder": self.background,
+            "ObjDecoder": self.obj_decoder,
+            "BgDecoder": self.bg_decoder,
         }
 
     # -- stages ---------------------------------------------------------------
@@ -171,7 +171,7 @@ class GSODModel(nn.Module):
             "frame": frame,
             "focal_ratio": self.focal_ratio,
         }
-        gaussians, _, extent = self.decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
@@ -180,7 +180,7 @@ class GSODModel(nn.Module):
         """Background slot (C,), attention (s*s,), token colours (s*s, 3) ->
         world floor discs (N, ...) and "fill" (3,)."""
         side = self.input_size
-        gaussians = self.background(
+        gaussians = self.bg_decoder(
             bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame, self.focal_ratio
         )
         fill = gaussians.pop("fill")
