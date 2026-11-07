@@ -13,6 +13,7 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 # -- cameras and the floor ----------------------------------------------------
@@ -140,14 +141,16 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
-def view0_grid(points: torch.Tensor, frame: SceneFrame, focal_ratio) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scene-frame points (..., 3) -> view-0 grid_sample coordinates (..., 2)
-    (align_corners=False) and whether they are in front of the camera."""
+def read_view0(points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio) -> torch.Tensor:
+    """Scene-frame points (B, P, 3) -> maps (B, C, s, s) read bilinearly where
+    each point projects in view 0 (B, P, C); 0 behind the camera or off the image."""
     cam = (points - frame.origin) @ frame.rot
     front = cam[..., 2] > 1e-3
     z = torch.where(front, cam[..., 2], torch.ones_like(cam[..., 2]))
+    # grid_sample coordinates (align_corners=False): pixel centres at integers.
     grid = torch.stack([2.0 * focal_ratio[0] * cam[..., 0] / z, 2.0 * focal_ratio[1] * cam[..., 1] / z], -1)
-    return grid, front
+    out = F.grid_sample(maps, grid[:, None], mode="bilinear", align_corners=False)[:, :, 0]
+    return out.transpose(1, 2) * front[..., None]
 
 
 def yaw_matrix(angle: torch.Tensor) -> torch.Tensor:

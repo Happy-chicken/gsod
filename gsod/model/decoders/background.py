@@ -1,7 +1,7 @@
 """Background decoder: background slot -> discs on the floor plane, plus
 one fill colour. Walls are drawn on the floor too. Each disc reads view 0
 where it projects, weighted by the background's attention there
-(detached): sampled colour a*c, base colour a*c + (1 - a) * mean. Where an
+(detached): colour read a*c, base colour a*c + (1 - a) * mean. Where an
 object hides the floor (a ~ 0) the MLP(PE(x), latent, view-0 azimuth, a*c,
 a) fills in, so the background cannot draw an object. Scene frame,
 world-aligned.
@@ -12,11 +12,10 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.objects import OBJECT_REGION
-from gsod.utils.geometry import view0_grid, yaw_matrix
+from gsod.utils.geometry import read_view0, yaw_matrix
 
 _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
@@ -97,7 +96,7 @@ class BackgroundDecoder(nn.Module):
 
     def __init__(self, z_dim: int, hidden_dim: int):
         super().__init__()
-        # Inputs: PE(x), latent, azimuth, sampled a*c (3) and a (1).
+        # Inputs: PE(x), latent, azimuth, a*c (3) and a (1) read from view 0.
         self.appearance = _mlp(3 + 6 * _PE_BANDS + z_dim + 2 + 4, hidden_dim)
         self.head = BackgroundHead(hidden_dim, z_dim + 2)
         mu, spacing = floor_grid()
@@ -105,15 +104,13 @@ class BackgroundDecoder(nn.Module):
         scale = torch.stack([spacing, spacing, torch.full_like(spacing, BACKGROUND_THICKNESS)], -1)
         self.register_buffer("floor_scale", scale, persistent=False)
 
-    def _sample(self, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio):
+    def _read_view0(self, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio):
         """Where each disc projects in view 0: a*c (N, 3) and a (N,), a the
         background's attention (detached), c the colour."""
         points = self.floor_mu @ yaw_matrix(-frame.yaw).to(self.floor_mu.dtype).T  # scene frame
-        grid, front = view0_grid(points, frame, focal_ratio)
         a = attn.detach()[None]
         maps = torch.cat([a * colours, a], 0)[None]  # (1, 4, s, s)
-        out = F.grid_sample(maps, grid[None, None], mode="bilinear", align_corners=False)[0, :, 0].T
-        out = out * front[:, None]  # (N, 4)
+        out = read_view0(points[None], maps, frame, focal_ratio)[0]  # (N, 4)
         return out[:, :3], out[:, 3]
 
     def forward(
@@ -127,7 +124,7 @@ class BackgroundDecoder(nn.Module):
         scene = torch.cat([latent, azimuth])  # (C + 2,)
         n = self.floor_mu.shape[0]
         pe = positional_encoding(self.floor_mu / _HALF, _PE_BANDS)
-        ac, a = self._sample(attn, colours, frame, focal_ratio)
+        ac, a = self._read_view0(attn, colours, frame, focal_ratio)
         base = ac + (1.0 - a)[:, None] * mean
         feat = self.appearance(torch.cat([pe, scene.expand(n, -1), ac, a[:, None]], -1))
         return {

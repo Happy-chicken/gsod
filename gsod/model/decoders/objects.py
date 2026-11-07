@@ -7,7 +7,7 @@ slot's attention-weighted features and colour (dim where the slot holds
 little), its attention, and the background's. It passes n_layers of
 self-attention among cells, cross-attention to tokens from the slot latent
 and FFN, and emits a Gaussian near its centre whose opacity starts at the
-sampled attention. A cell over a background pixel is empty: view 0 sees the
+attention read there. A cell over a background pixel is empty: view 0 sees the
 background through it (visual hull), so its opacity is scaled by
 1 - background attention. Scene frame, lengths in units of R.
 """
@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gsod.utils.geometry import view0_grid
+from gsod.utils.geometry import read_view0
 
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
@@ -33,9 +33,9 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Regions and their Gaussians stay this high above the floor.
 OBJECT_FLOOR = 0.01
-# Sampled features and colours are divided by max(attention, this), so a
-# cell sees little of pixels its slot hardly holds.
-SAMPLE_FLOOR = 0.3
+# Features and colours read from view 0 are divided by max(attention, this),
+# so a cell sees little of pixels its slot hardly holds.
+READ_FLOOR = 0.3
 # Cell Gaussians: scale range in units of the cell's half size, and how far
 # (in cell half sizes) a Gaussian may move from its cell centre.
 CELL_SCALE = (0.25, 4.0)
@@ -109,7 +109,7 @@ class ObjectHead(nn.Module):
         keep: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), cell centres (K, G, 3), cell half sizes (K, 3), view-0
-        attention, colours and visual-hull factor sampled at the cells (K, G),
+        attention, colours and visual-hull factor read at the cells (K, G),
         (K, G, 3), (K, G) -> one Gaussian per cell (K, G, ...)."""
         raw = self.project(feat)
         half = cell_half[:, None]
@@ -186,21 +186,19 @@ class ObjectDecoder(nn.Module):
         self.head = ObjectHead(z_dim, d_model)
 
     @staticmethod
-    def _sample(cells: torch.Tensor, view0: dict):
+    def _read_view0(cells: torch.Tensor, view0: dict):
         """Cells (K, G, 3) -> where each projects in view 0: the slot's
         features (K, G, C) and colours (K, G, 3), both attention-weighted, its
         attention (K, G) and the visual-hull factor 1 - background attention (K, G)."""
-        grid, front = view0_grid(cells, view0["frame"], view0["focal_ratio"])
         attn, features, colours = view0["attn"], view0["features"], view0["colours"]
         K, C = attn.shape[0], features.shape[0]
         a = attn[:, None]
         maps = torch.cat(
             [a * features[None], a, a * colours[None], view0["bg_attn"][None, None].expand(K, -1, -1, -1)], 1
         )
-        out = F.grid_sample(maps, grid[:, None], mode="bilinear", align_corners=False)[:, :, 0]
-        out = out.transpose(1, 2) * front[..., None]  # (K, G, C + 5)
+        out = read_view0(cells, maps, view0["frame"], view0["focal_ratio"])  # (K, G, C + 5)
         a = out[..., C]
-        norm = a[..., None].clamp_min(SAMPLE_FLOOR)
+        norm = a[..., None].clamp_min(READ_FLOOR)
         return out[..., :C] / norm, a, out[..., C + 1 : C + 4] / norm, 1.0 - out[..., C + 4]
 
     def forward(
@@ -215,7 +213,7 @@ class ObjectDecoder(nn.Module):
         cells = centre[:, None] + extent[:, None] * self.cell_grid
         # Detached: reading view 0 cannot move the region or regroup.
         view0 = {**view0, "attn": view0["attn"].detach(), "bg_attn": view0["bg_attn"].detach()}
-        feat, a, colours, keep = self._sample(cells.detach(), view0)
+        feat, a, colours, keep = self._read_view0(cells.detach(), view0)
         position = self.cell_grid.expand(K, -1, -1)
         q = self.cell_embed + self.cell_in(torch.cat([feat, a[..., None], colours, position], -1))
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
