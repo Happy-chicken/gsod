@@ -3,7 +3,8 @@
     encode / slot attention   view 0 -> background slot + K-1 object slots
     decode_objects            object slot (+ view 0 at its region's cells) ->
                               region + one Gaussian per cell
-    decode_background         background slot -> floor discs + fill colour
+    decode_background         background slot (+ view 0 where the floor shows)
+                              -> floor discs + fill colour
     render                    per-slot layers (scaled by draw factor), soft
                               depth order, over the background
 
@@ -194,7 +195,7 @@ class GSODModel(nn.Module):
         world floor discs (N, ...) and "fill" (3,)."""
         side = self.input_size
         gaussians = self.background(
-            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame.yaw
+            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame, self.focal_ratio
         )
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}

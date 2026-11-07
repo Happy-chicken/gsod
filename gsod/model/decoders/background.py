@@ -1,7 +1,10 @@
-"""Background decoder: background slot -> discs on the floor plane, colour
-MLP(PE(x), latent, view-0 azimuth), plus one fill colour. Walls are drawn
-on the floor too. Nothing pixel-aligned, so it cannot draw a missed object.
-Scene frame, world-aligned.
+"""Background decoder: background slot -> discs on the floor plane, plus
+one fill colour. Walls are drawn on the floor too. Each disc reads view 0
+where it projects, weighted by the background's attention there
+(detached): sampled colour a*c, base colour a*c + (1 - a) * mean. Where an
+object hides the floor (a ~ 0) the MLP(PE(x), latent, view-0 azimuth, a*c,
+a) fills in, so the background cannot draw an object. Scene frame,
+world-aligned.
 """
 
 from __future__ import annotations
@@ -9,12 +12,14 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.objects import OBJECT_REGION
+from gsod.utils.geometry import view0_grid, yaw_matrix
 
-_INNER_SIDE = 51  # grid over the object region
-_OUTER_SIDE = 41  # grid over [-_HALF, _HALF]^2, outside the region
+_INNER_SIDE = 101  # grid over the object region (fine enough for texture)
+_OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
 _HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
 BACKGROUND_THICKNESS = 0.005
@@ -63,7 +68,7 @@ class BackgroundHead(nn.Module):
         return torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + self.fill_out(scene))
 
     def colour(self, feat: torch.Tensor, mean: torch.Tensor) -> dict[str, torch.Tensor]:
-        """feat (N, d) -> rgb (residual on mean (3,)), sh1 (N, 3, 3)."""
+        """feat (N, d) -> rgb (residual on a base colour, (3,) or (N, 3)), sh1 (N, 3, 3)."""
         residual = self.colour_out(feat)
         return {
             "rgb": torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + residual),
@@ -92,29 +97,44 @@ class BackgroundDecoder(nn.Module):
 
     def __init__(self, z_dim: int, hidden_dim: int):
         super().__init__()
-        self.appearance = _mlp(3 + 6 * _PE_BANDS + z_dim + 2, hidden_dim)
+        # Inputs: PE(x), latent, azimuth, sampled a*c (3) and a (1).
+        self.appearance = _mlp(3 + 6 * _PE_BANDS + z_dim + 2 + 4, hidden_dim)
         self.head = BackgroundHead(hidden_dim, z_dim + 2)
         mu, spacing = floor_grid()
         self.register_buffer("floor_mu", mu, persistent=False)
         scale = torch.stack([spacing, spacing, torch.full_like(spacing, BACKGROUND_THICKNESS)], -1)
         self.register_buffer("floor_scale", scale, persistent=False)
 
+    def _sample(self, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio):
+        """Where each disc projects in view 0: a*c (N, 3) and a (N,), a the
+        background's attention (detached), c the colour."""
+        points = self.floor_mu @ yaw_matrix(-frame.yaw).to(self.floor_mu.dtype).T  # scene frame
+        grid, front = view0_grid(points, frame, focal_ratio)
+        a = attn.detach()[None]
+        maps = torch.cat([a * colours, a], 0)[None]  # (1, 4, s, s)
+        out = F.grid_sample(maps, grid[None, None], mode="bilinear", align_corners=False)[0, :, 0].T
+        out = out * front[:, None]  # (N, 4)
+        return out[:, :3], out[:, 3]
+
     def forward(
-        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, yaw: torch.Tensor
+        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio
     ) -> dict[str, torch.Tensor]:
         """latent (C,), attn (s, s) background attention, colours (3, s, s),
-        yaw: view 0's azimuth -> Gaussians and "fill" (3,)."""
+        view 0's SceneFrame and focal ratio -> Gaussians and "fill" (3,)."""
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
+        yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
         scene = torch.cat([latent, azimuth])  # (C + 2,)
         n = self.floor_mu.shape[0]
         pe = positional_encoding(self.floor_mu / _HALF, _PE_BANDS)
-        feat = self.appearance(torch.cat([pe, scene.expand(n, -1)], -1))
+        ac, a = self._sample(attn, colours, frame, focal_ratio)
+        base = ac + (1.0 - a)[:, None] * mean
+        feat = self.appearance(torch.cat([pe, scene.expand(n, -1), ac, a[:, None]], -1))
         return {
             "mu": self.floor_mu,
             "scale": self.floor_scale,
             "quat": self.floor_mu.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(n, -1),
             "opacity": self.head.opacity(feat),
-            **self.head.colour(feat, mean),
+            **self.head.colour(feat, base),
             "fill": self.head.fill(scene, mean),
         }

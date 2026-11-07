@@ -11,7 +11,7 @@ from gsod.utils.io import default_out_dir
 class LossConfig:
     l1: float = 1.0  # novel views
     ssim: float = 0.2  # novel views
-    view0: float = 1.0  # L1 on the encoded view
+    view0: float = 0.5  # L1 on the encoded view (cells read it: copying is cheap)
 
 
 @dataclass
