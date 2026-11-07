@@ -185,11 +185,6 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d_model, n_heads) for _ in range(n_layers))
         self.head = ObjectHead(z_dim, d_model)
 
-    @property
-    def extent_range(self) -> tuple[float, float]:
-        """xy half width range (units of R)."""
-        return float(self.head.size_lo[0]), float(self.head.size_hi[0])
-
     @staticmethod
     def _sample(cells: torch.Tensor, view0: dict):
         """Cells (K, G, 3) -> where each projects in view 0: the slot's

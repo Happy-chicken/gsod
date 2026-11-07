@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BRANCH=claude/charming-lamport-iy8f83
+BRANCH=claude/relaxed-cannon-qtduhi
 URL="https://github.com/Happy-chicken/gsod/archive/refs/heads/${BRANCH}.zip"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

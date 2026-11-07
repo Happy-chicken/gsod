@@ -104,8 +104,7 @@ def evaluate(model: GSODModel, dataset, device: torch.device, n_images: int = 0)
 def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     """One forward pass, as numpy."""
     images = item["images"].to(device)
-    masks = item["masks"][0].to(device) if model.oracle_masks else None
-    result = model(images, item["cam2world"].to(device), masks=masks)
+    result = model(images, item["cam2world"].to(device))
     rgb = result["rgb"].clamp(0, 1)
     n_views = images.shape[0]
     novel_ssim = [float(ssim(rgb[v : v + 1], images[v : v + 1])) for v in range(1, n_views)]

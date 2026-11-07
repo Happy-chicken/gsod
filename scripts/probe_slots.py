@@ -51,12 +51,7 @@ def collect(model, dataset, device, size: int) -> tuple[torch.Tensor, torch.Tens
         if item.get("masks") is None:
             raise ValueError("the probe needs GT masks")
         gt = item["masks"][0].to(device)
-        scene = model(
-            item["images"].to(device),
-            item["cam2world"].to(device),
-            render=False,
-            masks=gt if model.oracle_masks else None,
-        )
+        scene = model(item["images"].to(device), item["cam2world"].to(device), render=False)
         tokens = F.interpolate(gt[None, None].float(), size=side, mode="nearest")[0, 0].long().flatten()
         labels = [l for l in tokens.unique() if l > 0]
         for k in range(1, scene["attn"].shape[0]):
