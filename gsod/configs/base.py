@@ -12,7 +12,7 @@ class LossConfig:
     l1: float = 1.0  # novel views
     ssim: float = 0.2  # novel views
     view0: float = 1.0  # L1 on the encoded view
-    percept: float = 0.006  # VGG16 relu4_3 feature MSE, every view (as uORF)
+    percept: float = 0.0  # VGG16 relu4_3 feature MSE, every view (uORF: 0.006)
     percept_from: float = 0.1  # share of training before it starts
 
 
@@ -26,6 +26,7 @@ class BaseConfig:
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
     near: float = 0.1
+    oracle_masks: bool = False  # diagnostic: view-0 GT masks replace slot attention
 
     # --- optimisation (one scene per step; ramps as fractions of training)
     epochs: int = 100

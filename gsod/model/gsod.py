@@ -50,6 +50,19 @@ def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
     return DRAW_FLOOR + (1.0 - DRAW_FLOOR) * f
 
 
+def oracle_attention(mask: torch.Tensor, num_slots: int, side: int) -> torch.Tensor:
+    """Diagnostic: view-0 GT labels (H, W), 0 = background -> attention
+    (K, side*side): the background, then one object per slot, largest first
+    (extra objects join the background; spare slots hold nothing)."""
+    labels = [int(l) for l in mask.unique() if l != 0]
+    labels = sorted(labels, key=lambda l: -int((mask == l).sum()))[: num_slots - 1]
+    objects = [(mask == l).float() for l in labels]
+    rows = [1.0 - sum(objects, torch.zeros_like(mask, dtype=torch.float32))] + objects
+    rows += [torch.zeros_like(rows[0])] * (num_slots - len(rows))
+    small = F.interpolate(torch.stack(rows)[None], size=side, mode="area")[0]
+    return small.flatten(1).clamp_min(1e-8)
+
+
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
 _CORNERS = [[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
 
@@ -116,8 +129,10 @@ class GSODModel(nn.Module):
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
+        oracle_masks: bool = False,
     ):
-        """num_slots: K, the background slot included."""
+        """num_slots: K, the background slot included; oracle_masks: forward
+        takes view 0's GT mask in place of slot attention (diagnostic)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
         self.splat = GsplatSplatter()
@@ -125,6 +140,8 @@ class GSODModel(nn.Module):
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
+        self.num_slots = num_slots
+        self.oracle_masks = oracle_masks
         self.draw_power = 1.0
 
         self.encoder = Encoder(3, z_dim=z_dim)
@@ -210,11 +227,22 @@ class GSODModel(nn.Module):
         }
 
     def forward(
-        self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True
+        self,
+        images: torch.Tensor,
+        cam2world: torch.Tensor,
+        render: bool = True,
+        masks: torch.Tensor | None = None,
     ) -> dict:
-        """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4) -> render
-        outputs, or with render=False the decoded scene."""
-        bg_slot, slots, attn = (x[0] for x in self.slot_attention(self.encode(images[0:1])))
+        """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4); masks: view 0's
+        GT labels (H, W), oracle_masks only -> render outputs, or with
+        render=False the decoded scene."""
+        fixed = None
+        if self.oracle_masks:
+            if masks is None:
+                raise ValueError("oracle_masks: forward needs view 0's GT mask")
+            fixed = oracle_attention(masks, self.num_slots, self.input_size)[None].to(images.dtype)
+        tokens = self.encode(images[0:1])
+        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens, fixed))
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {

@@ -101,10 +101,11 @@ class GSODTraining(L.LightningModule):
         ref = self.rng.randrange(images.shape[0])
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order], cams[order]
+        masks = item["masks"][ref] if self.cfg.oracle_masks else None
         progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
         self.model.draw_power = _ramp(progress, 0.0, self.cfg.draw_ramp)
         self.criterion.percept_on = progress >= self.cfg.loss.percept_from
-        outputs = self.model(images, cams)
+        outputs = self.model(images, cams, masks=masks)
         loss, terms = self.criterion(outputs, images)
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
         self.log("train/view0", terms["view0"], batch_size=1)
@@ -200,7 +201,12 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
         val_fraction=cfg.val_fraction,
         seed=cfg.seed,
     )
-    train_set = _first(make_dataset(cfg.data_root, "train", **dataset_kwargs), cfg.train_scenes)
+    train_set = make_dataset(cfg.data_root, "train", load_masks=cfg.oracle_masks, **dataset_kwargs)
+    if cfg.oracle_masks and cfg.dataset_mode == "primordia":
+        train_set = WithGTMasks(train_set, cfg.data_root)
+    train_set = _first(train_set, cfg.train_scenes)
+    if cfg.oracle_masks and not _has_masks(train_set):
+        raise ValueError(f"--oracle-masks: no GT masks in {cfg.data_root}")
     val_set = make_dataset(cfg.data_root, "val", load_masks=True, **dataset_kwargs)
     if cfg.dataset_mode == "primordia":
         val_set = WithGTMasks(val_set, cfg.data_root)
@@ -286,6 +292,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
+    parser.add_argument(
+        "--oracle-masks", action="store_true", help="diagnostic: GT masks replace slot attention"
+    )
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
 
@@ -323,6 +332,8 @@ def main() -> None:
         for field in fields
         if getattr(args, field) is not None
     }
+    if args.oracle_masks:
+        values["oracle_masks"] = True
     if args.data is not None:
         values["data_root"] = args.data
     if args.out is not None:

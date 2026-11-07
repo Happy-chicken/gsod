@@ -113,7 +113,9 @@ class SlotAttention(nn.Module):
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, n, d)
         return slots + res(slots)
 
-    def forward(self, feat: torch.Tensor):
+    def forward(self, feat: torch.Tensor, fixed_attn: torch.Tensor | None = None):
+        """fixed_attn (b, K, N): used instead of the computed attention
+        (diagnostic, gsod.oracle_attention)."""
         b = feat.shape[0]
         grid = self._grid(feat.shape[1], feat.device)
         feat = feat + self.pos_proj(grid)
@@ -138,7 +140,7 @@ class SlotAttention(nn.Module):
                 fg = fg + fg_init - fg_init.detach()
             q = torch.cat([self.to_q_bg(bg), self.to_q(fg)], dim=1)  # (b, K, D)
             dots = tau * torch.einsum("bid,bjd->bij", F.normalize(q, dim=-1), k)
-            attn = dots.softmax(dim=1) + self.eps
+            attn = dots.softmax(dim=1) + self.eps if fixed_attn is None else fixed_attn
             attn_w = attn / attn.sum(dim=-1, keepdim=True)
             updates = torch.einsum("bjd,bij->bid", v, attn_w)  # (b, K, D)
             bg = self._update(self.gru_bg, self.to_res_bg, updates[:, :1], bg)
