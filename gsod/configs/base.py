@@ -12,6 +12,8 @@ class LossConfig:
     l1: float = 1.0  # novel views
     ssim: float = 0.2  # novel views
     view0: float = 1.0  # L1 on the encoded view
+    percept: float = 0.006  # VGG16 relu4_3 feature MSE, every view (as uORF)
+    percept_from: float = 0.1  # share of training before it starts
 
 
 @dataclass
