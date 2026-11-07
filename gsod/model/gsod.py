@@ -34,7 +34,7 @@ FULL_OCCUPANCY = 0.8
 COUNT_HALF = 1.0
 # Every object slot is drawn at least this much, so a slot that lost its
 # tokens still gets gradient and can recover.
-DRAW_FLOOR = 0.05
+MIN_DRAW = 0.05
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
@@ -42,14 +42,14 @@ def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
 
         f = min(1, occupancy / FULL_OCCUPANCY)^power * count / (count + COUNT_HALF)
         occupancy = sum a^2 / sum a,  count = sum a
-        draw = DRAW_FLOOR + (1 - DRAW_FLOOR) * f
+        draw = MIN_DRAW + (1 - MIN_DRAW) * f
 
     A split object costs coverage, so one owner is preferred."""
     count = attn.sum(-1)
     occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
     share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
     f = share.pow(power) * count / (count + COUNT_HALF)
-    return DRAW_FLOOR + (1.0 - DRAW_FLOOR) * f
+    return MIN_DRAW + (1.0 - MIN_DRAW) * f
 
 
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])

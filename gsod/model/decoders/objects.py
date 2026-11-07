@@ -32,10 +32,10 @@ OBJECT_HEIGHT = 1.2
 # Initial region size (share of its range).
 EXTENT_INIT = 0.9
 # Regions and their Gaussians stay this high above the floor.
-OBJECT_FLOOR = 0.01
+MIN_HEIGHT = 0.01
 # Features and colours read from view 0 are divided by max(attention, this),
 # so a cell sees little of pixels its slot hardly holds.
-READ_FLOOR = 0.3
+MIN_ATTN = 0.3
 # Cell Gaussians: scale range in units of the cell's half size, and how far
 # (in cell half sizes) a Gaussian may move from its cell centre.
 CELL_SCALE = (0.25, 4.0)
@@ -91,13 +91,13 @@ class ObjectHead(nn.Module):
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """slots (K, C), anchor, ray (K, 3) -> region centre, half sizes (K, 3).
-        The region stands on the floor: z from OBJECT_FLOOR up twice its half height."""
+        The region stands on the floor: z from MIN_HEIGHT up twice its half height."""
         ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
         t = self.shift_bound * torch.tanh(self.shift(slots))
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
         extent = self.size_lo + (self.size_hi - self.size_lo) * torch.sigmoid(self.size(slots))
-        return torch.cat([xy, OBJECT_FLOOR + extent[:, 2:]], -1), extent
+        return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
 
     def forward(
         self,
@@ -115,7 +115,7 @@ class ObjectHead(nn.Module):
         half = cell_half[:, None]
         mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
         return {
-            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(OBJECT_FLOOR)], -1),
+            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
             "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(torch.logit(attn.clamp(0.02, 0.98)) + raw[..., 10]) * keep,
@@ -198,7 +198,7 @@ class ObjectDecoder(nn.Module):
         )
         out = read_view0(cells, maps, view0["frame"], view0["focal_ratio"])  # (K, G, C + 5)
         a = out[..., C]
-        norm = a[..., None].clamp_min(READ_FLOOR)
+        norm = a[..., None].clamp_min(MIN_ATTN)
         return out[..., :C] / norm, a, out[..., C + 1 : C + 4] / norm, 1.0 - out[..., C + 4]
 
     def forward(
