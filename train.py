@@ -107,7 +107,6 @@ class GSODTraining(L.LightningModule):
         loss, terms = self.criterion(outputs, images)
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
         self.log("train/view0", terms["view0"], batch_size=1)
-        self.log("train/draw_power", self.model.draw_power, batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
         return loss
 

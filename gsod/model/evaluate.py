@@ -6,7 +6,6 @@ Metrics (nan without GT masks), averaged per scene:
     diag    attn_fg_ari        attention argmax (background included) vs GT
             obj_recall         GT objects with an owning slot
             n_duplicate        objects split over slots
-            n_merged           slots holding several objects
             fg_on_bg           GT background drawn by object slots
             gt_outside_box     object pixels outside its slot's region (view 0)
 
@@ -42,7 +41,6 @@ DIAGNOSTIC_KEYS = (
     "attn_fg_ari",
     "obj_recall",
     "n_duplicate",
-    "n_merged",
     "fg_on_bg",
     "gt_outside_box",
 )
@@ -56,13 +54,11 @@ SLOT_COLUMNS = (
     "iou",
     "draw",
     "occupancy",
-    "count",
     "extent_x",
     "extent_y",
+    "extent_z",
     "gt_outside",
 )
-# Share of a GT object's pixels a slot must hold to count as holding it.
-MERGED_SHARE = 0.3
 # Share of a GT object's pixels one object slot must own for it to be found.
 OBJECT_FOUND = 0.5
 # An object slot owning fewer view-0 pixels than this draws nothing.
@@ -131,7 +127,6 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "alpha": np_(result["slot_alpha"]),  # (V, K, H, W), 0 = uncovered
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (V, H, W)
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
-        "count": count,
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
         "extent": np_(result["extent"]),  # (K-1, 3)
@@ -158,10 +153,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
     bg = gt[0] == 0
     roles = [row["role"] for row in rows]
     objects = [r for r in rows if r["role"] == "object"]
-    holds = [
-        sum((mask[0][gt[0] == o] == r["slot"]).mean() > MERGED_SHARE for o in np.unique(gt[0]) if o > 0)
-        for r in rows
-    ]
     out.update(
         {
             "ari": ari(gt[0], mask[0]),
@@ -171,7 +162,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
             "attn_fg_ari": fg_ari(gt[0], attn.argmax(0)),
             "obj_recall": object_recall(gt[0], mask[0]),
             "n_duplicate": float(roles.count("duplicate")),
-            "n_merged": float(sum(h >= 2 for h in holds)),
             "fg_on_bg": float(1.0 - rec["alpha"][0, 0][bg].mean()) if bg.any() else NAN,
             "gt_outside_box": _nanmean([r["gt_outside"] for r in objects]),
         }
@@ -194,9 +184,9 @@ def slot_table(rec: dict) -> list[dict]:
             "iou": NAN,
             "draw": float(rec["draw"][k - 1]),
             "occupancy": float(rec["occupancy"][k - 1]),
-            "count": float(rec["count"][k - 1]),
             "extent_x": float(rec["extent"][k - 1, 0]),
             "extent_y": float(rec["extent"][k - 1, 1]),
+            "extent_z": float(rec["extent"][k - 1, 2]),
             "gt_outside": NAN,
         }
         if pixels.sum() >= MIN_SLOT_PIXELS:
