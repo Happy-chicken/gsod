@@ -9,7 +9,6 @@ Metrics (nan without GT masks), averaged per scene:
             n_merged           slots holding several objects
             fg_on_bg           GT background drawn by object slots
             gt_outside_region  object pixels outside its slot's region
-            pixel_drawn        object pixels its slot's pixel Gaussians draw
 
 Slot roles: object, duplicate, haze (on background), empty, draws (no GT).
 """
@@ -46,7 +45,6 @@ DIAGNOSTIC_KEYS = (
     "n_merged",
     "fg_on_bg",
     "gt_outside_region",
-    "pixel_drawn",
 )
 METRIC_KEYS = SEGMENTATION_KEYS + RECONSTRUCTION_KEYS + DIAGNOSTIC_KEYS
 
@@ -123,9 +121,6 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     attn = np_(result["attn"])
     count = attn[1:].sum(-1)
     occupancy = (attn[1:] ** 2).sum(-1) / np.maximum(count, 1e-8)
-    pixel = result["pixel_opacity"]
-    # Pixel Gaussian opacities, scaled by the draw factor as in the render.
-    pixel = None if pixel is None else np_(pixel * result["draw"][:, None]).reshape(-1, side, side)
     return {
         "scene": int(item.get("scene", -1)),
         "target": np_(images),
@@ -139,7 +134,6 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "count": count,
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
-        "pixel": pixel,  # (K-1, s, s) or None
         "extent": np_(result["extent"]),  # (K-1, 3)
         "region_box": _project_boxes(
             np_(result["corners"]),
@@ -173,10 +167,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
         sum((mask[0][gt[0] == o] == r["slot"]).mean() > MERGED_SHARE for o in np.unique(gt[0]) if o > 0)
         for r in rows
     ]
-    drawn = NAN
-    if rec["pixel"] is not None:
-        pixel = np.stack([upsample_labels(p, size) for p in rec["pixel"]])  # nearest
-        drawn = _nanmean([(pixel[r["slot"] - 1][gt[0] == r["gt_object"]] > 0.5).mean() for r in objects])
     out.update(
         {
             "ari": ari(gt[0], mask[0]),
@@ -189,7 +179,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
             "n_merged": float(sum(h >= 2 for h in holds)),
             "fg_on_bg": float(1.0 - rec["alpha"][0, 0][bg].mean()) if bg.any() else NAN,
             "gt_outside_region": _nanmean([r["gt_outside"] for r in objects]),
-            "pixel_drawn": drawn,
         }
     )
     return out

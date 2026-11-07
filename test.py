@@ -18,6 +18,7 @@ from pathlib import Path
 
 import torch
 import wandb
+from torch.utils.data import Subset
 
 from gsod.configs import DATASETS, config_for
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
@@ -52,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--out", default=None, help="output directory for PNGs")
     parser.add_argument("--no-render", action="store_true", help="skip the PNG renders")
+    parser.add_argument("--scenes", type=int, default=None, help="first N scenes of the split")
     return parser.parse_args()
 
 
@@ -95,6 +97,8 @@ def main() -> None:
     )
     if cfg.dataset_mode == "primordia":
         dataset = WithGTMasks(dataset, data_root)
+    if args.scenes is not None and args.scenes < len(dataset):
+        dataset = Subset(dataset, range(args.scenes))
     result = evaluate(model, dataset, device, IMAGE_SCENES)
     groups = {
         "seg": SEGMENTATION_KEYS,
