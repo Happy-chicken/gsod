@@ -13,14 +13,13 @@ import argparse
 import csv
 import json
 import math
-from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
 import wandb
 from torch.utils.data import Subset
 
-from gsod.configs import DATASETS, config_for
+from gsod.configs import DATASETS, config_for, run_config
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model
 from gsod.model.evaluate import (
@@ -152,29 +151,6 @@ def main() -> None:
             rec = collect(model, dataset[i], device)
             save_panels(panels(rec, slot_table(rec)), out / f"sc{rec['scene']:04d}")
         print(f"wrote the panels of {len(dataset)} scenes to {out}")
-
-
-MODEL_FIELDS = (
-    "input_size",
-    "z_dim",
-    "num_slots",
-    "attn_iter",
-    "gaussians_per_slot",
-    "decoder_hidden_dim",
-    "near",
-    "oracle_masks",
-)
-
-
-def run_config(cfg, checkpoint: Path):
-    """cfg with the model fields of the run's config.json, if any."""
-    path = checkpoint / "config.json"
-    if not path.is_file():
-        print(f"no {path}: building the model from the {cfg.dataset_mode} profile")
-        return cfg
-    saved = json.loads(path.read_text())
-    known = {f.name for f in fields(cfg)}
-    return replace(cfg, **{k: saved[k] for k in MODEL_FIELDS if k in saved and k in known})
 
 
 def _write_csv(path: Path, rows: list[dict], columns: list[str] | None = None) -> None:

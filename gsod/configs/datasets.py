@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
 
 from gsod.configs.base import BaseConfig
 from gsod.utils.io import default_out_dir
@@ -65,3 +67,26 @@ def config_for(dataset_mode: str) -> BaseConfig:
     if dataset_mode not in PROFILES:
         raise ValueError(f"dataset_mode must be one of {DATASETS}, got {dataset_mode!r}")
     return PROFILES[dataset_mode]()
+
+
+MODEL_FIELDS = (
+    "input_size",
+    "z_dim",
+    "num_slots",
+    "attn_iter",
+    "gaussians_per_slot",
+    "decoder_hidden_dim",
+    "near",
+    "oracle_masks",
+)
+
+
+def run_config(cfg, checkpoint: str | Path):
+    """cfg with the model fields of the run's config.json, if any."""
+    path = Path(checkpoint) / "config.json"
+    if not path.is_file():
+        print(f"no {path}: building the model from the {cfg.dataset_mode} profile")
+        return cfg
+    saved = json.loads(path.read_text())
+    known = {f.name for f in fields(cfg)}
+    return replace(cfg, **{k: saved[k] for k in MODEL_FIELDS if k in saved and k in known})
