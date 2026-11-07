@@ -22,7 +22,7 @@ from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, ray_box, scene_frame, to_world, view0_rays
+from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
 from gsod.utils.splatter import GsplatSplatter
 
 # Transparent parts count as a layer at the far depth with this weight.
@@ -59,7 +59,10 @@ def token_points(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
     """(side*side, 3): each token's view-0 ray at mid object height."""
-    directions = view0_rays(frame, image_size, focal_ratio, side)
+    h, w = image_size
+    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype) + 0.5
+    vv, uu = torch.meshgrid(idx * h / side - 0.5, idx * w / side - 0.5, indexing="ij")
+    directions = camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
     t = ((_ANCHOR_HEIGHT - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
     xy = (frame.origin[:2] + t[:, None] * directions[:, :2]).clamp(-OBJECT_REGION, OBJECT_REGION)
     return torch.cat([xy, torch.full_like(xy[:, :1], _ANCHOR_HEIGHT)], -1)
@@ -153,8 +156,7 @@ class GSODModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
         and features (s*s, C), the background's attention (s*s,) -> world
-        Gaussians (K-1, G, ...), region "centre" and half sizes "extent"
-        (K-1, 3, scene frame)."""
+        Gaussians (K-1, G, ...) and region half sizes "extent" (K-1, 3)."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor = attention_anchors(attn, points)
@@ -167,15 +169,8 @@ class GSODModel(nn.Module):
             "frame": frame,
             "focal_ratio": self.focal_ratio,
         }
-        gaussians, centre, extent = self.decoder(slots, anchor=anchor, ray=ray, view0=view0)
-        return {"gaussians": to_world(gaussians, frame), "centre": centre, "extent": extent}
-
-    @torch.no_grad()
-    def box_masks(self, centre: torch.Tensor, extent: torch.Tensor, frame: SceneFrame) -> torch.Tensor:
-        """Regions (K, 3) -> where view 0 sees them (K, H, W), bool."""
-        dirs = view0_rays(frame, self.image_size, self.focal_ratio)
-        t_in, t_out = ray_box(frame.origin, dirs, centre - extent, centre + extent)
-        return (t_out > t_in).reshape(-1, *self.image_size)
+        gaussians, _, extent = self.decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -206,7 +201,7 @@ class GSODModel(nn.Module):
         far = (frame.origin.norm() + 2.0 * OBJECT_REGION) * frame.scale
         image, weights, slot_rgb = composite(layers, tau, far, bg_rgb)
 
-        out = {
+        return {
             "rgb": image,  # (N, 3, H, W)
             "fg_rgb": slot_rgb.sum(1),
             "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W)
@@ -217,9 +212,6 @@ class GSODModel(nn.Module):
             "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
-        if not self.training:  # (K-1, H, W): where view 0 sees each region
-            out["box_mask"] = self.box_masks(scene["objects"]["centre"], scene["objects"]["extent"], frame)
-        return out
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
         """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4) -> render

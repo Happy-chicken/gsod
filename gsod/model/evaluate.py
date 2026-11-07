@@ -7,7 +7,6 @@ Metrics (nan without GT masks), averaged per scene:
             obj_recall         GT objects with an owning slot
             n_duplicate        objects split over slots
             fg_on_bg           GT background drawn by object slots
-            gt_outside_box     object pixels outside its slot's region (view 0)
 
 Slot roles: object, duplicate, haze (on background), empty, draws (no GT).
 """
@@ -42,7 +41,6 @@ DIAGNOSTIC_KEYS = (
     "obj_recall",
     "n_duplicate",
     "fg_on_bg",
-    "gt_outside_box",
 )
 METRIC_KEYS = SEGMENTATION_KEYS + RECONSTRUCTION_KEYS + DIAGNOSTIC_KEYS
 
@@ -57,7 +55,6 @@ SLOT_COLUMNS = (
     "extent_x",
     "extent_y",
     "extent_z",
-    "gt_outside",
 )
 # Share of a GT object's pixels one object slot must own for it to be found.
 OBJECT_FOUND = 0.5
@@ -130,7 +127,6 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
         "extent": np_(result["extent"]),  # (K-1, 3)
-        "box_mask": result["box_mask"].cpu().numpy(),  # (K-1, H, W) region in view 0
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
@@ -152,7 +148,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
     attn = np.stack([upsample_labels(a, size) for a in rec["attn"]])  # nearest
     bg = gt[0] == 0
     roles = [row["role"] for row in rows]
-    objects = [r for r in rows if r["role"] == "object"]
     out.update(
         {
             "ari": ari(gt[0], mask[0]),
@@ -163,7 +158,6 @@ def scene_metrics(rec: dict, rows: list[dict]) -> dict[str, float]:
             "obj_recall": object_recall(gt[0], mask[0]),
             "n_duplicate": float(roles.count("duplicate")),
             "fg_on_bg": float(1.0 - rec["alpha"][0, 0][bg].mean()) if bg.any() else NAN,
-            "gt_outside_box": _nanmean([r["gt_outside"] for r in objects]),
         }
     )
     return out
@@ -187,7 +181,6 @@ def slot_table(rec: dict) -> list[dict]:
             "extent_x": float(rec["extent"][k - 1, 0]),
             "extent_y": float(rec["extent"][k - 1, 1]),
             "extent_z": float(rec["extent"][k - 1, 2]),
-            "gt_outside": NAN,
         }
         if pixels.sum() >= MIN_SLOT_PIXELS:
             row["role"] = "draws"
@@ -198,7 +191,6 @@ def slot_table(rec: dict) -> list[dict]:
                     target = gt[0] == obj
                     row["gt_object"] = obj
                     row["iou"] = float((pixels & target).sum() / (pixels | target).sum())
-                    row["gt_outside"] = float(1.0 - rec["box_mask"][k - 1][target].mean())
                     row["role"] = "object"
                 else:
                     row["role"] = "haze"
