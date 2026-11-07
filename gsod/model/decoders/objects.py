@@ -1,8 +1,9 @@
 """Object decoder: object slot -> region + G Gaussians in it.
 
 The region sits around the attention anchor (shifted along view 0's ray),
-sized from the slot latent. G shared learned queries attend to tokens from
-the slot latent. Opacities are max-normalised: visibility is the draw
+sized from the slot latent. G shared learned queries pass n_layers of
+self-attention (among themselves), cross-attention (to tokens from the slot
+latent) and FFN. Opacities are max-normalised: visibility is the draw
 factor alone. Scene frame, lengths in units of R.
 """
 
@@ -25,7 +26,7 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Gaussian scale range and initial value (units of r_max).
 SCALE_RANGE = (1.0 / 40.0, 1.0)
-SCALE_INIT = 1.0 / 8.0
+SCALE_INIT = 1.0 / 16.0
 
 
 def _logit(p: float) -> float:
@@ -110,6 +111,31 @@ class ObjectHead(nn.Module):
         }
 
 
+class DecoderLayer(nn.Module):
+    """Self-attention among the Gaussian queries (so they can form parts
+    together), cross-attention to the slot tokens, FFN; pre-norm."""
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.norm_self = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_q = nn.LayerNorm(d_model)
+        self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model),
+        )
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """q (K, G, d), slot tokens k, v (K, M, d) -> (K, G, d)."""
+        x = self.norm_self(q)
+        q = q + self.self_attn(x, x, x, need_weights=False)[0]
+        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
+        return q + self.ffn(self.norm_ff(q))
+
+
 class ObjectDecoder(nn.Module):
     """Object slots -> regions and Gaussians, scene frame."""
 
@@ -121,6 +147,7 @@ class ObjectDecoder(nn.Module):
         *,
         n_heads: int = 4,
         n_tokens: int = 8,
+        n_layers: int = 2,
         query_std: float = 2.0,
     ):
         """hidden_dim: the attention width."""
@@ -136,25 +163,14 @@ class ObjectDecoder(nn.Module):
         self.k_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.v_proj = nn.Linear(z_dim, n_tokens * d_model)
 
-        self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
-        self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm_ff = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.GELU(),
-            nn.Linear(2 * d_model, d_model),
-        )
+        self.layers = nn.ModuleList(DecoderLayer(d_model, n_heads) for _ in range(n_layers))
         self.head = ObjectHead(z_dim, d_model)
 
     @property
     def extent_range(self) -> tuple[float, float]:
         """xy half width range (units of R)."""
         return float(self.head.size_lo[0]), float(self.head.size_hi[0])
-
-    def _attend(self, q, k, v):
-        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
-        return q + self.ffn(self.norm_ff(q))
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
@@ -166,4 +182,6 @@ class ObjectDecoder(nn.Module):
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         q = self.queries.unsqueeze(0).expand(K, -1, -1)
-        return self.head(self._attend(q, k, v), slots, centre, extent, colour), centre, extent
+        for layer in self.layers:
+            q = layer(q, k, v)
+        return self.head(q, slots, centre, extent, colour), centre, extent
