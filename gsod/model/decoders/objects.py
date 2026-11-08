@@ -1,8 +1,8 @@
 """Object decoder: object slot -> region + one Gaussian per region cell.
 
-The region stands just above the floor around the attention anchor (shifted
-along view 0's ray), sized from the slot latent. It holds side^3 cells. Each
-cell reads view 0 where it projects (region and attention detached): the
+The region (RegionHead, an MLP on the slot latent) stands just above the
+floor around the attention anchor, shifted along view 0's ray and sized. It
+holds side^3 cells. Each cell reads view 0 where it projects (region and attention detached): the
 slot's attention-weighted features and colour (dim where the slot holds
 little), its attention, and the background's. It passes n_layers of
 self-attention among cells, cross-attention to tokens from the slot latent
@@ -61,43 +61,52 @@ def _projection(d_model: int, n_params: int) -> nn.Sequential:
     return mlp
 
 
-class ObjectHead(nn.Module):
-    """The region from the slot latent; per cell raw parameters: offset 3,
-    scale 3, quat 4, opacity 1, rgb 3, sh1 9."""
+class RegionHead(nn.Module):
+    """Slot latent -> the slot's region: a small MLP gives the shift along
+    view 0's ray and across it (on the floor) and the half sizes (x, y, z).
+    The output layer starts at zero: every region starts at the anchor, at
+    EXTENT_INIT of its size range."""
 
-    def __init__(self, z_dim: int, d_model: int):
+    def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
         r_min, r_max = OBJECT_RADIUS
-        self.project = _projection(d_model, 23)
-        # Region shift along (view 0's ray, across it) on the floor, and half sizes.
-        self.shift = nn.Linear(z_dim, 2)
-        self.size = nn.Linear(z_dim, 3)
+        self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
         self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
         self.register_buffer("size_lo", torch.tensor([r_min, r_min, r_min]), persistent=False)
         self.register_buffer("size_hi", torch.tensor(
             [OBJECT_WIDTH * r_max, OBJECT_WIDTH * r_max, OBJECT_HEIGHT * r_max]), persistent=False)
+        with torch.no_grad():
+            self.mlp[-1].weight.zero_()
+            self.mlp[-1].bias.zero_()
+            self.mlp[-1].bias[2:] = _logit(EXTENT_INIT)
+
+    def forward(
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """slots (K, C), anchor, ray (K, 3) -> region centre, half sizes (K, 3).
+        The region stands on the floor: z from MIN_HEIGHT up twice its half height."""
+        raw = self.mlp(slots)
+        ray_xy = F.normalize(ray[:, :2], dim=-1)
+        across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
+        t = self.shift_bound * torch.tanh(raw[:, :2])
+        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
+        extent = self.size_lo + (self.size_hi - self.size_lo) * torch.sigmoid(raw[:, 2:])
+        return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
+
+
+class ObjectHead(nn.Module):
+    """Cell feature -> raw Gaussian parameters: offset 3, scale 3, quat 4,
+    opacity 1, rgb 3, sh1 9."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.project = _projection(d_model, 23)
         lo, hi = (math.log(s) for s in CELL_SCALE)
         with torch.no_grad():
             bias = self.project[-1].bias
             bias[3:6] = _logit(-lo / (hi - lo))  # scale = half a cell at first
             bias[6] = 1.0  # identity quaternion (wxyz)
             self.project[-1].weight[14:].zero_()  # view-independent at first
-            self.shift.weight.zero_()
-            self.shift.bias.zero_()
-            self.size.weight.zero_()
-            self.size.bias.fill_(_logit(EXTENT_INIT))
-
-    def region(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, ray (K, 3) -> region centre, half sizes (K, 3).
-        The region stands on the floor: z from MIN_HEIGHT up twice its half height."""
-        ray_xy = F.normalize(ray[:, :2], dim=-1)
-        across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
-        t = self.shift_bound * torch.tanh(self.shift(slots))
-        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        extent = self.size_lo + (self.size_hi - self.size_lo) * torch.sigmoid(self.size(slots))
-        return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
 
     def forward(
         self,
@@ -183,7 +192,8 @@ class ObjectDecoder(nn.Module):
         self.v_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.norm_kv = nn.LayerNorm(d_model)
         self.layers = nn.ModuleList(DecoderLayer(d_model, n_heads) for _ in range(n_layers))
-        self.head = ObjectHead(z_dim, d_model)
+        self.region = RegionHead(z_dim)
+        self.head = ObjectHead(d_model)
 
     @staticmethod
     def _read_view0(cells: torch.Tensor, view0: dict):
@@ -209,7 +219,7 @@ class ObjectDecoder(nn.Module):
         "bg_attn" (s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
         region centre and half sizes (K, 3)."""
         K = slots.shape[0]
-        centre, extent = self.head.region(slots, anchor, ray)
+        centre, extent = self.region(slots, anchor, ray)
         cells = centre[:, None] + extent[:, None] * self.cell_grid
         # Detached: reading view 0 cannot move the region or regroup.
         view0 = {**view0, "attn": view0["attn"].detach(), "bg_attn": view0["bg_attn"].detach()}
