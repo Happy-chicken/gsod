@@ -1,10 +1,7 @@
-"""Background decoder: background slot -> discs on the floor plane, plus
-one fill colour. Walls are drawn on the floor too. Each disc reads view 0
-where it projects, weighted by the background's attention there
-(detached): colour read a*c, base colour a*c + (1 - a) * mean. Where an
-object hides the floor (a ~ 0) the MLP(PE(x), latent, view-0 azimuth, a*c,
-a) fills in, so the background cannot draw an object. Scene frame,
-world-aligned.
+"""Background decoder: background slot -> floor discs + fill colour.
+
+Each disc reads view 0's colour weighted by background attention a
+(detached); base colour a*c + (1 - a) * mean, MLP residual. World-aligned.
 """
 
 from __future__ import annotations

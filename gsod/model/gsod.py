@@ -32,8 +32,7 @@ _ANCHOR_SHARPNESS = 2.0
 # draw_factor: occupancy drawn fully; token count drawn at half.
 FULL_OCCUPANCY = 0.8
 COUNT_HALF = 1.0
-# Every object slot is drawn at least this much, so a slot that lost its
-# tokens still gets gradient and can recover.
+# Lower bound of the draw factor (lost slots keep a gradient).
 MIN_DRAW = 0.05
 
 

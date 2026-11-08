@@ -1,16 +1,10 @@
-"""Object decoder: object slot -> region + one Gaussian per region cell.
+"""Object decoder: object slot -> floor-standing region -> side^3 cells ->
+one Gaussian per cell.
 
-The region (RegionHead, an MLP on the slot latent) stands just above the
-floor around the attention anchor, shifted along view 0's ray and sized. It
-holds side^3 cells. Each cell reads view 0 where it projects (region and
-attention detached): the slot's attention-weighted features (dim where the
-slot holds little), its attention, and the background's. Its query is its
-own embedding plus the features and attention. It passes n_layers of
-self-attention among cells, cross-attention to tokens from the slot latent
-and FFN, and emits a Gaussian near its centre whose opacity starts at the
-attention read there. A cell over a background pixel is empty: view 0 sees the
-background through it (visual hull), so its opacity is scaled by
-1 - background attention. Scene frame, lengths in units of R.
+Each cell reads view 0 where it projects (the slot's attention-weighted
+features and attention; region and attention detached), passes self-attention
+among cells, cross-attention to the slot and FFN. Cells over background
+pixels are pruned (visual hull). Scene frame, lengths in units of R.
 """
 
 from __future__ import annotations
@@ -32,13 +26,11 @@ OBJECT_WIDTH = 1.5
 OBJECT_HEIGHT = 1.2
 # Initial region size (share of its range).
 EXTENT_INIT = 0.9
-# Regions and their Gaussians stay this high above the floor.
+# Height of regions and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Features read from view 0 are divided by max(attention, this),
-# so a cell sees little of pixels its slot hardly holds.
+# Read features are divided by max(attention, this).
 MIN_ATTN = 0.3
-# Cell Gaussians: scale range in units of the cell's half size, and how far
-# (in cell half sizes) a Gaussian may move from its cell centre.
+# Gaussian scale range and max offset, in cell half sizes.
 CELL_SCALE = (0.25, 4.0)
 CELL_REACH = 1.5
 
@@ -63,10 +55,7 @@ def _projection(d_model: int, n_params: int) -> nn.Sequential:
 
 
 class RegionHead(nn.Module):
-    """Slot latent -> the slot's region: a small MLP gives the shift along
-    view 0's ray and across it (on the floor) and the half sizes (x, y, z).
-    The output layer starts at zero: every region starts at the anchor, at
-    EXTENT_INIT of its size range."""
+    """Slot latent -> region shift (along / across view 0's ray) and half sizes."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
@@ -84,8 +73,7 @@ class RegionHead(nn.Module):
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, ray (K, 3) -> region centre, half sizes (K, 3).
-        The region stands on the floor: z from MIN_HEIGHT up twice its half height."""
+        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
         raw = self.mlp(slots)
         ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
@@ -117,9 +105,8 @@ class ObjectHead(nn.Module):
         attn: torch.Tensor,
         keep: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), cell centres (K, G, 3), cell half sizes (K, 3), view-0
-        attention and visual-hull factor read at the cells (K, G) -> one
-        Gaussian per cell (K, G, ...)."""
+        """feat (K, G, d), cells (K, G, 3), cell half sizes (K, 3), attention,
+        keep (K, G) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
         half = cell_half[:, None]
         mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
@@ -185,9 +172,7 @@ class ObjectDecoder(nn.Module):
         lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
         grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         self.register_buffer("cell_grid", grid, persistent=False)
-        # Cell query: its own embedding (its identity and position; large enough
-        # to tell apart cells on one view-0 ray, which read the same pixels)
-        # + the view-0 feature and attention read there.
+        # Query: cell embedding (identity, position) + read feature and attention.
         self.cell_embed = nn.Parameter(torch.randn(len(grid), d_model))
         self.cell_in = nn.Linear(z_dim + 1, d_model)
         self.k_proj = nn.Linear(z_dim, n_tokens * d_model)
@@ -199,9 +184,7 @@ class ObjectDecoder(nn.Module):
 
     @staticmethod
     def _read_view0(cells: torch.Tensor, view0: dict):
-        """Cells (K, G, 3) -> where each projects in view 0: the slot's
-        attention-weighted features (K, G, C), its attention (K, G) and the
-        visual-hull factor 1 - background attention (K, G)."""
+        """Cells (K, G, 3) -> read features (K, G, C), attention (K, G), keep (K, G)."""
         attn, features = view0["attn"], view0["features"]
         K, C = attn.shape[0], features.shape[0]
         a = attn[:, None]
