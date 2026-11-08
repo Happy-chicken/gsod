@@ -2,9 +2,10 @@
 
 The region (RegionHead, an MLP on the slot latent) stands just above the
 floor around the attention anchor, shifted along view 0's ray and sized. It
-holds side^3 cells. Each cell reads view 0 where it projects (region and attention detached): the
-slot's attention-weighted features and colour (dim where the slot holds
-little), its attention, and the background's. It passes n_layers of
+holds side^3 cells. Each cell reads view 0 where it projects (region and
+attention detached): the slot's attention-weighted features (dim where the
+slot holds little), its attention, and the background's. Its query is its
+own embedding plus the features and attention. It passes n_layers of
 self-attention among cells, cross-attention to tokens from the slot latent
 and FFN, and emits a Gaussian near its centre whose opacity starts at the
 attention read there. A cell over a background pixel is empty: view 0 sees the
@@ -33,7 +34,7 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Regions and their Gaussians stay this high above the floor.
 MIN_HEIGHT = 0.01
-# Features and colours read from view 0 are divided by max(attention, this),
+# Features read from view 0 are divided by max(attention, this),
 # so a cell sees little of pixels its slot hardly holds.
 MIN_ATTN = 0.3
 # Cell Gaussians: scale range in units of the cell's half size, and how far
@@ -114,12 +115,11 @@ class ObjectHead(nn.Module):
         cells: torch.Tensor,
         cell_half: torch.Tensor,
         attn: torch.Tensor,
-        colours: torch.Tensor,
         keep: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), cell centres (K, G, 3), cell half sizes (K, 3), view-0
-        attention, colours and visual-hull factor read at the cells (K, G),
-        (K, G, 3), (K, G) -> one Gaussian per cell (K, G, ...)."""
+        attention and visual-hull factor read at the cells (K, G) -> one
+        Gaussian per cell (K, G, ...)."""
         raw = self.project(feat)
         half = cell_half[:, None]
         mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
@@ -128,7 +128,7 @@ class ObjectHead(nn.Module):
             "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(torch.logit(attn.clamp(0.02, 0.98)) + raw[..., 10]) * keep,
-            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
+            "rgb": torch.sigmoid(raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
@@ -185,9 +185,11 @@ class ObjectDecoder(nn.Module):
         lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
         grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         self.register_buffer("cell_grid", grid, persistent=False)
-        # Cell query: its own embedding + view-0 feature, attention, colour, position.
-        self.cell_embed = nn.Parameter(torch.randn(len(grid), d_model) * 0.02)
-        self.cell_in = nn.Linear(z_dim + 7, d_model)
+        # Cell query: its own embedding (its identity and position; large enough
+        # to tell apart cells on one view-0 ray, which read the same pixels)
+        # + the view-0 feature and attention read there.
+        self.cell_embed = nn.Parameter(torch.randn(len(grid), d_model))
+        self.cell_in = nn.Linear(z_dim + 1, d_model)
         self.k_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.v_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.norm_kv = nn.LayerNorm(d_model)
@@ -198,24 +200,21 @@ class ObjectDecoder(nn.Module):
     @staticmethod
     def _read_view0(cells: torch.Tensor, view0: dict):
         """Cells (K, G, 3) -> where each projects in view 0: the slot's
-        features (K, G, C) and colours (K, G, 3), both attention-weighted, its
-        attention (K, G) and the visual-hull factor 1 - background attention (K, G)."""
-        attn, features, colours = view0["attn"], view0["features"], view0["colours"]
+        attention-weighted features (K, G, C), its attention (K, G) and the
+        visual-hull factor 1 - background attention (K, G)."""
+        attn, features = view0["attn"], view0["features"]
         K, C = attn.shape[0], features.shape[0]
         a = attn[:, None]
-        maps = torch.cat(
-            [a * features[None], a, a * colours[None], view0["bg_attn"][None, None].expand(K, -1, -1, -1)], 1
-        )
-        out = read_view0(cells, maps, view0["frame"], view0["focal_ratio"])  # (K, G, C + 5)
+        maps = torch.cat([a * features[None], a, view0["bg_attn"][None, None].expand(K, -1, -1, -1)], 1)
+        out = read_view0(cells, maps, view0["frame"], view0["focal_ratio"])  # (K, G, C + 2)
         a = out[..., C]
-        norm = a[..., None].clamp_min(MIN_ATTN)
-        return out[..., :C] / norm, a, out[..., C + 1 : C + 4] / norm, 1.0 - out[..., C + 4]
+        return out[..., :C] / a[..., None].clamp_min(MIN_ATTN), a, 1.0 - out[..., C + 1]
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: "features" (C, s, s),
-        "colours" (3, s, s), the slots' "attn" (K, s, s), the background's
+        the slots' "attn" (K, s, s), the background's
         "bg_attn" (s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
         region centre and half sizes (K, 3)."""
         K = slots.shape[0]
@@ -223,11 +222,10 @@ class ObjectDecoder(nn.Module):
         cells = centre[:, None] + extent[:, None] * self.cell_grid
         # Detached: reading view 0 cannot move the region or regroup.
         view0 = {**view0, "attn": view0["attn"].detach(), "bg_attn": view0["bg_attn"].detach()}
-        feat, a, colours, keep = self._read_view0(cells.detach(), view0)
-        position = self.cell_grid.expand(K, -1, -1)
-        q = self.cell_embed + self.cell_in(torch.cat([feat, a[..., None], colours, position], -1))
+        feat, a, keep = self._read_view0(cells.detach(), view0)
+        q = self.cell_embed + self.cell_in(torch.cat([feat, a[..., None]], -1))
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, cells, extent / self.side, a, colours, keep), centre, extent
+        return self.head(q, cells, extent / self.side, a, keep), centre, extent
