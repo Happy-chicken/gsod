@@ -13,7 +13,8 @@
 #SBATCH --output=logs/%x_%j.out
 
 module purge
-module load CUDA  # `module spider CUDA` lists the versions; gsplat needs one matching PyTorch's
+module load CUDA  # `module spider CUDA` lists the versions; use the one matching torch.version.cuda
+export CUDA_HOME=${CUDA_HOME:-$(dirname $(dirname $(which nvcc)))}  # gsplat compiles against it
 source $HOME/miniforge3/bin/activate gsod
 
 cd $SLURM_SUBMIT_DIR
