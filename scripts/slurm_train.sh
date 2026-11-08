@@ -12,15 +12,8 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/%x_%j.out
 
-module purge
-# The versions you compiled gsplat with on the login node: GCC (not the default
-# Intel compiler; PyTorch is built with g++) and CUDA matching torch.version.cuda.
-module load GCC CUDA
-export CC=gcc CXX=g++
-export CUDA_HOME=${CUDA_HOME:-$(dirname $(dirname $(which nvcc)))}
-source $HOME/miniforge3/bin/activate gsod
-
 cd $SLURM_SUBMIT_DIR
+source scripts/hpc_env.sh  # modules, compilers, conda env
 export WANDB_MODE=offline  # compute nodes have no internet; `wandb sync` from a login node later
 export WANDB_DIR=$HPCWORK/wandb
 export TMPDIR=$TMP
