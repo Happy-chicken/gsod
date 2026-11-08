@@ -30,9 +30,18 @@ EXTENT_INIT = 0.9
 MIN_HEIGHT = 0.01
 # Read features are divided by max(attention, this).
 MIN_ATTN = 0.3
+# Frequency bands of the cells' position encoding.
+CELL_PE_BANDS = 4
 # Gaussian scale range and max offset, in cell half sizes.
 CELL_SCALE = (0.25, 4.0)
 CELL_REACH = 1.5
+
+
+def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
+    """x (N, 3) in [-1, 1] -> (N, 3 + 6 * bands): x, sin / cos(2^k pi x)."""
+    freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
+    angles = x[..., None] * freqs  # (N, 3, bands)
+    return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
 
 
 def _logit(p: float) -> float:
@@ -163,9 +172,9 @@ class ObjectDecoder(nn.Module):
         lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
         grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         self.register_buffer("cell_grid", grid, persistent=False)
-        # Query: cell embedding (identity, position) + read feature and attention.
-        self.cell_embed = nn.Parameter(torch.randn(len(grid), d_model))
-        self.cell_in = nn.Linear(z_dim + 1, d_model)
+        # Query: read feature and attention + encoded position in the region.
+        self.register_buffer("cell_pe", positional_encoding(grid, CELL_PE_BANDS), persistent=False)
+        self.cell_in = nn.Linear(z_dim + 1 + self.cell_pe.shape[1], d_model)
         self.k_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.v_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.norm_kv = nn.LayerNorm(d_model)
@@ -197,7 +206,7 @@ class ObjectDecoder(nn.Module):
         # Detached: reading view 0 cannot move the region or regroup.
         view0 = {**view0, "attn": view0["attn"].detach(), "bg_attn": view0["bg_attn"].detach()}
         feat, a, keep = self._read_view0(cells.detach(), view0)
-        q = self.cell_embed + self.cell_in(torch.cat([feat, a[..., None]], -1))
+        q = self.cell_in(torch.cat([feat, a[..., None], self.cell_pe.expand(K, -1, -1)], -1))
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:

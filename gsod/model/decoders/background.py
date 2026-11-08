@@ -11,7 +11,7 @@ import math
 import torch
 from torch import nn
 
-from gsod.model.decoders.objects import OBJECT_REGION
+from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
 from gsod.utils.geometry import read_view0, yaw_matrix
 
 _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
@@ -27,13 +27,6 @@ def _mlp(d_in: int, hidden: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(d_in, hidden), nn.ReLU(True), nn.Linear(hidden, hidden), nn.ReLU(True)
     )
-
-
-def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
-    """x (N, 3) in [-1, 1] -> (N, 3 + 6 * bands): x, sin / cos(2^k pi x)."""
-    freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
-    angles = x[..., None] * freqs  # (N, 3, bands)
-    return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
 
 
 class BackgroundHead(nn.Module):
