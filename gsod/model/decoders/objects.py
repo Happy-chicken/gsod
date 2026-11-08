@@ -43,17 +43,6 @@ def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
     return torch.exp(math.log(lo) + (math.log(hi) - math.log(lo)) * torch.sigmoid(raw))
 
 
-def _projection(d_model: int, n_params: int) -> nn.Sequential:
-    """Feature -> raw parameters; all but the position rows start small."""
-    mlp = nn.Sequential(
-        nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, n_params)
-    )
-    with torch.no_grad():
-        mlp[-1].weight[3:].mul_(0.1)
-        mlp[-1].bias.zero_()
-    return mlp
-
-
 class RegionHead(nn.Module):
     """Slot latent -> region shift (along / across view 0's ray) and half sizes."""
 
@@ -89,10 +78,12 @@ class ObjectHead(nn.Module):
 
     def __init__(self, d_model: int):
         super().__init__()
-        self.project = _projection(d_model, 23)
+        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
         lo, hi = (math.log(s) for s in CELL_SCALE)
         with torch.no_grad():
+            self.project[-1].weight[3:].mul_(0.1)  # all but the offset start small
             bias = self.project[-1].bias
+            bias.zero_()
             bias[3:6] = _logit(-lo / (hi - lo))  # scale = half a cell at first
             bias[6] = 1.0  # identity quaternion (wxyz)
             self.project[-1].weight[14:].zero_()  # view-independent at first
