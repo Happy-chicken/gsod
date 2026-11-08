@@ -2,9 +2,9 @@
 one Gaussian per cell.
 
 Each cell reads view 0 where it projects (the slot's attention-weighted
-features and attention; region and attention detached), passes self-attention
-among cells, cross-attention to the slot and FFN. Cells over background
-pixels are pruned (visual hull). Scene frame, lengths in units of R.
+features and colour, attention, position; region and attention detached),
+passes self-attention among cells, cross-attention to the slot and FFN. Cells
+over background pixels are pruned (visual hull). Scene frame, lengths in units of R.
 """
 
 from __future__ import annotations
@@ -28,20 +28,11 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Height of regions and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Read features are divided by max(attention, this).
+# Read features and colours are divided by max(attention, this).
 MIN_ATTN = 0.3
-# Frequency bands of the cells' position encoding.
-CELL_PE_BANDS = 4
 # Gaussian scale range and max offset, in cell half sizes.
 CELL_SCALE = (0.25, 4.0)
 CELL_REACH = 1.5
-
-
-def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
-    """x (N, 3) in [-1, 1] -> (N, 3 + 6 * bands): x, sin / cos(2^k pi x)."""
-    freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
-    angles = x[..., None] * freqs  # (N, 3, bands)
-    return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
 
 
 def _logit(p: float) -> float:
@@ -103,10 +94,11 @@ class ObjectHead(nn.Module):
         cells: torch.Tensor,
         cell_half: torch.Tensor,
         attn: torch.Tensor,
+        colours: torch.Tensor,
         keep: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), cells (K, G, 3), cell half sizes (K, 3), attention,
-        keep (K, G) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), cells (K, G, 3), cell half sizes (K, 3), attention (K, G),
+        colours (K, G, 3), keep (K, G) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
         half = cell_half[:, None]
         mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
@@ -115,7 +107,7 @@ class ObjectHead(nn.Module):
             "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(torch.logit(attn.clamp(0.02, 0.98)) + raw[..., 10]) * keep,
-            "rgb": torch.sigmoid(raw[..., 11:14]),
+            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
@@ -172,9 +164,9 @@ class ObjectDecoder(nn.Module):
         lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
         grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         self.register_buffer("cell_grid", grid, persistent=False)
-        # Query: read feature and attention + encoded position in the region.
-        self.register_buffer("cell_pe", positional_encoding(grid, CELL_PE_BANDS), persistent=False)
-        self.cell_in = nn.Linear(z_dim + 1 + self.cell_pe.shape[1], d_model)
+        # Query: cell embedding + read feature, attention, colour, position.
+        self.cell_embed = nn.Parameter(torch.randn(len(grid), d_model) * 0.02)
+        self.cell_in = nn.Linear(z_dim + 7, d_model)
         self.k_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.v_proj = nn.Linear(z_dim, n_tokens * d_model)
         self.norm_kv = nn.LayerNorm(d_model)
@@ -184,20 +176,24 @@ class ObjectDecoder(nn.Module):
 
     @staticmethod
     def _read_view0(cells: torch.Tensor, view0: dict):
-        """Cells (K, G, 3) -> read features (K, G, C), attention (K, G), keep (K, G)."""
-        attn, features = view0["attn"], view0["features"]
+        """Cells (K, G, 3) -> read features (K, G, C), attention (K, G),
+        colours (K, G, 3), keep (K, G)."""
+        attn, features, colours = view0["attn"], view0["features"], view0["colours"]
         K, C = attn.shape[0], features.shape[0]
         a = attn[:, None]
-        maps = torch.cat([a * features[None], a, view0["bg_attn"][None, None].expand(K, -1, -1, -1)], 1)
-        out = read_view0(cells, maps, view0["frame"], view0["focal_ratio"])  # (K, G, C + 2)
+        maps = torch.cat(
+            [a * features[None], a, a * colours[None], view0["bg_attn"][None, None].expand(K, -1, -1, -1)], 1
+        )
+        out = read_view0(cells, maps, view0["frame"], view0["focal_ratio"])  # (K, G, C + 5)
         a = out[..., C]
-        return out[..., :C] / a[..., None].clamp_min(MIN_ATTN), a, 1.0 - out[..., C + 1]
+        norm = a[..., None].clamp_min(MIN_ATTN)
+        return out[..., :C] / norm, a, out[..., C + 1 : C + 4] / norm, 1.0 - out[..., C + 4]
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: "features" (C, s, s),
-        the slots' "attn" (K, s, s), the background's
+        "colours" (3, s, s), the slots' "attn" (K, s, s), the background's
         "bg_attn" (s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
         region centre and half sizes (K, 3)."""
         K = slots.shape[0]
@@ -205,10 +201,11 @@ class ObjectDecoder(nn.Module):
         cells = centre[:, None] + extent[:, None] * self.cell_grid
         # Detached: reading view 0 cannot move the region or regroup.
         view0 = {**view0, "attn": view0["attn"].detach(), "bg_attn": view0["bg_attn"].detach()}
-        feat, a, keep = self._read_view0(cells.detach(), view0)
-        q = self.cell_in(torch.cat([feat, a[..., None], self.cell_pe.expand(K, -1, -1)], -1))
+        feat, a, colours, keep = self._read_view0(cells.detach(), view0)
+        position = self.cell_grid.expand(K, -1, -1)
+        q = self.cell_embed + self.cell_in(torch.cat([feat, a[..., None], colours, position], -1))
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, cells, extent / self.side, a, keep), centre, extent
+        return self.head(q, cells, extent / self.side, a, colours, keep), centre, extent
