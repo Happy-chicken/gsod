@@ -1,7 +1,8 @@
 """Background decoder: background slot -> floor discs + fill colour.
 
 Each disc reads view 0's colour weighted by background attention a
-(detached, eroded: object edges are not copied onto the floor); base colour a*c + (1 - a) * mean, MLP residual. World-aligned.
+(detached, eroded: object edges are not copied onto the floor); base
+colour a*c + (1 - a) * mean, MLP residual. World-aligned.
 """
 
 from __future__ import annotations
