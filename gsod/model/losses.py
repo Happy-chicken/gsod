@@ -2,6 +2,9 @@
 
     total = l1 * L1 + ssim * (1 - SSIM)   novel views
           + view0 * L1                    view 0
+          + bg_explained * mean(w_obj * sg(exp(-|bg_rgb - gt|_1 / bg_sigma)))
+                                          all views: objects drawn where the
+                                          background alone already matches
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
+        self.bg_explained_scale = 1.0  # ramped by the trainer
 
     def forward(
         self, outputs: dict[str, torch.Tensor], images: torch.Tensor
@@ -61,6 +65,12 @@ class GSODLoss(nn.Module):
         if cfg.view0 > 0:
             terms["view0"] = F.l1_loss(outputs["rgb"][:1], images[:1])
             weights["view0"] = cfg.view0
+        if cfg.bg_explained > 0:
+            with torch.no_grad():
+                explained = torch.exp(-(outputs["bg_rgb"] - images).abs().sum(1) / cfg.bg_sigma)
+            w_obj = outputs["slot_alpha"][:, 1:].sum(1)
+            terms["bg_explained"] = (w_obj * explained).mean()
+            weights["bg_explained"] = cfg.bg_explained * self.bg_explained_scale
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

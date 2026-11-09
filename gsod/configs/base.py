@@ -12,6 +12,8 @@ class LossConfig:
     l1: float = 1.0  # novel views
     ssim: float = 0.2  # novel views
     view0: float = 0.5  # L1 on the encoded view (cells read it: copying is cheap)
+    bg_explained: float = 0.05  # object weight where the background alone matches
+    bg_sigma: float = 0.05  # L1 error at which the background explains 1/e
 
 
 @dataclass
@@ -31,6 +33,7 @@ class BaseConfig:
     lr_warmup: float = 0.06
     lr_final: float = 0.02
     draw_ramp: float = 0.1  # draw factor power 0 -> 1
+    bg_explained_ramp: float = 0.2  # bg_explained 0 -> 1 from draw_ramp to this
     grad_clip: float = 1.0  # 0 = off
     seed: int = 0
     log_every: int = 100  # steps
