@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
-from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
+from gsod.model.decoders.objects import MIN_HEIGHT, OBJECT_HEIGHT, OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
@@ -52,21 +52,52 @@ def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
 
 
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
+# Top of the object volume (the tallest region).
+_OBJECT_TOP = MIN_HEIGHT + 2.0 * OBJECT_HEIGHT * OBJECT_RADIUS[1]
+
+
+def _token_rays(
+    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
+) -> torch.Tensor:
+    """(side*side, 3) scene-frame directions of the tokens' view-0 rays."""
+    h, w = image_size
+    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
+    u = (idx + 0.5) * w / side - 0.5
+    v = (idx + 0.5) * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
+
+
+def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
+    """Where the rays reach height z (N, 2); rays not going down stay at the camera."""
+    t = ((z - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
+    return frame.origin[:2] + t[:, None] * directions[:, :2]
 
 
 def token_points(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
     """(side*side, 3): each token's view-0 ray at mid object height."""
-    h, w = image_size
-    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
-    u = (idx + 0.5) * w / side - 0.5
-    v = (idx + 0.5) * h / side - 0.5
-    vv, uu = torch.meshgrid(v, u, indexing="ij")
-    directions = camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
-    t = ((_ANCHOR_HEIGHT - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
-    xy = (frame.origin[:2] + t[:, None] * directions[:, :2]).clamp(-OBJECT_REGION, OBJECT_REGION)
+    xy = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), _ANCHOR_HEIGHT)
+    xy = xy.clamp(-OBJECT_REGION, OBJECT_REGION)
     return torch.cat([xy, torch.full_like(xy[:, :1], _ANCHOR_HEIGHT)], -1)
+
+
+def object_tokens(
+    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
+) -> torch.Tensor:
+    """(side*side,) bool: the token's view-0 ray passes through the object
+    volume |x|, |y| <= OBJECT_REGION, 0 <= z <= _OBJECT_TOP. Others (walls,
+    far floor) can only be background."""
+    directions = _token_rays(frame, side, image_size, focal_ratio)
+    a = _at_height(frame, directions, _OBJECT_TOP)
+    b = _at_height(frame, directions, 0.0)
+    delta = b - a
+    delta = torch.where(delta.abs() < 1e-9, torch.full_like(delta, 1e-9), delta)
+    s0, s1 = (-OBJECT_REGION - a) / delta, (OBJECT_REGION - a) / delta
+    enter = torch.minimum(s0, s1).amax(-1).clamp(min=0.0)
+    leave = torch.maximum(s0, s1).amin(-1).clamp(max=1.0)
+    return (enter <= leave) & (directions[:, 2] < -1e-6)
 
 
 def attention_anchors(attn: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
@@ -218,9 +249,10 @@ class GSODModel(nn.Module):
         """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4) -> render
         outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
-        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
-        tokens = tokens[0]  # (s*s, C)
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
+        allowed = object_tokens(frame, self.input_size, self.image_size, self.focal_ratio)
+        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens, allowed[None]))
+        tokens = tokens[0]  # (s*s, C)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
             "objects": self.decode_objects(slots, attn[1:], colours, tokens, frame, attn[0]),
