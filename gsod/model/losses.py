@@ -5,6 +5,7 @@
           + bg_explained * mean(w_obj * sg(exp(-|bg_rgb - gt|_1 / bg_sigma)))
                                           novel views (view 0 the background
                                           copies): objects where it matches
+          + percept * MSE(VGG16 relu4_3)  novel views, as uORF
 """
 
 from __future__ import annotations
@@ -14,6 +15,30 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs.base import LossConfig
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+class Perceptual(nn.Module):
+    """Frozen VGG16 up to relu4_3 (ImageNet weights, as uORF)."""
+
+    def __init__(self):
+        super().__init__()
+        from torchvision.models import VGG16_Weights, vgg16
+
+        self.net = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:23].eval()
+        self.net.requires_grad_(False)
+        self.register_buffer("mean", torch.tensor(_IMAGENET_MEAN)[:, None, None], persistent=False)
+        self.register_buffer("std", torch.tensor(_IMAGENET_STD)[:, None, None], persistent=False)
+
+    def train(self, mode: bool = True):
+        return super().train(False)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """x, y (B, 3, H, W) in [0, 1] -> MSE of their features."""
+        f = self.net((torch.cat([x, y]) - self.mean) / self.std)
+        return F.mse_loss(*f.chunk(2))
 
 
 def _gaussian_window(
@@ -50,6 +75,8 @@ class GSODLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.bg_explained_scale = 1.0  # ramped by the trainer
+        self.percept_on = True  # set by the trainer
+        self.perceptual = Perceptual() if cfg.percept > 0 else None
 
     def forward(
         self, outputs: dict[str, torch.Tensor], images: torch.Tensor
@@ -71,6 +98,10 @@ class GSODLoss(nn.Module):
             w_obj = outputs["slot_alpha"][1:, 1:].sum(1)
             terms["bg_explained"] = (w_obj * explained).mean()
             weights["bg_explained"] = cfg.bg_explained * self.bg_explained_scale
+
+        if self.perceptual is not None and self.percept_on:
+            terms["percept"] = self.perceptual(rendered, target)
+            weights["percept"] = cfg.percept
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}

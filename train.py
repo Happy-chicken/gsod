@@ -104,12 +104,15 @@ class GSODTraining(L.LightningModule):
         progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
         self.model.draw_power = _ramp(progress, 0.0, self.cfg.draw_ramp)
         self.criterion.bg_explained_scale = _ramp(progress, self.cfg.draw_ramp, self.cfg.bg_explained_ramp)
+        self.criterion.percept_on = progress >= self.cfg.percept_start
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
         self.log("train/l1", terms["l1"], prog_bar=True, batch_size=1)
         self.log("train/view0", terms["view0"], batch_size=1)
         if "bg_explained" in terms:
             self.log("train/bg_explained", terms["bg_explained"], batch_size=1)
+        if "percept" in terms:
+            self.log("train/percept", terms["percept"], batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
         return loss
 
