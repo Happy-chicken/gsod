@@ -3,8 +3,8 @@
     total = l1 * L1 + ssim * (1 - SSIM)   novel views
           + view0 * L1                    view 0
           + bg_explained * mean(w_obj * sg(exp(-|bg_rgb - gt|_1 / bg_sigma)))
-                                          all views: objects drawn where the
-                                          background alone already matches
+                                          novel views (view 0 the background
+                                          copies): objects where it matches
 """
 
 from __future__ import annotations
@@ -67,8 +67,8 @@ class GSODLoss(nn.Module):
             weights["view0"] = cfg.view0
         if cfg.bg_explained > 0:
             with torch.no_grad():
-                explained = torch.exp(-(outputs["bg_rgb"] - images).abs().sum(1) / cfg.bg_sigma)
-            w_obj = outputs["slot_alpha"][:, 1:].sum(1)
+                explained = torch.exp(-(outputs["bg_rgb"][1:] - target).abs().sum(1) / cfg.bg_sigma)
+            w_obj = outputs["slot_alpha"][1:, 1:].sum(1)
             terms["bg_explained"] = (w_obj * explained).mean()
             weights["bg_explained"] = cfg.bg_explained * self.bg_explained_scale
 

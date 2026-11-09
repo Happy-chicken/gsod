@@ -1,7 +1,8 @@
 """Background decoder: background slot -> floor discs + fill colour.
 
 Each disc reads view 0's colour weighted by background attention a
-(detached); base colour a*c + (1 - a) * mean, MLP residual. World-aligned.
+(detached, at _READ_SIDE: too coarse to copy an object's outline); base
+colour a*c + (1 - a) * mean, MLP residual. World-aligned.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.objects import OBJECT_REGION
@@ -18,6 +20,7 @@ _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
 _HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
+_READ_SIDE = 16  # view-0 maps are pooled to this side before reading
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
 
@@ -106,7 +109,7 @@ class BackgroundDecoder(nn.Module):
         background's attention (detached), c the colour."""
         points = self.floor_mu @ yaw_matrix(-frame.yaw).to(self.floor_mu.dtype).T  # scene frame
         a = attn.detach()[None]
-        maps = torch.cat([a * colours, a], 0)[None]  # (1, 4, s, s)
+        maps = F.adaptive_avg_pool2d(torch.cat([a * colours, a], 0)[None], _READ_SIDE)  # (1, 4, r, r)
         out = read_view0(points[None], maps, frame, focal_ratio)[0]  # (N, 4)
         return out[:, :3], out[:, 3]
 
