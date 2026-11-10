@@ -1,14 +1,11 @@
-"""Object decoder: object slot -> floor-standing box -> Gaussians along
-view 0's rays.
+"""Object decoder: object slot -> floor-standing box -> side^3 cells ->
+one Gaussian per cell.
 
 The box (RegionHead) sits at the slot's attention anchor, shifted along
-view 0's ray and sized by the slot. Each ray of a side x side grid that
-crosses the box carries `layers` Gaussians at increasing depths inside it:
-the first is the visible surface, the others the back. A conv net over the
-grid (token features, slot, attention, colour, box range) predicts them.
-Opacity is the slot's view-0 attention on the ray times a learned value:
-attention gives the silhouette, the slot and features the depth. Colour is
-view 0's on the ray plus a residual. Scene frame, units of R.
+view 0's ray and sized by the slot. Cells (encoded position) attend among themselves and to the slot.
+Each Gaussian's opacity is the slot's view-0 attention where its cell
+projects times a learned occupancy: attention gives the silhouette, the slot
+the depth. Colour is view 0's there plus a residual. Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gsod.utils.geometry import pixel_rays
+from gsod.utils.geometry import read_view0
 
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
@@ -32,13 +29,10 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Gaussian scale range, in ray spacings at its depth.
-RAY_SCALE = (0.5, 3.0)
-# Initial opacity factor of the first (visible) and the back layers.
-FRONT_OPACITY = 0.9
-BACK_OPACITY = 0.3
-# Per layer: depth step 1, scale 3, quat 4, opacity 1, rgb 3, sh1 9.
-N_PARAMS = 21
+# Gaussian scale range and max offset, in cell half sizes.
+CELL_SCALE = (0.25, 4.0)
+CELL_REACH = 1.5
+CELL_PE_BANDS = 4
 
 
 def _logit(p: float) -> float:
@@ -86,118 +80,117 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Raw per-ray parameters -> Gaussians along the rays."""
+    """Cell feature -> raw Gaussian parameters (offset 3, scale 3, quat 4,
+    occupancy 1, rgb 3, sh1 9) -> one Gaussian per cell."""
 
-    def __init__(self, layers: int):
+    def __init__(self, d_model: int):
         super().__init__()
-        self.layers = layers
-
-    def init_bias(self, bias: torch.Tensor) -> None:
-        """Output bias (layers * N_PARAMS,): evenly spaced depths, identity
-        quaternion, front / back opacity."""
-        b = bias.view(self.layers, N_PARAMS)
-        b.zero_()
-        for layer in range(self.layers):
-            b[layer, 0] = _logit(1.0 / (self.layers + 1 - layer))  # depth fraction (l+1)/(L+1)
-        b[:, 4] = 1.0
-        b[0, 8] = _logit(FRONT_OPACITY)
-        b[1:, 8] = _logit(BACK_OPACITY)
+        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
+        lo, hi = (math.log(s) for s in CELL_SCALE)
+        with torch.no_grad():
+            out = self.project[-1]
+            out.weight[3:].mul_(0.1)
+            out.weight[14:].zero_()  # view-independent at first
+            out.bias.zero_()
+            out.bias[3:6] = _logit(-lo / (hi - lo))  # scale = half a cell
+            out.bias[6] = 1.0  # identity quaternion (wxyz)
+            out.bias[10] = _logit(0.9)  # occupied: attention sets the opacity
 
     def forward(
         self,
-        raw: torch.Tensor,
-        origin: torch.Tensor,
-        rays: torch.Tensor,
-        t_in: torch.Tensor,
-        t_out: torch.Tensor,
-        spacing: torch.Tensor,
+        feat: torch.Tensor,
+        cells: torch.Tensor,
+        cell_half: torch.Tensor,
         attn: torch.Tensor,
         colours: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """raw (K, N, layers, N_PARAMS); camera origin (3,), rays (N, 3) at unit
-        depth; box range t_in, t_out (K, N); ray spacing per unit depth;
-        attention (K, N, 1) (0 off the box) and colours (N, 3) on the rays ->
-        Gaussians (K, N * layers, ...)."""
-        # Increasing depth fractions in [0, 1] of the box range.
-        steps = torch.sigmoid(raw[..., 0])
-        fractions = 1.0 - torch.cumprod(1.0 - steps, -1)
-        t = t_in[..., None] + fractions * (t_out - t_in)[..., None]  # (K, N, L)
-        mu = origin + t[..., None] * rays[:, None]
-        width = (spacing * t)[..., None]
-        out = {
+        """feat (K, G, d), cells (K, G, 3), cell half sizes (K, 3), view-0
+        attention (K, G) and colours (K, G, 3) at the cells -> Gaussians (K, G, ...)."""
+        raw = self.project(feat)
+        half = cell_half[:, None]
+        mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
+        return {
             "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
-            "scale": width * _log_uniform(raw[..., 1:4], *RAY_SCALE),
-            "quat": F.normalize(raw[..., 4:8], dim=-1),
-            "opacity": attn * torch.sigmoid(raw[..., 8]),
-            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98))[:, None] + raw[..., 9:12]),
-            "sh1": raw[..., 12:21].unflatten(-1, (3, 3)),
+            "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "opacity": attn.clamp(0.0, 1.0) * torch.sigmoid(raw[..., 10]),
+            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
+            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
-        return {name: value.flatten(1, 2) for name, value in out.items()}
+
+
+class DecoderLayer(nn.Module):
+    """Self-attention among the cells, cross-attention to the slot tokens,
+    FFN; pre-norm."""
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.norm_self = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_q = nn.LayerNorm(d_model)
+        self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, 2 * d_model), nn.GELU(), nn.Linear(2 * d_model, d_model))
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """q (K, G, d), slot tokens k, v (K, M, d) -> (K, G, d)."""
+        x = self.norm_self(q)
+        q = q + self.self_attn(x, x, x, need_weights=False)[0]
+        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
+        return q + self.ffn(self.norm_ff(q))
 
 
 class ObjectDecoder(nn.Module):
-    """Object slots -> Gaussians along view 0's rays, scene frame."""
+    """Object slots -> Gaussians, scene frame."""
 
-    def __init__(self, z_dim: int, ray_side: int, layers: int, hidden_dim: int):
-        """ray_side: rays per image side; layers: Gaussians per ray and slot."""
+    def __init__(
+        self,
+        z_dim: int,
+        gaussians_per_slot: int,
+        hidden_dim: int,
+        *,
+        n_heads: int = 4,
+        n_tokens: int = 8,
+        n_layers: int = 2,
+    ):
+        """gaussians_per_slot: side**3 cells; hidden_dim: the attention width."""
         super().__init__()
-        self.side, self.layers = int(ray_side), int(layers)
-        self.region = RegionHead(z_dim)
-        # Inputs: features, slot, attention, colour, box range (t_in, t_out - t_in).
         d = int(hidden_dim)
-        self.net = nn.Sequential(
-            nn.Conv2d(2 * z_dim + 1 + 3 + 2, d, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(d, d, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(d, d, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(d, self.layers * N_PARAMS, 1),
-        )
-        self.head = ObjectHead(self.layers)
-        with torch.no_grad():
-            out = self.net[-1]
-            out.weight.mul_(0.1)
-            self.head.init_bias(out.bias)
+        side = round(gaussians_per_slot ** (1.0 / 3.0))
+        assert side**3 == gaussians_per_slot, "gaussians_per_slot must be a cube"
+        self.side, self.M, self.d = side, int(n_tokens), d
+
+        lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
+        grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
+        self.register_buffer("cell_grid", grid, persistent=False)
+        self.register_buffer("cell_pe", positional_encoding(grid, CELL_PE_BANDS), persistent=False)
+        self.cell_in = nn.Linear(self.cell_pe.shape[1], d)
+        self.k_proj = nn.Linear(z_dim, n_tokens * d)
+        self.v_proj = nn.Linear(z_dim, n_tokens * d)
+        self.norm_kv = nn.LayerNorm(d)
+        self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
+        self.region = RegionHead(z_dim)
+        self.head = ObjectHead(d)
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: the slots' "attn" (K, s, s),
-        "colours" (3, s, s), "features" (C, s, s), "frame", "focal_ratio",
-        "image_size" -> Gaussians (K, side * side * layers, ...), box centres
-        and half sizes (K, 3)."""
-        K, r = slots.shape[0], self.side
-        frame, focal_ratio = view0["frame"], view0["focal_ratio"]
+        "colours" (3, s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
+        box centres and half sizes (K, 3)."""
+        K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
+        cells = centre[:, None] + extent[:, None] * self.cell_grid
 
-        # Where each ray crosses each box (slab test); t is camera depth.
-        origin = frame.origin
-        rays = pixel_rays(frame, r, view0["image_size"], focal_ratio)  # (N, 3)
-        safe = torch.where(rays.abs() < 1e-6, torch.full_like(rays, 1e-6), rays)
-        t1 = (centre[:, None] - extent[:, None] - origin) / safe
-        t2 = (centre[:, None] + extent[:, None] - origin) / safe
-        t_in = torch.minimum(t1, t2).amax(-1).clamp_min(1e-3)  # (K, N)
-        t_out = torch.maximum(t1, t2).amin(-1)
-        crosses = (t_out > t_in).to(t_in.dtype)
-        t_out = torch.maximum(t_out, t_in)
+        # Not detached: reconstruction trains the attention through the opacity.
+        attn, colours = view0["attn"], view0["colours"]
+        maps = torch.cat([attn[:, None], colours[None].expand(K, -1, -1, -1)], 1)
+        read = read_view0(cells.detach(), maps, view0["frame"], view0["focal_ratio"])  # (K, G, 4)
+        a, c = read[..., 0], read[..., 1:]
 
-        # View-0 maps at the rays; attention not detached.
-        pool = lambda x: F.adaptive_avg_pool2d(x, r)
-        attn = pool(view0["attn"][:, None])  # (K, 1, r, r)
-        colours = pool(view0["colours"][None])  # (1, 3, r, r)
-        features = pool(view0["features"][None])
-        grid = lambda x: x.view(K, 1, r, r)
-        maps = torch.cat(
-            [
-                features.expand(K, -1, -1, -1),
-                slots[:, :, None, None].expand(-1, -1, r, r),
-                attn,
-                colours.expand(K, -1, -1, -1),
-                grid(t_in),
-                grid(t_out - t_in),
-            ],
-            1,
-        )
-        raw = self.net(maps).view(K, self.layers, N_PARAMS, r * r).permute(0, 3, 1, 2)
-        spacing = 1.0 / (r * math.sqrt(focal_ratio[0] * focal_ratio[1]))
-        gate = attn.flatten(1)[..., None] * crosses[..., None]  # (K, N, 1)
-        gaussians = self.head(raw, origin, rays, t_in, t_out, spacing, gate, colours[0].flatten(1).T)
-        return gaussians, centre, extent
+        q = self.cell_in(self.cell_pe).expand(K, -1, -1)
+        k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
+        v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
+        for layer in self.layers:
+            q = layer(q, k, v)
+        return self.head(q, cells, extent / self.side, a, c), centre, extent

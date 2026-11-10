@@ -273,8 +273,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-dim", type=int, default=None)
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
-    parser.add_argument("--ray-side", type=int, default=None)
-    parser.add_argument("--ray-layers", type=int, default=None)
+    parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
@@ -305,8 +304,7 @@ def main() -> None:
         "z_dim",
         "num_slots",
         "attn_iter",
-        "ray_side",
-        "ray_layers",
+        "gaussians_per_slot",
         "decoder_hidden_dim",
         "train_scenes",
         "val_scenes",

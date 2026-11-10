@@ -74,8 +74,7 @@ MODEL_FIELDS = (
     "z_dim",
     "num_slots",
     "attn_iter",
-    "ray_side",
-    "ray_layers",
+    "gaussians_per_slot",
     "decoder_hidden_dim",
     "near",
 )

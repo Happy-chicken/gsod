@@ -141,19 +141,6 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
-def pixel_rays(
-    frame: "SceneFrame", side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
-) -> torch.Tensor:
-    """(side*side, 3) scene-frame directions of view 0's rays through a
-    side x side grid of pixel centres, row-major; unit camera depth (z = 1)."""
-    h, w = image_size
-    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
-    u = (idx + 0.5) * w / side - 0.5
-    v = (idx + 0.5) * h / side - 0.5
-    vv, uu = torch.meshgrid(v, u, indexing="ij")
-    return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
-
-
 def read_view0(points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio) -> torch.Tensor:
     """Scene-frame points (B, P, 3) -> maps (B, C, s, s) read bilinearly where
     each point projects in view 0 (B, P, C); 0 behind the camera or off the image."""
