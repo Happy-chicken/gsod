@@ -1,7 +1,7 @@
 """Slot model: view 0 -> slots -> Gaussians -> splatted into every view.
 
     encode / slot attention   view 0 -> background slot + K-1 object slots
-    decode_objects            object slot -> fixed box of cells; opacity =
+    decode_objects            object slot -> box of cells; opacity =
                               slot attention where a cell projects x occupancy
     decode_background         background slot (+ view 0 where the floor shows)
                               -> floor discs + fill colour
@@ -139,7 +139,7 @@ class GSODModel(nn.Module):
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
-        -> world Gaussians (K-1, G, ...) and box "centre" (K-1, 3)."""
+        -> world Gaussians (K-1, G, ...) and box half sizes "extent" (K-1, 3)."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor = attention_anchors(attn, points)
@@ -150,8 +150,8 @@ class GSODModel(nn.Module):
             "frame": frame,
             "focal_ratio": self.focal_ratio,
         }
-        gaussians, centre = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
-        return {"gaussians": to_world(gaussians, frame), "centre": centre}
+        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -189,6 +189,7 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
+            "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:

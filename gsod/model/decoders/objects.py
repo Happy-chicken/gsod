@@ -1,8 +1,8 @@
-"""Object decoder: object slot -> fixed floor-standing box -> side^3 cells ->
+"""Object decoder: object slot -> floor-standing box -> side^3 cells ->
 one Gaussian per cell.
 
-The box sits at the slot's attention anchor, shifted along view 0's ray by
-the slot. Cells (encoded position) attend among themselves and to the slot.
+The box (RegionHead) sits at the slot's attention anchor, shifted along
+view 0's ray and sized by the slot. Cells (encoded position) attend among themselves and to the slot.
 Each Gaussian's opacity is the slot's view-0 attention where its cell
 projects times a learned occupancy: attention gives the silhouette, the slot
 the depth. Colour is view 0's there plus a residual. Scene frame, units of R.
@@ -22,8 +22,11 @@ from gsod.utils.geometry import read_view0
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
-# Box half sizes.
-BOX_HALF = (1.5 * OBJECT_RADIUS[1], 1.5 * OBJECT_RADIUS[1], 1.2 * OBJECT_RADIUS[1])
+# Largest box half width / height (units of r_max).
+OBJECT_WIDTH = 1.5
+OBJECT_HEIGHT = 1.2
+# Initial box size (share of its range).
+EXTENT_INIT = 0.9
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
 # Gaussian scale range and max offset, in cell half sizes.
@@ -45,6 +48,35 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
     freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
     angles = x[..., None] * freqs  # (N, 3, bands)
     return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
+
+
+class RegionHead(nn.Module):
+    """Slot latent -> box shift (along / across view 0's ray) and half sizes."""
+
+    def __init__(self, z_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        r_min, r_max = OBJECT_RADIUS
+        self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
+        self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
+        self.register_buffer("size_lo", torch.tensor([r_min, r_min, r_min]), persistent=False)
+        self.register_buffer("size_hi", torch.tensor(
+            [OBJECT_WIDTH * r_max, OBJECT_WIDTH * r_max, OBJECT_HEIGHT * r_max]), persistent=False)
+        with torch.no_grad():
+            self.mlp[-1].weight.zero_()
+            self.mlp[-1].bias.zero_()
+            self.mlp[-1].bias[2:] = _logit(EXTENT_INIT)
+
+    def forward(
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
+        raw = self.mlp(slots)
+        ray_xy = F.normalize(ray[:, :2], dim=-1)
+        across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
+        t = self.shift_bound * torch.tanh(raw[:, :2])
+        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
+        extent = self.size_lo + (self.size_hi - self.size_lo) * torch.sigmoid(raw[:, 2:])
+        return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
 
 
 class DecoderLayer(nn.Module):
@@ -92,21 +124,16 @@ class ObjectDecoder(nn.Module):
         grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         self.register_buffer("cell_grid", grid, persistent=False)
         self.register_buffer("cell_pe", positional_encoding(grid, CELL_PE_BANDS), persistent=False)
-        self.register_buffer("box_half", torch.tensor(BOX_HALF), persistent=False)
         self.cell_in = nn.Linear(self.cell_pe.shape[1], d)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
-        # Box shift along / across view 0's ray.
-        self.shift = nn.Linear(z_dim, 2)
-        self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * OBJECT_RADIUS[1]]), persistent=False)
+        self.region = RegionHead(z_dim)
         # Offset 3, scale 3, quat 4, occupancy 1, rgb 3, sh1 9.
         self.head = nn.Sequential(nn.Linear(d, d), nn.ReLU(True), nn.Linear(d, 23))
         lo, hi = (math.log(s) for s in CELL_SCALE)
         with torch.no_grad():
-            self.shift.weight.zero_()
-            self.shift.bias.zero_()
             out = self.head[-1]
             out.weight[3:].mul_(0.1)
             out.weight[14:].zero_()  # view-independent at first
@@ -117,17 +144,13 @@ class ObjectDecoder(nn.Module):
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: the slots' "attn" (K, s, s),
         "colours" (3, s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
-        box centres (K, 3)."""
+        box centres and half sizes (K, 3)."""
         K = slots.shape[0]
-        ray_xy = F.normalize(ray[:, :2], dim=-1)
-        across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
-        t = self.shift_bound * torch.tanh(self.shift(slots))
-        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        centre = torch.cat([xy, (MIN_HEIGHT + self.box_half[2]).expand(K, 1)], -1)
-        cells = centre[:, None] + self.box_half * self.cell_grid
+        centre, extent = self.region(slots, anchor, ray)
+        cells = centre[:, None] + extent[:, None] * self.cell_grid
 
         # Not detached: reconstruction trains the attention through the opacity.
         attn, colours = view0["attn"], view0["colours"]
@@ -142,7 +165,7 @@ class ObjectDecoder(nn.Module):
             q = layer(q, k, v)
         raw = self.head(q)
 
-        half = self.box_half / self.side
+        half = (extent / self.side)[:, None]
         mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
         gaussians = {
             "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
@@ -152,4 +175,4 @@ class ObjectDecoder(nn.Module):
             "rgb": torch.sigmoid(torch.logit(c.clamp(0.02, 0.98)) + raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
-        return gaussians, centre
+        return gaussians, centre, extent
