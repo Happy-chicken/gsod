@@ -79,6 +79,46 @@ class RegionHead(nn.Module):
         return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
 
 
+class ObjectHead(nn.Module):
+    """Cell feature -> raw Gaussian parameters (offset 3, scale 3, quat 4,
+    occupancy 1, rgb 3, sh1 9) -> one Gaussian per cell."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
+        lo, hi = (math.log(s) for s in CELL_SCALE)
+        with torch.no_grad():
+            out = self.project[-1]
+            out.weight[3:].mul_(0.1)
+            out.weight[14:].zero_()  # view-independent at first
+            out.bias.zero_()
+            out.bias[3:6] = _logit(-lo / (hi - lo))  # scale = half a cell
+            out.bias[6] = 1.0  # identity quaternion (wxyz)
+            out.bias[10] = _logit(0.9)  # occupied: attention sets the opacity
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        cells: torch.Tensor,
+        cell_half: torch.Tensor,
+        attn: torch.Tensor,
+        colours: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """feat (K, G, d), cells (K, G, 3), cell half sizes (K, 3), view-0
+        attention (K, G) and colours (K, G, 3) at the cells -> Gaussians (K, G, ...)."""
+        raw = self.project(feat)
+        half = cell_half[:, None]
+        mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
+        return {
+            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
+            "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "opacity": attn.clamp(0.0, 1.0) * torch.sigmoid(raw[..., 10]),
+            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 11:14]),
+            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
+        }
+
+
 class DecoderLayer(nn.Module):
     """Self-attention among the cells, cross-attention to the slot tokens,
     FFN; pre-norm."""
@@ -130,17 +170,7 @@ class ObjectDecoder(nn.Module):
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
-        # Offset 3, scale 3, quat 4, occupancy 1, rgb 3, sh1 9.
-        self.head = nn.Sequential(nn.Linear(d, d), nn.ReLU(True), nn.Linear(d, 23))
-        lo, hi = (math.log(s) for s in CELL_SCALE)
-        with torch.no_grad():
-            out = self.head[-1]
-            out.weight[3:].mul_(0.1)
-            out.weight[14:].zero_()  # view-independent at first
-            out.bias.zero_()
-            out.bias[3:6] = _logit(-lo / (hi - lo))  # scale = half a cell
-            out.bias[6] = 1.0  # identity quaternion (wxyz)
-            out.bias[10] = _logit(0.9)  # occupied: attention sets the opacity
+        self.head = ObjectHead(d)
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
@@ -163,16 +193,4 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        raw = self.head(q)
-
-        half = (extent / self.side)[:, None]
-        mu = cells + CELL_REACH * half * torch.tanh(raw[..., 0:3])
-        gaussians = {
-            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
-            "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
-            "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "opacity": a.clamp(0.0, 1.0) * torch.sigmoid(raw[..., 10]),
-            "rgb": torch.sigmoid(torch.logit(c.clamp(0.02, 0.98)) + raw[..., 11:14]),
-            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
-        }
-        return gaussians, centre, extent
+        return self.head(q, cells, extent / self.side, a, c), centre, extent
