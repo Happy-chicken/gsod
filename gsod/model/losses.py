@@ -1,11 +1,8 @@
-"""Reconstruction loss (no masks):
+"""Reconstruction loss (no masks), as uORF, over every view:
 
-    total = l1 * L1 + ssim * (1 - SSIM)   novel views
-          + view0 * L1                    view 0
-          + bg_explained * mean(w_obj * sg(exp(-|bg_rgb - gt|_1 / bg_sigma)))
-                                          novel views (view 0 the background
-                                          copies): objects where it matches
-          + percept * MSE(VGG16 relu4_3)  novel views, as uORF
+    total = recon * MSE (images in [-1, 1]) + percept * MSE(VGG16 relu4_3)
+
+The perceptual term is on from percept_start (uORF: epoch 20).
 """
 
 from __future__ import annotations
@@ -74,7 +71,6 @@ class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
-        self.bg_explained_scale = 1.0  # ramped by the trainer
         self.percept_on = True  # set by the trainer
         self.perceptual = Perceptual() if cfg.percept > 0 else None
 
@@ -83,24 +79,11 @@ class GSODLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """-> (total, per-term values for logging)."""
         cfg = self.cfg
-        rendered, target = outputs["rgb"][1:], images[1:]
-        terms: dict[str, torch.Tensor] = {
-            "l1": F.l1_loss(rendered, target),
-            "ssim": 1.0 - ssim(rendered, target),
-        }
-        weights = {"l1": cfg.l1, "ssim": cfg.ssim}
-        if cfg.view0 > 0:
-            terms["view0"] = F.l1_loss(outputs["rgb"][:1], images[:1])
-            weights["view0"] = cfg.view0
-        if cfg.bg_explained > 0:
-            with torch.no_grad():
-                explained = torch.exp(-(outputs["bg_rgb"][1:] - target).abs().sum(1) / cfg.bg_sigma)
-            w_obj = outputs["slot_alpha"][1:, 1:].sum(1)
-            terms["bg_explained"] = (w_obj * explained).mean()
-            weights["bg_explained"] = cfg.bg_explained * self.bg_explained_scale
-
+        rendered = outputs["rgb"]
+        terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}
+        weights = {"recon": cfg.recon}
         if self.perceptual is not None and self.percept_on:
-            terms["percept"] = self.perceptual(rendered, target)
+            terms["percept"] = self.perceptual(rendered, images)
             weights["percept"] = cfg.percept
 
         total = sum(weights[name] * value for name, value in terms.items())

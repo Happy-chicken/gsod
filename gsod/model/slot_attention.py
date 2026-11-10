@@ -4,7 +4,6 @@ Logits: learned temperature * cos(query, key), softmax over slots. The
 background has its own query, GRU and MLP; object slots are seeded from
 tokens unlike the background query (farthest point sampling). Both are
 refined BO-QSA style (detached iterations, straight-through last step).
-Tokens outside the object volume (`allowed` False) go to the background.
 """
 
 from __future__ import annotations
@@ -114,8 +113,7 @@ class SlotAttention(nn.Module):
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, n, d)
         return slots + res(slots)
 
-    def forward(self, feat: torch.Tensor, allowed: torch.Tensor | None = None):
-        """feat (b, N, C); allowed (b, N) bool: tokens object slots may take."""
+    def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
         grid = self._grid(feat.shape[1], feat.device)
         feat = feat + self.pos_proj(grid)
@@ -126,8 +124,6 @@ class SlotAttention(nn.Module):
         bg_init = self.bg_query.expand(b, -1, -1)
         q_bg = F.normalize(self.to_q_bg(bg_init), dim=-1)  # (b, 1, D)
         objectness = 1.0 - torch.einsum("bid,bjd->bj", q_bg, k.detach())
-        if allowed is not None:
-            objectness = torch.where(allowed, objectness, objectness.amin(-1, keepdim=True))
         idx = seed_tokens(objectness, grid[0, :, :2], self.n_objects)  # (b, K-1)
         picked = torch.gather(feat, 1, idx[..., None].expand(-1, -1, feat.shape[-1]))
         fg_init = self.seed_proj(picked)
@@ -142,8 +138,6 @@ class SlotAttention(nn.Module):
                 fg = fg + fg_init - fg_init.detach()
             q = torch.cat([self.to_q_bg(bg), self.to_q(fg)], dim=1)  # (b, K, D)
             dots = tau * torch.einsum("bid,bjd->bij", F.normalize(q, dim=-1), k)
-            if allowed is not None:
-                dots = torch.cat([dots[:, :1], dots[:, 1:].masked_fill(~allowed[:, None], float("-inf"))], 1)
             attn = dots.softmax(dim=1) + self.eps
             attn_w = attn / attn.sum(dim=-1, keepdim=True)
             updates = torch.einsum("bjd,bij->bid", v, attn_w)  # (b, K, D)

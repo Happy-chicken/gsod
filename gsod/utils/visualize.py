@@ -53,7 +53,7 @@ def _slot_caption(row: dict) -> str:
     target = f" #{row['gt_object']}" if row["gt_object"] >= 0 else ""
     return (
         f"s{row['slot']} {row['role']}{target} "
-        f"d{row['draw']:.2f} occ{row['occupancy']:.2f}"
+        f"occ{row['occupancy']:.2f}"
     )
 
 

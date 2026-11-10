@@ -50,11 +50,7 @@ SLOT_COLUMNS = (
     "role",
     "gt_object",
     "iou",
-    "draw",
     "occupancy",
-    "extent_x",
-    "extent_y",
-    "extent_z",
 )
 # Share of a GT object's pixels one object slot must own for it to be found.
 OBJECT_FOUND = 0.5
@@ -110,7 +106,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
 
     side = model.input_size
     gt = item.get("masks")
-    # As in gsod.draw_factor.
+    # Mean attention of a slot over its tokens.
     attn = np_(result["attn"])
     count = attn[1:].sum(-1)
     occupancy = (attn[1:] ** 2).sum(-1) / np.maximum(count, 1e-8)
@@ -125,8 +121,6 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (V, H, W)
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
         "occupancy": occupancy,
-        "draw": np_(result["draw"]),  # (K-1,)
-        "extent": np_(result["extent"]),  # (K-1, 3)
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
@@ -168,7 +162,7 @@ def slot_table(rec: dict) -> list[dict]:
     gt = rec["gt"]
     mask0 = rec["mask_idx"][0]
     rows = []
-    for k in range(1, rec["draw"].shape[0] + 1):
+    for k in range(1, rec["occupancy"].shape[0] + 1):
         pixels = mask0 == k
         row = {
             "scene": rec["scene"],
@@ -176,11 +170,7 @@ def slot_table(rec: dict) -> list[dict]:
             "role": "empty",
             "gt_object": -1,
             "iou": NAN,
-            "draw": float(rec["draw"][k - 1]),
             "occupancy": float(rec["occupancy"][k - 1]),
-            "extent_x": float(rec["extent"][k - 1, 0]),
-            "extent_y": float(rec["extent"][k - 1, 1]),
-            "extent_z": float(rec["extent"][k - 1, 2]),
         }
         if pixels.sum() >= MIN_SLOT_PIXELS:
             row["role"] = "draws"

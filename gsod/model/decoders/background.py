@@ -1,8 +1,8 @@
 """Background decoder: background slot -> floor discs + fill colour.
 
-Each disc reads view 0's colour weighted by background attention a
-(detached, eroded: object edges are not copied onto the floor); base
-colour a*c + (1 - a) * mean, MLP residual. World-aligned.
+Each disc reads view 0's colour weighted by background attention a (not
+detached: a wrong copy trains it); base colour a*c + (1 - a) * mean, MLP
+residual. World-aligned.
 """
 
 from __future__ import annotations
@@ -10,17 +10,15 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from gsod.model.decoders.objects import OBJECT_REGION
+from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
 from gsod.utils.geometry import read_view0, yaw_matrix
 
 _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
 _HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
-_ERODE = 7  # min-pool window on the background attention, in tokens
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
 
@@ -30,13 +28,6 @@ def _mlp(d_in: int, hidden: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(d_in, hidden), nn.ReLU(True), nn.Linear(hidden, hidden), nn.ReLU(True)
     )
-
-
-def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
-    """x (N, 3) in [-1, 1] -> (N, 3 + 6 * bands): x, sin / cos(2^k pi x)."""
-    freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
-    angles = x[..., None] * freqs  # (N, 3, bands)
-    return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
 
 
 class BackgroundHead(nn.Module):
@@ -106,9 +97,9 @@ class BackgroundDecoder(nn.Module):
 
     def _read_view0(self, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio):
         """Where each disc projects in view 0: a*c (N, 3) and a (N,), a the
-        background's attention (detached), c the colour."""
+        background's attention, c the colour."""
         points = self.floor_mu @ yaw_matrix(-frame.yaw).to(self.floor_mu.dtype).T  # scene frame
-        a = -F.max_pool2d(-attn.detach()[None, None], _ERODE, stride=1, padding=_ERODE // 2)[0]
+        a = attn[None]
         maps = torch.cat([a * colours, a], 0)[None]  # (1, 4, s, s)
         out = read_view0(points[None], maps, frame, focal_ratio)[0]  # (N, 4)
         return out[:, :3], out[:, 3]

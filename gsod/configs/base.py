@@ -9,12 +9,10 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class LossConfig:
-    l1: float = 1.0  # novel views
-    ssim: float = 0.2  # novel views
-    view0: float = 0.5  # L1 on the encoded view: rewards drawing objects solidly
-    bg_explained: float = 0.0  # object weight where the background alone matches (0.05 softened attention)
-    bg_sigma: float = 0.05  # L1 error at which the background explains 1/e
-    percept: float = 0.006  # MSE of VGG16 relu4_3 features, novel views (uORF)
+    """As uORF, every view."""
+
+    recon: float = 1.0  # MSE, images in [-1, 1]
+    percept: float = 0.006  # MSE of VGG16 relu4_3 features
 
 
 @dataclass
@@ -24,7 +22,7 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    gaussians_per_slot: int = 1728  # 12^3 cells
+    gaussians_per_slot: int = 1000  # 10^3 cells
     decoder_hidden_dim: int = 128
     near: float = 0.1
 
@@ -33,8 +31,6 @@ class BaseConfig:
     lr: float = 3e-4  # warm-up, then cosine to lr_final * lr
     lr_warmup: float = 0.06
     lr_final: float = 0.02
-    draw_ramp: float = 0.1  # draw factor power 0 -> 1
-    bg_explained_ramp: float = 0.2  # bg_explained 0 -> 1 from draw_ramp to this
     percept_start: float = 0.2  # perceptual loss on from here (uORF: epoch 20)
     grad_clip: float = 1.0  # 0 = off
     seed: int = 0
