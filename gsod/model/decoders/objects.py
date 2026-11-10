@@ -2,7 +2,7 @@
 Gaussian per cell.
 
 Per slot, S x S view-0 rays cover the slot's attention region (image box
-from the attention's moments); each holds D cells over a depth range
+from the attention's moments, at most an object wide); each holds D cells over a depth range
 centred near where the slot touches the floor (its lowest attended rays
 meet z = 0), shifted and sized by the slot (RegionHead). One token per ray
 (features, attention, colour read on it, encoded position, floor depth)
@@ -37,9 +37,11 @@ MIN_HEIGHT = 0.01
 # lowest rows by exp(CONTACT_SHARPNESS * v / H).
 CONTACT_SHARPNESS = 30.0
 # Image box: attention mean +- this many standard deviations, at least
-# MIN_BOX pixels.
+# MIN_BOX pixels and at most BOX_REACH (units of R) at the contact depth
+# (locality: one box cannot span several objects).
 BOX_STD = 2.0
 MIN_BOX = 4.0
+BOX_REACH = 1.5 * OBJECT_DEPTH * OBJECT_RADIUS[1]
 # Interval edge softness, in cells; Gaussian scale range, in cell sizes.
 EDGE = 0.5
 CELL_SCALE = (0.5, 2.0)
@@ -232,16 +234,21 @@ class ObjectDecoder(nn.Module):
         a = attn.detach().flatten(1)  # (K, s*s)
         u, v = _image_grid(s, (h, w), a.device, a.dtype)
         token_dirs = camera_directions(u, v, (h, w), fr) @ rot.T
+        token_floor = floor_depth(token_dirs).clamp(max=1e2)
         lean = torch.log(a.clamp_min(1e-8)) * 2.0 + CONTACT_SHARPNESS * v / h
-        contact = (lean.softmax(-1) * floor_depth(token_dirs).clamp(max=1e2)).sum(-1)  # (K,)
+        contact = (lean.softmax(-1) * token_floor).sum(-1)  # (K,)
         p = a.pow(2) / a.pow(2).sum(-1, keepdim=True).clamp_min(1e-8)
         lo, hi = [], []
-        for c, size in ((u, w), (v, h)):
+        for c, size, f in ((u, w, fr[0]), (v, h, fr[1])):
             mean = (p * c).sum(-1)
             std = (p * (c - mean[:, None]) ** 2).sum(-1).sqrt()
-            half = (BOX_STD * std).clamp_min(0.5 * MIN_BOX)
+            reach = BOX_REACH * f * size / contact.clamp_min(1e-2)  # pixels
+            half = torch.minimum(BOX_STD * std, reach).clamp_min(0.5 * MIN_BOX)
             lo.append((mean - half).clamp(-0.5, size - 0.5 - MIN_BOX))
             hi.append(torch.maximum(mean + half, lo[-1] + MIN_BOX).clamp(max=size - 0.5))
+        # Contact again, from the box only.
+        inside = (u >= lo[0][:, None]) & (u <= hi[0][:, None]) & (v >= lo[1][:, None]) & (v <= hi[1][:, None])
+        contact = (lean.masked_fill(~inside, -1e4).softmax(-1) * token_floor).sum(-1)
 
         # Rays: S x S over the box.
         g = 0.5 * (self.box_grid + 1.0)  # (N, 2) in [0, 1]
