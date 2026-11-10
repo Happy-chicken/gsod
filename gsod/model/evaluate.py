@@ -51,9 +51,8 @@ SLOT_COLUMNS = (
     "gt_object",
     "iou",
     "occupancy",
-    "extent_x",
-    "extent_y",
-    "extent_z",
+    "depth",
+    "depth_half",
 )
 # Share of a GT object's pixels one object slot must own for it to be found.
 OBJECT_FOUND = 0.5
@@ -124,7 +123,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (V, H, W)
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
         "occupancy": occupancy,
-        "extent": np_(result["extent"]),  # (K-1, 3)
+        "depth": np_(result["depth"]),  # (K-1, 2)
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
@@ -175,9 +174,8 @@ def slot_table(rec: dict) -> list[dict]:
             "gt_object": -1,
             "iou": NAN,
             "occupancy": float(rec["occupancy"][k - 1]),
-            "extent_x": float(rec["extent"][k - 1, 0]),
-            "extent_y": float(rec["extent"][k - 1, 1]),
-            "extent_z": float(rec["extent"][k - 1, 2]),
+            "depth": float(rec["depth"][k - 1, 0]),
+            "depth_half": float(rec["depth"][k - 1, 1]),
         }
         if pixels.sum() >= MIN_SLOT_PIXELS:
             row["role"] = "draws"
