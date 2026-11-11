@@ -2,8 +2,10 @@
 one Gaussian per cell.
 
 The box (RegionHead) sits at the slot's attention anchor, shifted along
-view 0's ray and sized by the slot; its first axis follows that ray, so a
-column of cells along it is (nearly) one view-0 ray. Cells (encoded
+view 0's ray and sized by the slot. The cell grid is sheared along that
+ray (columns follow it; across stays horizontal, up stays vertical, and
+the vertical half size grows so every column still spans floor to top),
+so a column of cells is (nearly) one view-0 ray. Cells (encoded
 position) attend among themselves and to the slot. Each column is occupied
 on one interval: every cell scores being its front and its back (softmax
 along the column), occupancy = P(front <= cell) * P(back >= cell). Opacity
@@ -198,13 +200,16 @@ class ObjectDecoder(nn.Module):
         box centres and half sizes (K, 3)."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
-        # Box axes: along view 0's ray, across it (horizontal), and up-ish.
+        # Sheared grid: columns along view 0's ray, across horizontal, up
+        # vertical; the ray drops |along_z| * extent_x over the half depth,
+        # so the vertical half size grows by that.
         along = F.normalize(ray, dim=-1)
         up = torch.zeros_like(along)
         up[:, 2] = 1.0
         across = F.normalize(torch.cross(up, along, dim=-1), dim=-1)
-        axes = torch.stack([along, across, torch.cross(along, across, dim=-1)], 1)  # (K, 3, 3)
-        cells = centre[:, None] + (extent[:, None] * self.cell_grid) @ axes
+        axes = torch.stack([along, across, up], 1)  # (K, 3, 3), not orthogonal
+        half = torch.stack([extent[:, 0], extent[:, 1], extent[:, 2] + extent[:, 0] * along[:, 2].abs()], -1)
+        cells = centre[:, None] + (half[:, None] * self.cell_grid) @ axes
 
         # Not detached: reconstruction trains the attention through the opacity.
         attn, colours = view0["attn"], view0["colours"]
@@ -217,4 +222,4 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, cells, axes, extent / self.side, a, c), centre, extent
+        return self.head(q, cells, axes, half / self.side, a, c), centre, extent
