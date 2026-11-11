@@ -1,9 +1,8 @@
 """Object decoder: slot -> floor-standing box -> G Gaussians free in it.
 
-G learned queries attend among themselves and to the slot. Opacity = view-0
-attention where the Gaussian projects (not detached) x its own factor
-(normalised per slot); colour = the slot's mean view-0 colour + residual.
-Scene frame, units of R.
+G learned queries attend among themselves and to the slot. Opacity is
+normalised per slot (the draw factor scales the slot's layer); colour = the
+colour at the slot's attention anchor + residual. Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -13,8 +12,6 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-from gsod.utils.geometry import read_view0
 
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
@@ -97,20 +94,19 @@ class ObjectHead(nn.Module):
             out.bias[6] = 1.0  # identity quaternion (wxyz)
 
     def forward(
-        self, feat: torch.Tensor, centre: torch.Tensor, extent: torch.Tensor, read, colour: torch.Tensor
+        self, feat: torch.Tensor, centre: torch.Tensor, extent: torch.Tensor, colour: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box centre / half sizes (K, 3), read: points ->
-        attention (K, G), slot colour (K, 3) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
         mu = centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3])
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        factor = torch.sigmoid(raw[..., 10])
-        factor = factor / factor.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        opacity = torch.sigmoid(raw[..., 10])
+        opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
         return {
             "mu": mu,
             "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "opacity": read(mu.detach()).clamp(0.0, 1.0) * factor,
+            "opacity": opacity,
             "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
@@ -162,21 +158,14 @@ class ObjectDecoder(nn.Module):
         self.head = ObjectHead(d)
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray (K, 3); view0: "attn" (K, s, s), "colours"
-        (3, s, s), "frame", "focal_ratio" -> Gaussians, centres, half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
-        attn, colours = view0["attn"], view0["colours"]  # attention not detached
-        colour = (attn[:, None] * colours).sum((2, 3)) / attn.sum((1, 2))[:, None].clamp_min(1e-6)
-
-        def read(points: torch.Tensor) -> torch.Tensor:
-            return read_view0(points, attn[:, None], view0["frame"], view0["focal_ratio"])[..., 0]
-
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, centre, extent, read, colour), centre, extent
+        return self.head(q, centre, extent, colour), centre, extent

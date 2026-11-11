@@ -29,6 +29,24 @@ from gsod.utils.splatter import GsplatSplatter
 _ALPHA_EPS = 1e-3
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
+# Draw factor: occupancy drawn fully; token count drawn at half.
+FULL_OCCUPANCY = 0.8
+COUNT_HALF = 1.0
+
+
+def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
+    """attn (K, N) -> (K,) in [0, 1], how far each object slot is drawn:
+
+        f = min(1, occupancy / FULL_OCCUPANCY)^power * count / (count + COUNT_HALF)
+        occupancy = sum a^2 / sum a,  count = sum a
+
+    A split object costs coverage, so one owner is preferred."""
+    count = attn.sum(-1)
+    occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
+    share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
+    return share.pow(power) * count / (count + COUNT_HALF)
+
+
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
 
 
@@ -59,9 +77,13 @@ def token_points(
     return torch.cat([xy, torch.full_like(xy[:, :1], _ANCHOR_HEIGHT)], -1)
 
 
-def attention_anchors(attn: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-    """attn (K, N), token points (N, 3) -> where each slot's attention points (K, 3)."""
-    return (_ANCHOR_SHARPNESS * attn.log()).softmax(dim=1) @ points
+def attention_anchors(
+    attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """attn (K, N), token points and colours (N, 3) -> where each slot's
+    attention points and the colour there (K, 3)."""
+    p = (_ANCHOR_SHARPNESS * attn.log()).softmax(dim=1)
+    return p @ points, p @ colours
 
 
 def composite(
@@ -112,6 +134,7 @@ class GSODModel(nn.Module):
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
+        self.draw_power = 1.0
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -142,15 +165,9 @@ class GSODModel(nn.Module):
         -> world Gaussians (K-1, G, ...) and box half sizes "extent" (K-1, 3)."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
-        anchor = attention_anchors(attn, points)
+        anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        view0 = {
-            "attn": attn.reshape(-1, side, side),
-            "colours": colours.T.reshape(3, side, side),
-            "frame": frame,
-            "focal_ratio": self.focal_ratio,
-        }
-        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, colour=colour)
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
@@ -169,11 +186,12 @@ class GSODModel(nn.Module):
         """A scene (forward(render=False)) rendered into cam2world (N, 4, 4)."""
         obj = scene["objects"]["gaussians"]
         bg = scene["background"]
-        slots = scene["slots"]
+        draw, slots = scene["draw"], scene["slots"]
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         layers = []
         for k in range(slots.shape[0]):
-            layers.append(self.splat({name: obj[name][k] for name in obj}, *cams))
+            layer = self.splat({name: obj[name][k] for name in obj}, *cams)
+            layers.append({name: draw[k] * value for name, value in layer.items()})
         floor = self.splat(bg["gaussians"], *cams)
         bg_rgb = floor["rgb"] + (1.0 - floor["alpha"]) * bg["fill"][None, :, None, None]
         frame = scene["frame"]
@@ -189,6 +207,7 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
+            "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
 
@@ -202,6 +221,7 @@ class GSODModel(nn.Module):
         scene = {
             "objects": self.decode_objects(slots, attn[1:], colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
+            "draw": draw_factor(attn[1:], self.draw_power),
             "attn": attn,
             "slots": slots,
             "frame": frame,

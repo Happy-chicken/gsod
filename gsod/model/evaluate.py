@@ -50,6 +50,7 @@ SLOT_COLUMNS = (
     "role",
     "gt_object",
     "iou",
+    "draw",
     "occupancy",
     "extent_x",
     "extent_y",
@@ -124,6 +125,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (V, H, W)
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
         "occupancy": occupancy,
+        "draw": np_(result["draw"]),  # (K-1,)
         "extent": np_(result["extent"]),  # (K-1, 3)
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
@@ -174,6 +176,7 @@ def slot_table(rec: dict) -> list[dict]:
             "role": "empty",
             "gt_object": -1,
             "iou": NAN,
+            "draw": float(rec["draw"][k - 1]),
             "occupancy": float(rec["occupancy"][k - 1]),
             "extent_x": float(rec["extent"][k - 1, 0]),
             "extent_y": float(rec["extent"][k - 1, 1]),

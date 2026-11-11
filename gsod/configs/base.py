@@ -31,6 +31,7 @@ class BaseConfig:
     lr: float = 3e-4  # warm-up, then cosine to lr_final * lr
     lr_warmup: float = 0.06
     lr_final: float = 0.02
+    draw_ramp: float = 0.1  # draw factor power 0 -> 1
     percept_start: float = 0.2  # perceptual loss on from here (uORF: epoch 20)
     grad_clip: float = 1.0  # 0 = off
     seed: int = 0
