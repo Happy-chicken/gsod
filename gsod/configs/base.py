@@ -9,10 +9,10 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class LossConfig:
-    """uORF's terms, novel views only (view 0 is copied by both decoders)."""
+    """As uORF, every view."""
 
-    recon: float = 1.0  # MSE, images in [-1, 1], novel views
-    percept: float = 0.006  # MSE of VGG16 relu4_3 features, novel views
+    recon: float = 1.0  # MSE, images in [-1, 1]
+    percept: float = 0.006  # MSE of VGG16 relu4_3 features
 
 
 @dataclass
