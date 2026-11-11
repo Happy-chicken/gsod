@@ -18,7 +18,7 @@ class LossConfig:
 @dataclass
 class BaseConfig:
     # --- model
-    input_size: int = 128  # encoder input side
+    input_size: int = 64  # encoder input side
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
