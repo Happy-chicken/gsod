@@ -106,9 +106,8 @@ class GSODTraining(L.LightningModule):
         self.criterion.percept_on = progress >= self.cfg.percept_start
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
-        self.log("train/recon", terms["recon"], prog_bar=True, batch_size=1)
-        if "percept" in terms:
-            self.log("train/percept", terms["percept"], batch_size=1)
+        for name, value in terms.items():
+            self.log(f"train/{name}", value, prog_bar=name == "total", batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
         return loss
 
