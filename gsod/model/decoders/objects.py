@@ -1,9 +1,9 @@
-"""Object decoder: slot -> floor-standing box -> side^3 cubes -> k Gaussians
-per cube, free inside it.
+"""Object decoder: slot -> floor-standing box -> G Gaussians free in it.
 
-Opacity = view-0 attention where the Gaussian projects x cube occupancy x
-its own factor; occupancy and factor can be exactly 0 (pruned). Colour =
-view 0's there + residual. Scene frame, units of R.
+G learned queries attend among themselves and to the slot. Opacity = view-0
+attention where the Gaussian projects (not detached) x its own factor
+(normalised per slot); colour = the slot's mean view-0 colour + residual.
+Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -27,23 +27,15 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Gaussian scale range, in cube half sizes.
-GAUSS_SCALE = (0.1, 1.0)
-OCCUPANCY_INIT = 0.9
-OPACITY_INIT = 0.7
-# Per Gaussian: offset 3, scale 3, quat 4, opacity 1, rgb 3, sh1 9.
-GAUSS_PARAMS = 23
-CELL_PE_BANDS = 4
+# Gaussian scale range and initial scale (units of r_max).
+SCALE_RANGE = (1.0 / 40.0, 1.0)
+SCALE_INIT = 1.0 / 8.0
+# Spread of the learned queries (how far apart Gaussians start).
+QUERY_STD = 2.0
 
 
 def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
-
-
-def _gate(raw: torch.Tensor) -> torch.Tensor:
-    """max(tanh, 0); gradient as tanh, so a pruned value can come back."""
-    t = torch.tanh(raw)
-    return t + (t.clamp_min(0.0) - t).detach()
 
 
 def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
@@ -87,58 +79,45 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Cube feature -> occupancy and k Gaussians inside the cube."""
+    """Gaussian feature -> raw parameters (position 3, scale 3, quat 4,
+    opacity 1, rgb 3, sh1 9) -> one Gaussian."""
 
-    def __init__(self, d_model: int, per_cube: int):
+    def __init__(self, d_model: int):
         super().__init__()
-        sub = round(per_cube ** (1.0 / 3.0))
-        assert sub**3 == per_cube, "gaussians_per_cell must be a cube"
-        self.k = per_cube
-        self.project = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 1 + per_cube * GAUSS_PARAMS)
-        )
-        lin = (torch.arange(sub) + 0.5) / sub * 2.0 - 1.0
-        start = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
-        lo, hi = (math.log(s) for s in GAUSS_SCALE)
+        r_max = OBJECT_RADIUS[1]
+        self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
+        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
+        lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
             out = self.project[-1]
-            out.weight.mul_(0.1)
+            out.weight[3:].mul_(0.1)
+            out.weight[14:].zero_()  # view-independent at first
             out.bias.zero_()
-            out.bias[0] = math.atanh(OCCUPANCY_INIT)
-            w = out.weight[1:].view(per_cube, GAUSS_PARAMS, d_model)
-            w[:, 14:] = 0.0  # view-independent at first
-            g = out.bias[1:].view(per_cube, GAUSS_PARAMS)
-            g[:, 0:3] = torch.atanh(start)  # sub-grid of the cube
-            g[:, 3:6] = _logit((math.log(1.0 / sub) - lo) / (hi - lo))
-            g[:, 6] = 1.0  # identity quaternion (wxyz)
-            g[:, 10] = math.atanh(OPACITY_INIT)
+            out.bias[3:6] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
+            out.bias[6] = 1.0  # identity quaternion (wxyz)
 
-    def forward(self, feat: torch.Tensor, centres: torch.Tensor, half: torch.Tensor, read) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), centres (K, G, 3), half sizes (K, 3), read: points
-        -> attention, colours -> Gaussians (K, G * k, ...), kept share (K,)."""
-        K, G = feat.shape[:2]
+    def forward(
+        self, feat: torch.Tensor, centre: torch.Tensor, extent: torch.Tensor, read, colour: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """feat (K, G, d), box centre / half sizes (K, 3), read: points ->
+        attention (K, G), slot colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
-        occupancy = _gate(raw[..., 0])  # (K, G)
-        p = raw[..., 1:].view(K, G, self.k, GAUSS_PARAMS)
-        h = half[:, None, None]
-        mu = centres[:, :, None] + h * torch.tanh(p[..., 0:3])
+        mu = centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3])
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        a, c = read(mu.detach().flatten(1, 2))
-        a, c = a.view(K, G, self.k), c.view(K, G, self.k, 3)
-        out = {
+        factor = torch.sigmoid(raw[..., 10])
+        factor = factor / factor.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        return {
             "mu": mu,
-            "scale": h * _log_uniform(p[..., 3:6], *GAUSS_SCALE),
-            "quat": F.normalize(p[..., 6:10], dim=-1),
-            "opacity": a.clamp(0.0, 1.0) * occupancy[..., None] * _gate(p[..., 10]),
-            "rgb": torch.sigmoid(torch.logit(c.clamp(0.02, 0.98)) + p[..., 11:14]),
-            "sh1": p[..., 14:23].unflatten(-1, (3, 3)),
+            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "opacity": read(mu.detach()).clamp(0.0, 1.0) * factor,
+            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
+            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
-        kept = (out["opacity"] > 0).flatten(1).float().mean(1).detach()
-        return {name: value.flatten(1, 2) for name, value in out.items()}, kept
 
 
 class DecoderLayer(nn.Module):
-    """Self-attention among the cells, cross-attention to the slot tokens,
+    """Self-attention among the Gaussians, cross-attention to the slot tokens,
     FFN; pre-norm."""
 
     def __init__(self, d_model: int, n_heads: int):
@@ -164,53 +143,40 @@ class ObjectDecoder(nn.Module):
     def __init__(
         self,
         z_dim: int,
-        cell_side: int,
-        gaussians_per_cell: int,
+        gaussians_per_slot: int,
         hidden_dim: int,
         *,
         n_heads: int = 4,
         n_tokens: int = 8,
         n_layers: int = 2,
     ):
-        """cell_side^3 cubes x gaussians_per_cell Gaussians."""
         super().__init__()
         d = int(hidden_dim)
-        side = int(cell_side)
-        self.side, self.M, self.d = side, int(n_tokens), d
-
-        lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
-        grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
-        self.register_buffer("cell_grid", grid, persistent=False)
-        self.register_buffer("cell_pe", positional_encoding(grid, CELL_PE_BANDS), persistent=False)
-        self.cell_in = nn.Linear(self.cell_pe.shape[1], d)
+        self.M, self.d = int(n_tokens), d
+        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
-        self.head = ObjectHead(d, int(gaussians_per_cell))
+        self.head = ObjectHead(d)
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: "attn" (K, s, s), "colours"
-        (3, s, s), "frame", "focal_ratio" -> Gaussians, centres, half sizes,
-        kept share (K,)."""
+        (3, s, s), "frame", "focal_ratio" -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
-        cells = centre[:, None] + extent[:, None] * self.cell_grid
+        attn, colours = view0["attn"], view0["colours"]  # attention not detached
+        colour = (attn[:, None] * colours).sum((2, 3)) / attn.sum((1, 2))[:, None].clamp_min(1e-6)
 
-        # Attention not detached: it gets gradients through the opacity.
-        maps = torch.cat([view0["attn"][:, None], view0["colours"][None].expand(K, -1, -1, -1)], 1)
+        def read(points: torch.Tensor) -> torch.Tensor:
+            return read_view0(points, attn[:, None], view0["frame"], view0["focal_ratio"])[..., 0]
 
-        def read(points: torch.Tensor):
-            out = read_view0(points, maps, view0["frame"], view0["focal_ratio"])
-            return out[..., 0], out[..., 1:]
-
-        q = self.cell_in(self.cell_pe).expand(K, -1, -1)
+        q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians, kept = self.head(q, cells, extent / self.side, read)
-        return gaussians, centre, extent, kept
+        return self.head(q, centre, extent, read, colour), centre, extent

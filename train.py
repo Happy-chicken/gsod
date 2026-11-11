@@ -109,8 +109,6 @@ class GSODTraining(L.LightningModule):
         if "percept" in terms:
             self.log("train/percept", terms["percept"], batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
-        self.log("train/kept", outputs["kept"].mean(), batch_size=1)
-        self.log("train/kept_min_slot", outputs["kept"].min(), batch_size=1)
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
@@ -275,8 +273,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-dim", type=int, default=None)
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
-    parser.add_argument("--cell-side", type=int, default=None)
-    parser.add_argument("--gaussians-per-cell", type=int, default=None)
+    parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
@@ -307,8 +304,7 @@ def main() -> None:
         "z_dim",
         "num_slots",
         "attn_iter",
-        "cell_side",
-        "gaussians_per_cell",
+        "gaussians_per_slot",
         "decoder_hidden_dim",
         "train_scenes",
         "val_scenes",

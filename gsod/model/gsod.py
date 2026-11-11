@@ -99,8 +99,7 @@ class GSODModel(nn.Module):
         z_dim: int = 64,
         num_slots: int = 6,
         attn_iter: int = 3,
-        cell_side: int = 8,
-        gaussians_per_cell: int = 8,
+        gaussians_per_slot: int = 512,
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
@@ -118,7 +117,7 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
-        self.obj_decoder = ObjectDecoder(z_dim, cell_side, gaussians_per_cell, decoder_hidden_dim)
+        self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:
@@ -151,8 +150,8 @@ class GSODModel(nn.Module):
             "frame": frame,
             "focal_ratio": self.focal_ratio,
         }
-        gaussians, _, extent, kept = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
-        return {"gaussians": to_world(gaussians, frame), "extent": extent, "kept": kept}
+        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -191,7 +190,6 @@ class GSODModel(nn.Module):
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
-            "kept": scene["objects"]["kept"],  # (K-1,) unpruned share
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:

@@ -74,8 +74,7 @@ MODEL_FIELDS = (
     "z_dim",
     "num_slots",
     "attn_iter",
-    "cell_side",
-    "gaussians_per_cell",
+    "gaussians_per_slot",
     "decoder_hidden_dim",
     "near",
 )
