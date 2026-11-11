@@ -12,7 +12,7 @@ class LossConfig:
     """As uORF, every view."""
 
     recon: float = 1.0  # MSE, images in [-1, 1]
-    percept: float = 0.006  # MSE of VGG16 relu4_3 features
+    percept: float = 0.006  # MSE of VGG16 relu4_3 features; 0 = off
 
 
 @dataclass
