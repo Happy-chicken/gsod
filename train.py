@@ -284,6 +284,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
+    parser.add_argument("--percept", type=float, default=None, help="perceptual weight, 0 = off")
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
 
@@ -326,6 +327,8 @@ def main() -> None:
     if args.out is not None:
         values["out_dir"] = args.out
     cfg = replace(cfg, **values)
+    if args.percept is not None:
+        cfg = replace(cfg, loss=replace(cfg.loss, percept=args.percept))
 
     if not torch.cuda.is_available():
         raise RuntimeError(
