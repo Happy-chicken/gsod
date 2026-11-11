@@ -27,9 +27,9 @@ from gsod.utils.splatter import GsplatSplatter
 
 # Transparent parts count as a layer at the far depth with this weight.
 _ALPHA_EPS = 1e-3
-# Contact anchor: tokens weighted by attn ** 2 * exp(this * v / H), leaning
-# to the slot's lowest pixels (where it stands on the floor).
-_CONTACT_SHARPNESS = 30.0
+# Anchors weight tokens by attn ** this (lean to the stronger core).
+_ANCHOR_SHARPNESS = 2.0
+_ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
 
 
 def _token_rays(
@@ -50,22 +50,18 @@ def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.T
     return frame.origin[:2] + t[:, None] * directions[:, :2]
 
 
-def contact_anchors(
-    attn: torch.Tensor,
-    frame: SceneFrame,
-    side: int,
-    image_size: tuple[int, int],
-    focal_ratio: tuple[float, float],
+def token_points(
+    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
-    """attn (K, side*side) -> where each slot touches the floor (K, 3): its
-    lowest attended rays meeting z = 0."""
-    h = image_size[0]
-    floor = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), 0.0)
-    floor = torch.cat([floor.clamp(-OBJECT_REGION, OBJECT_REGION), torch.zeros_like(floor[:, :1])], -1)
-    idx = torch.arange(side, device=attn.device, dtype=attn.dtype)
-    v = ((idx + 0.5) * h / side - 0.5).repeat_interleave(side)  # row-major
-    lean = 2.0 * attn.clamp_min(1e-8).log() + _CONTACT_SHARPNESS * v / h
-    return lean.softmax(dim=1) @ floor
+    """(side*side, 3): each token's view-0 ray at mid object height."""
+    xy = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), _ANCHOR_HEIGHT)
+    xy = xy.clamp(-OBJECT_REGION, OBJECT_REGION)
+    return torch.cat([xy, torch.full_like(xy[:, :1], _ANCHOR_HEIGHT)], -1)
+
+
+def attention_anchors(attn: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+    """attn (K, N), token points (N, 3) -> where each slot's attention points (K, 3)."""
+    return (_ANCHOR_SHARPNESS * attn.log()).softmax(dim=1) @ points
 
 
 def composite(
@@ -145,7 +141,8 @@ class GSODModel(nn.Module):
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
         -> world Gaussians (K-1, G, ...) and box half sizes "extent" (K-1, 3)."""
         side = self.input_size
-        anchor = contact_anchors(attn, frame, side, self.image_size, self.focal_ratio)
+        points = token_points(frame, side, self.image_size, self.focal_ratio)
+        anchor = attention_anchors(attn, points)
         ray = F.normalize(anchor - frame.origin, dim=-1)
         view0 = {
             "attn": attn.reshape(-1, side, side),
