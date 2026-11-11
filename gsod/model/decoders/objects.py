@@ -8,6 +8,9 @@ cubes and to the slot, then emits the cube's occupancy and k Gaussians that
 move freely inside it. A Gaussian's opacity is the slot's view-0 attention
 where it projects x its cube's occupancy x its own factor: attention gives
 the silhouette, occupancy where the object is, the Gaussians its shape.
+Occupancy and factor are max(tanh, 0) (as Scaffold-GS filters neural
+Gaussians by opacity > 0): a cube or Gaussian can be exactly off; the
+gradient passes the max (straight-through), so it can come back.
 Colour is view 0's there plus a residual. Scene frame, units of R.
 """
 
@@ -44,6 +47,13 @@ CELL_PE_BANDS = 4
 
 def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
+
+
+def _gate(raw: torch.Tensor) -> torch.Tensor:
+    """max(tanh(raw), 0); backward as tanh (straight-through), so a value
+    pruned to 0 still learns whether it should come back."""
+    t = torch.tanh(raw)
+    return t + (t.clamp_min(0.0) - t).detach()
 
 
 def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
@@ -104,22 +114,22 @@ class ObjectHead(nn.Module):
             out = self.project[-1]
             out.weight.mul_(0.1)
             out.bias.zero_()
-            out.bias[0] = _logit(OCCUPANCY_INIT)
+            out.bias[0] = math.atanh(OCCUPANCY_INIT)
             w = out.weight[1:].view(per_cube, GAUSS_PARAMS, d_model)
             w[:, 14:] = 0.0  # view-independent at first
             g = out.bias[1:].view(per_cube, GAUSS_PARAMS)
             g[:, 0:3] = torch.atanh(start)  # spread over the cube
             g[:, 3:6] = _logit((math.log(1.0 / sub) - lo) / (hi - lo))  # one sub-cell
             g[:, 6] = 1.0  # identity quaternion (wxyz)
-            g[:, 10] = _logit(OPACITY_INIT)
+            g[:, 10] = math.atanh(OPACITY_INIT)
 
     def forward(self, feat: torch.Tensor, centres: torch.Tensor, half: torch.Tensor, read) -> dict[str, torch.Tensor]:
         """feat (K, G, d), cube centres (K, G, 3), cube half sizes (K, 3),
         read: points (K, P, 3) -> view-0 attention (K, P), colours (K, P, 3)
-        -> Gaussians (K, G * k, ...)."""
+        -> Gaussians (K, G * k, ...) and the share of them not pruned (K,)."""
         K, G = feat.shape[:2]
         raw = self.project(feat)
-        occupancy = torch.sigmoid(raw[..., 0])  # (K, G)
+        occupancy = _gate(raw[..., 0])  # (K, G)
         p = raw[..., 1:].view(K, G, self.k, GAUSS_PARAMS)
         h = half[:, None, None]
         mu = centres[:, :, None] + h * torch.tanh(p[..., 0:3])
@@ -130,11 +140,12 @@ class ObjectHead(nn.Module):
             "mu": mu,
             "scale": h * _log_uniform(p[..., 3:6], *GAUSS_SCALE),
             "quat": F.normalize(p[..., 6:10], dim=-1),
-            "opacity": a.clamp(0.0, 1.0) * occupancy[..., None] * torch.sigmoid(p[..., 10]),
+            "opacity": a.clamp(0.0, 1.0) * occupancy[..., None] * _gate(p[..., 10]),
             "rgb": torch.sigmoid(torch.logit(c.clamp(0.02, 0.98)) + p[..., 11:14]),
             "sh1": p[..., 14:23].unflatten(-1, (3, 3)),
         }
-        return {name: value.flatten(1, 2) for name, value in out.items()}
+        kept = (out["opacity"] > 0).flatten(1).float().mean(1).detach()
+        return {name: value.flatten(1, 2) for name, value in out.items()}, kept
 
 
 class DecoderLayer(nn.Module):
@@ -193,10 +204,10 @@ class ObjectDecoder(nn.Module):
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray (K, 3); view0: the slots' "attn" (K, s, s),
         "colours" (3, s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
-        box centres and half sizes (K, 3)."""
+        box centres and half sizes (K, 3), share of Gaussians not pruned (K,)."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         cells = centre[:, None] + extent[:, None] * self.cell_grid
@@ -213,4 +224,5 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, cells, extent / self.side, read), centre, extent
+        gaussians, kept = self.head(q, cells, extent / self.side, read)
+        return gaussians, centre, extent, kept

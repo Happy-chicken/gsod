@@ -109,6 +109,8 @@ class GSODTraining(L.LightningModule):
         if "percept" in terms:
             self.log("train/percept", terms["percept"], batch_size=1)
         self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
+        self.log("train/kept", outputs["kept"].mean(), batch_size=1)
+        self.log("train/kept_min_slot", outputs["kept"].min(), batch_size=1)
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:

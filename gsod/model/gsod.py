@@ -151,8 +151,8 @@ class GSODModel(nn.Module):
             "frame": frame,
             "focal_ratio": self.focal_ratio,
         }
-        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
-        return {"gaussians": to_world(gaussians, frame), "extent": extent}
+        gaussians, _, extent, kept = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        return {"gaussians": to_world(gaussians, frame), "extent": extent, "kept": kept}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -191,6 +191,7 @@ class GSODModel(nn.Module):
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
+            "kept": scene["objects"]["kept"],  # (K-1,) share of Gaussians not pruned
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
