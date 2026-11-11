@@ -1,8 +1,8 @@
 """Slot model: view 0 -> slots -> Gaussians -> splatted into every view.
 
     encode / slot attention   view 0 -> background slot + K-1 object slots
-    decode_objects            object slot -> cells along view 0's rays; per
-                              ray an interval; opacity = attention x inside
+    decode_objects            object slot -> box of cells; opacity =
+                              slot attention where a cell projects x occupancy
     decode_background         background slot (+ view 0 where the floor shows)
                               -> floor discs + fill colour
     render                    per-slot layers, soft depth order, over the
@@ -22,11 +22,50 @@ from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, scene_frame, to_world
+from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
 from gsod.utils.splatter import GsplatSplatter
 
 # Transparent parts count as a layer at the far depth with this weight.
 _ALPHA_EPS = 1e-3
+# Contact anchor: tokens weighted by attn ** 2 * exp(this * v / H), leaning
+# to the slot's lowest pixels (where it stands on the floor).
+_CONTACT_SHARPNESS = 30.0
+
+
+def _token_rays(
+    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
+) -> torch.Tensor:
+    """(side*side, 3) scene-frame directions of the tokens' view-0 rays."""
+    h, w = image_size
+    idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
+    u = (idx + 0.5) * w / side - 0.5
+    v = (idx + 0.5) * h / side - 0.5
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
+
+
+def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
+    """Where the rays reach height z (N, 2); rays not going down stay at the camera."""
+    t = ((z - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
+    return frame.origin[:2] + t[:, None] * directions[:, :2]
+
+
+def contact_anchors(
+    attn: torch.Tensor,
+    frame: SceneFrame,
+    side: int,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+) -> torch.Tensor:
+    """attn (K, side*side) -> where each slot touches the floor (K, 3): its
+    lowest attended rays meeting z = 0."""
+    h = image_size[0]
+    floor = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), 0.0)
+    floor = torch.cat([floor.clamp(-OBJECT_REGION, OBJECT_REGION), torch.zeros_like(floor[:, :1])], -1)
+    idx = torch.arange(side, device=attn.device, dtype=attn.dtype)
+    v = ((idx + 0.5) * h / side - 0.5).repeat_interleave(side)  # row-major
+    lean = 2.0 * attn.clamp_min(1e-8).log() + _CONTACT_SHARPNESS * v / h
+    return lean.softmax(dim=1) @ floor
 
 
 def composite(
@@ -64,8 +103,7 @@ class GSODModel(nn.Module):
         z_dim: int = 64,
         num_slots: int = 6,
         attn_iter: int = 3,
-        ray_side: int = 16,
-        ray_depths: int = 8,
+        gaussians_per_slot: int = 512,
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
@@ -83,7 +121,7 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
-        self.obj_decoder = ObjectDecoder(z_dim, ray_side, ray_depths, decoder_hidden_dim)
+        self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:
@@ -102,27 +140,21 @@ class GSODModel(nn.Module):
         return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
-        self,
-        slots: torch.Tensor,
-        attn: torch.Tensor,
-        colours: torch.Tensor,
-        features: torch.Tensor,
-        frame: SceneFrame,
+        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
-        and features (s*s, C) -> world Gaussians (K-1, G, ...) and each
-        slot's depth centre and half range "depth" (K-1, 2)."""
+        -> world Gaussians (K-1, G, ...) and box half sizes "extent" (K-1, 3)."""
         side = self.input_size
+        anchor = contact_anchors(attn, frame, side, self.image_size, self.focal_ratio)
+        ray = F.normalize(anchor - frame.origin, dim=-1)
         view0 = {
             "attn": attn.reshape(-1, side, side),
             "colours": colours.T.reshape(3, side, side),
-            "features": features.T.reshape(-1, side, side),
             "frame": frame,
             "focal_ratio": self.focal_ratio,
-            "image_size": self.image_size,
         }
-        gaussians, depth = self.obj_decoder(slots, view0)
-        return {"gaussians": to_world(gaussians, frame), "depth": depth}
+        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, view0=view0)
+        return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -160,7 +192,7 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
-            "depth": scene["objects"]["depth"],  # (K-1, 2) centre, half range
+            "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
@@ -169,10 +201,9 @@ class GSODModel(nn.Module):
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
-        tokens = tokens[0]  # (s*s, C)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, tokens, frame),
+            "objects": self.decode_objects(slots, attn[1:], colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "attn": attn,
             "slots": slots,

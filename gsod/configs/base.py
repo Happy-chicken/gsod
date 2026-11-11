@@ -22,8 +22,7 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    ray_side: int = 16  # object cells: S x S view-0 rays per slot
-    ray_depths: int = 8  # D cells per ray
+    gaussians_per_slot: int = 1000  # 10^3 cells
     decoder_hidden_dim: int = 128
     near: float = 0.1
 
