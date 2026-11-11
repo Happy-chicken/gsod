@@ -1,16 +1,13 @@
-"""Object decoder: object slot -> floor-standing box -> side^3 cells ->
-one Gaussian per cell.
+"""Object decoder: object slot -> floor-standing box -> side^3 cubes ->
+k Gaussians per cube.
 
 The box (RegionHead) sits at the slot's attention anchor, shifted along
-view 0's ray and sized by the slot. The cell grid is sheared along that
-ray (columns follow it; across stays horizontal, up stays vertical, and
-the vertical half size grows so every column still spans floor to top),
-so a column of cells is (nearly) one view-0 ray. Cells (encoded
-position) attend among themselves and to the slot. Each column is occupied
-on one interval: every cell scores being its front and its back (softmax
-along the column), occupancy = P(front <= cell) * P(back >= cell). Opacity
-= the slot's view-0 attention where the cell projects x occupancy (x above
-the floor): attention gives the silhouette, the interval the depth.
+view 0's ray and sized by the slot; it is split into side^3 cubes along the
+scene axes. One token per cube (encoded position) attends to the other
+cubes and to the slot, then emits the cube's occupancy and k Gaussians that
+move freely inside it. A Gaussian's opacity is the slot's view-0 attention
+where it projects x its cube's occupancy x its own factor: attention gives
+the silhouette, occupancy where the object is, the Gaussians its shape.
 Colour is view 0's there plus a residual. Scene frame, units of R.
 """
 
@@ -35,9 +32,13 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Gaussian scale range and max offset, in cell half sizes.
-CELL_SCALE = (0.25, 4.0)
-CELL_REACH = 1.5
+# Gaussian scale range, in cube half sizes; Gaussians stay inside their cube.
+GAUSS_SCALE = (0.1, 1.0)
+# Initial cube occupancy and Gaussian opacity factor.
+OCCUPANCY_INIT = 0.9
+OPACITY_INIT = 0.7
+# Per Gaussian: offset 3, scale 3, quat 4, opacity 1, rgb 3, sh1 9.
+GAUSS_PARAMS = 23
 CELL_PE_BANDS = 4
 
 
@@ -86,57 +87,54 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Cell feature -> raw Gaussian parameters (offset 3, scale 3, quat 4,
-    front 1, back 1, rgb 3, sh1 9) -> one Gaussian per cell."""
+    """Cube feature -> occupancy and k Gaussians inside the cube."""
 
-    def __init__(self, d_model: int, side: int):
+    def __init__(self, d_model: int, per_cube: int):
         super().__init__()
-        self.side = side
-        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 24))
-        lo, hi = (math.log(s) for s in CELL_SCALE)
+        sub = round(per_cube ** (1.0 / 3.0))
+        assert sub**3 == per_cube, "gaussians_per_cell must be a cube"
+        self.k = per_cube
+        self.project = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 1 + per_cube * GAUSS_PARAMS)
+        )
+        lin = (torch.arange(sub) + 0.5) / sub * 2.0 - 1.0  # sub-grid of the cube
+        start = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
+        lo, hi = (math.log(s) for s in GAUSS_SCALE)
         with torch.no_grad():
             out = self.project[-1]
-            out.weight[3:].mul_(0.1)
-            out.weight[15:].zero_()  # view-independent at first
+            out.weight.mul_(0.1)
             out.bias.zero_()
-            out.bias[3:6] = _logit(-lo / (hi - lo))  # scale = half a cell
-            out.bias[6] = 1.0  # identity quaternion (wxyz)
+            out.bias[0] = _logit(OCCUPANCY_INIT)
+            w = out.weight[1:].view(per_cube, GAUSS_PARAMS, d_model)
+            w[:, 14:] = 0.0  # view-independent at first
+            g = out.bias[1:].view(per_cube, GAUSS_PARAMS)
+            g[:, 0:3] = torch.atanh(start)  # spread over the cube
+            g[:, 3:6] = _logit((math.log(1.0 / sub) - lo) / (hi - lo))  # one sub-cell
+            g[:, 6] = 1.0  # identity quaternion (wxyz)
+            g[:, 10] = _logit(OPACITY_INIT)
 
-    def occupancy(self, front: torch.Tensor, back: torch.Tensor) -> torch.Tensor:
-        """front, back scores (K, G) -> occupancy (K, G): one interval per
-        column (cells along the box's first axis)."""
-        K, S = front.shape[0], self.side
-        p_front = front.view(K, S, S * S).softmax(1)
-        p_back = back.view(K, S, S * S).softmax(1)
-        started = p_front.cumsum(1)  # P(front <= cell)
-        ended = p_back.cumsum(1) - p_back  # P(back < cell)
-        return (started * (1.0 - ended)).view(K, -1)
-
-    def forward(
-        self,
-        feat: torch.Tensor,
-        cells: torch.Tensor,
-        axes: torch.Tensor,
-        cell_half: torch.Tensor,
-        attn: torch.Tensor,
-        colours: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), cells (K, G, 3), box axes (K, 3, 3) (rows), cell half
-        sizes (K, 3) along them, view-0 attention (K, G) and colours (K, G, 3)
-        at the cells -> Gaussians (K, G, ...)."""
+    def forward(self, feat: torch.Tensor, centres: torch.Tensor, half: torch.Tensor, read) -> dict[str, torch.Tensor]:
+        """feat (K, G, d), cube centres (K, G, 3), cube half sizes (K, 3),
+        read: points (K, P, 3) -> view-0 attention (K, P), colours (K, P, 3)
+        -> Gaussians (K, G * k, ...)."""
+        K, G = feat.shape[:2]
         raw = self.project(feat)
-        half = cell_half[:, None]
-        offset = (CELL_REACH * half * torch.tanh(raw[..., 0:3]))[..., None, :] @ axes[:, None]
-        mu = cells + offset[..., 0, :]
-        above = torch.sigmoid((cells[..., 2] - MIN_HEIGHT) / half.amin(-1))  # the floor
-        return {
-            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
-            "scale": half * _log_uniform(raw[..., 3:6], *CELL_SCALE),
-            "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "opacity": attn.clamp(0.0, 1.0) * self.occupancy(raw[..., 10], raw[..., 11]) * above,
-            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98)) + raw[..., 12:15]),
-            "sh1": raw[..., 15:24].unflatten(-1, (3, 3)),
+        occupancy = torch.sigmoid(raw[..., 0])  # (K, G)
+        p = raw[..., 1:].view(K, G, self.k, GAUSS_PARAMS)
+        h = half[:, None, None]
+        mu = centres[:, :, None] + h * torch.tanh(p[..., 0:3])
+        mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
+        a, c = read(mu.detach().flatten(1, 2))
+        a, c = a.view(K, G, self.k), c.view(K, G, self.k, 3)
+        out = {
+            "mu": mu,
+            "scale": h * _log_uniform(p[..., 3:6], *GAUSS_SCALE),
+            "quat": F.normalize(p[..., 6:10], dim=-1),
+            "opacity": a.clamp(0.0, 1.0) * occupancy[..., None] * torch.sigmoid(p[..., 10]),
+            "rgb": torch.sigmoid(torch.logit(c.clamp(0.02, 0.98)) + p[..., 11:14]),
+            "sh1": p[..., 14:23].unflatten(-1, (3, 3)),
         }
+        return {name: value.flatten(1, 2) for name, value in out.items()}
 
 
 class DecoderLayer(nn.Module):
@@ -166,18 +164,19 @@ class ObjectDecoder(nn.Module):
     def __init__(
         self,
         z_dim: int,
-        gaussians_per_slot: int,
+        cell_side: int,
+        gaussians_per_cell: int,
         hidden_dim: int,
         *,
         n_heads: int = 4,
         n_tokens: int = 8,
         n_layers: int = 2,
     ):
-        """gaussians_per_slot: side**3 cells; hidden_dim: the attention width."""
+        """cell_side^3 cubes, gaussians_per_cell Gaussians each; hidden_dim:
+        the attention width."""
         super().__init__()
         d = int(hidden_dim)
-        side = round(gaussians_per_slot ** (1.0 / 3.0))
-        assert side**3 == gaussians_per_slot, "gaussians_per_slot must be a cube"
+        side = int(cell_side)
         self.side, self.M, self.d = side, int(n_tokens), d
 
         lin = (torch.arange(side) + 0.5) / side * 2.0 - 1.0
@@ -190,7 +189,7 @@ class ObjectDecoder(nn.Module):
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
-        self.head = ObjectHead(d, side)
+        self.head = ObjectHead(d, int(gaussians_per_cell))
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
@@ -200,26 +199,18 @@ class ObjectDecoder(nn.Module):
         box centres and half sizes (K, 3)."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
-        # Sheared grid: columns along view 0's ray, across horizontal, up
-        # vertical; the ray drops |along_z| * extent_x over the half depth,
-        # so the vertical half size grows by that.
-        along = F.normalize(ray, dim=-1)
-        up = torch.zeros_like(along)
-        up[:, 2] = 1.0
-        across = F.normalize(torch.cross(up, along, dim=-1), dim=-1)
-        axes = torch.stack([along, across, up], 1)  # (K, 3, 3), not orthogonal
-        half = torch.stack([extent[:, 0], extent[:, 1], extent[:, 2] + extent[:, 0] * along[:, 2].abs()], -1)
-        cells = centre[:, None] + (half[:, None] * self.cell_grid) @ axes
+        cells = centre[:, None] + extent[:, None] * self.cell_grid
 
         # Not detached: reconstruction trains the attention through the opacity.
-        attn, colours = view0["attn"], view0["colours"]
-        maps = torch.cat([attn[:, None], colours[None].expand(K, -1, -1, -1)], 1)
-        read = read_view0(cells.detach(), maps, view0["frame"], view0["focal_ratio"])  # (K, G, 4)
-        a, c = read[..., 0], read[..., 1:]
+        maps = torch.cat([view0["attn"][:, None], view0["colours"][None].expand(K, -1, -1, -1)], 1)
+
+        def read(points: torch.Tensor):
+            out = read_view0(points, maps, view0["frame"], view0["focal_ratio"])  # (K, P, 4)
+            return out[..., 0], out[..., 1:]
 
         q = self.cell_in(self.cell_pe).expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, cells, axes, half / self.side, a, c), centre, extent
+        return self.head(q, cells, extent / self.side, read), centre, extent

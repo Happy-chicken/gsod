@@ -99,7 +99,8 @@ class GSODModel(nn.Module):
         z_dim: int = 64,
         num_slots: int = 6,
         attn_iter: int = 3,
-        gaussians_per_slot: int = 512,
+        cell_side: int = 8,
+        gaussians_per_cell: int = 8,
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
@@ -117,7 +118,7 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
-        self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
+        self.obj_decoder = ObjectDecoder(z_dim, cell_side, gaussians_per_cell, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:
