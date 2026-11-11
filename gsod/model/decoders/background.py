@@ -98,7 +98,7 @@ class BackgroundDecoder(nn.Module):
         self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame
     ) -> dict[str, torch.Tensor]:
         """latent (C,), attn (s, s) background attention, colours (3, s, s),
-        view 0's SceneFrame and focal ratio -> Gaussians and "fill" (3,)."""
+        view 0's SceneFrame -> Gaussians and "fill" (3,)."""
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
         yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
