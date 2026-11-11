@@ -1,9 +1,8 @@
 """Background decoder: background slot -> floor discs + fill colour.
 
-Each disc reads view 0's colour weighted by a = (background attention)^4,
-detached: half-background object pixels are not copied onto the floor, and
-the floor cannot pull attention from objects. Base colour a*c + (1 - a) *
-mean, MLP residual. World-aligned.
+Each disc reads view 0's colour weighted by the background attention a
+(detached: the floor cannot pull attention from objects). Base colour
+a*c + (1 - a) * mean, MLP residual. World-aligned.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
 _HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
-_COPY_POWER = 4  # read weight = background attention ** this
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
 
@@ -111,7 +109,7 @@ class BackgroundDecoder(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """latent (C,), attn (s, s) background attention, colours (3, s, s),
         view 0's SceneFrame and focal ratio -> Gaussians and "fill" (3,)."""
-        attn = attn.detach().pow(_COPY_POWER)
+        attn = attn.detach()
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
         yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)

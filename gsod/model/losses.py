@@ -1,8 +1,10 @@
-"""Reconstruction loss (no masks), as uORF, over every view:
+"""Reconstruction loss (no masks), uORF's terms on the novel views only:
 
     total = recon * MSE (images in [-1, 1]) + percept * MSE(VGG16 relu4_3)
 
-The perceptual term is on from percept_start (uORF: epoch 20).
+View 0 is left out: both decoders copy it, so there any copy is right;
+on the other views only correct 3D is. The perceptual term is on from
+percept_start (uORF: epoch 20).
 """
 
 from __future__ import annotations
@@ -79,7 +81,7 @@ class GSODLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """-> (total, per-term values for logging)."""
         cfg = self.cfg
-        rendered = outputs["rgb"]
+        rendered, images = outputs["rgb"][1:], images[1:]
         terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}
         weights = {"recon": cfg.recon}
         if self.perceptual is not None and self.percept_on:
