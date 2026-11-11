@@ -1,17 +1,9 @@
-"""Object decoder: object slot -> floor-standing box -> side^3 cubes ->
-k Gaussians per cube.
+"""Object decoder: slot -> floor-standing box -> side^3 cubes -> k Gaussians
+per cube, free inside it.
 
-The box (RegionHead) sits at the slot's attention anchor, shifted along
-view 0's ray and sized by the slot; it is split into side^3 cubes along the
-scene axes. One token per cube (encoded position) attends to the other
-cubes and to the slot, then emits the cube's occupancy and k Gaussians that
-move freely inside it. A Gaussian's opacity is the slot's view-0 attention
-where it projects x its cube's occupancy x its own factor: attention gives
-the silhouette, occupancy where the object is, the Gaussians its shape.
-Occupancy and factor are max(tanh, 0) (as Scaffold-GS filters neural
-Gaussians by opacity > 0): a cube or Gaussian can be exactly off; the
-gradient passes the max (straight-through), so it can come back.
-Colour is view 0's there plus a residual. Scene frame, units of R.
+Opacity = view-0 attention where the Gaussian projects x cube occupancy x
+its own factor; occupancy and factor can be exactly 0 (pruned). Colour =
+view 0's there + residual. Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -35,9 +27,8 @@ OBJECT_HEIGHT = 1.2
 EXTENT_INIT = 0.9
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Gaussian scale range, in cube half sizes; Gaussians stay inside their cube.
+# Gaussian scale range, in cube half sizes.
 GAUSS_SCALE = (0.1, 1.0)
-# Initial cube occupancy and Gaussian opacity factor.
 OCCUPANCY_INIT = 0.9
 OPACITY_INIT = 0.7
 # Per Gaussian: offset 3, scale 3, quat 4, opacity 1, rgb 3, sh1 9.
@@ -50,8 +41,7 @@ def _logit(p: float) -> float:
 
 
 def _gate(raw: torch.Tensor) -> torch.Tensor:
-    """max(tanh(raw), 0); backward as tanh (straight-through), so a value
-    pruned to 0 still learns whether it should come back."""
+    """max(tanh, 0); gradient as tanh, so a pruned value can come back."""
     t = torch.tanh(raw)
     return t + (t.clamp_min(0.0) - t).detach()
 
@@ -107,7 +97,7 @@ class ObjectHead(nn.Module):
         self.project = nn.Sequential(
             nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 1 + per_cube * GAUSS_PARAMS)
         )
-        lin = (torch.arange(sub) + 0.5) / sub * 2.0 - 1.0  # sub-grid of the cube
+        lin = (torch.arange(sub) + 0.5) / sub * 2.0 - 1.0
         start = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         lo, hi = (math.log(s) for s in GAUSS_SCALE)
         with torch.no_grad():
@@ -118,15 +108,14 @@ class ObjectHead(nn.Module):
             w = out.weight[1:].view(per_cube, GAUSS_PARAMS, d_model)
             w[:, 14:] = 0.0  # view-independent at first
             g = out.bias[1:].view(per_cube, GAUSS_PARAMS)
-            g[:, 0:3] = torch.atanh(start)  # spread over the cube
-            g[:, 3:6] = _logit((math.log(1.0 / sub) - lo) / (hi - lo))  # one sub-cell
+            g[:, 0:3] = torch.atanh(start)  # sub-grid of the cube
+            g[:, 3:6] = _logit((math.log(1.0 / sub) - lo) / (hi - lo))
             g[:, 6] = 1.0  # identity quaternion (wxyz)
             g[:, 10] = math.atanh(OPACITY_INIT)
 
     def forward(self, feat: torch.Tensor, centres: torch.Tensor, half: torch.Tensor, read) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), cube centres (K, G, 3), cube half sizes (K, 3),
-        read: points (K, P, 3) -> view-0 attention (K, P), colours (K, P, 3)
-        -> Gaussians (K, G * k, ...) and the share of them not pruned (K,)."""
+        """feat (K, G, d), centres (K, G, 3), half sizes (K, 3), read: points
+        -> attention, colours -> Gaussians (K, G * k, ...), kept share (K,)."""
         K, G = feat.shape[:2]
         raw = self.project(feat)
         occupancy = _gate(raw[..., 0])  # (K, G)
@@ -183,8 +172,7 @@ class ObjectDecoder(nn.Module):
         n_tokens: int = 8,
         n_layers: int = 2,
     ):
-        """cell_side^3 cubes, gaussians_per_cell Gaussians each; hidden_dim:
-        the attention width."""
+        """cell_side^3 cubes x gaussians_per_cell Gaussians."""
         super().__init__()
         d = int(hidden_dim)
         side = int(cell_side)
@@ -205,18 +193,18 @@ class ObjectDecoder(nn.Module):
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, view0: dict
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray (K, 3); view0: the slots' "attn" (K, s, s),
-        "colours" (3, s, s), "frame", "focal_ratio" -> Gaussians (K, G, ...),
-        box centres and half sizes (K, 3), share of Gaussians not pruned (K,)."""
+        """slots (K, C); anchor, ray (K, 3); view0: "attn" (K, s, s), "colours"
+        (3, s, s), "frame", "focal_ratio" -> Gaussians, centres, half sizes,
+        kept share (K,)."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         cells = centre[:, None] + extent[:, None] * self.cell_grid
 
-        # Not detached: reconstruction trains the attention through the opacity.
+        # Attention not detached: it gets gradients through the opacity.
         maps = torch.cat([view0["attn"][:, None], view0["colours"][None].expand(K, -1, -1, -1)], 1)
 
         def read(points: torch.Tensor):
-            out = read_view0(points, maps, view0["frame"], view0["focal_ratio"])  # (K, P, 4)
+            out = read_view0(points, maps, view0["frame"], view0["focal_ratio"])
             return out[..., 0], out[..., 1:]
 
         q = self.cell_in(self.cell_pe).expand(K, -1, -1)

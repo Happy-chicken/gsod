@@ -22,8 +22,8 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    cell_side: int = 8  # object box: cell_side^3 cubes
-    gaussians_per_cell: int = 8  # Gaussians per cube (a cube number)
+    cell_side: int = 8  # cell_side^3 cubes per object
+    gaussians_per_cell: int = 8  # a cube number
     decoder_hidden_dim: int = 128
     near: float = 0.1
 

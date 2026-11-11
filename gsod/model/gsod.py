@@ -191,7 +191,7 @@ class GSODModel(nn.Module):
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
-            "kept": scene["objects"]["kept"],  # (K-1,) share of Gaussians not pruned
+            "kept": scene["objects"]["kept"],  # (K-1,) unpruned share
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
