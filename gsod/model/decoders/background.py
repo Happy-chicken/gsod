@@ -1,8 +1,8 @@
 """Background decoder: background slot -> floor discs + fill colour.
 
-Each disc reads view 0's colour weighted by background attention a (not
-detached: a wrong copy trains it); base colour a*c + (1 - a) * mean, MLP
-residual. World-aligned.
+Disc colour = the background's mean view-0 colour + MLP(PE(x), latent,
+view-0 azimuth) residual. Nothing is read per pixel, so the background
+cannot copy an object onto the floor. World-aligned.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import torch
 from torch import nn
 
 from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
-from gsod.utils.geometry import read_view0, yaw_matrix
 
 _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
@@ -87,25 +86,16 @@ class BackgroundDecoder(nn.Module):
 
     def __init__(self, z_dim: int, hidden_dim: int):
         super().__init__()
-        # Inputs: PE(x), latent, azimuth, a*c (3) and a (1) read from view 0.
-        self.appearance = _mlp(3 + 6 * _PE_BANDS + z_dim + 2 + 4, hidden_dim)
+        # Inputs: PE(x), latent, azimuth.
+        self.appearance = _mlp(3 + 6 * _PE_BANDS + z_dim + 2, hidden_dim)
         self.head = BackgroundHead(hidden_dim, z_dim + 2)
         mu, spacing = floor_grid()
         self.register_buffer("floor_mu", mu, persistent=False)
         scale = torch.stack([spacing, spacing, torch.full_like(spacing, BACKGROUND_THICKNESS)], -1)
         self.register_buffer("floor_scale", scale, persistent=False)
 
-    def _read_view0(self, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio):
-        """Where each disc projects in view 0: a*c (N, 3) and a (N,), a the
-        background's attention, c the colour."""
-        points = self.floor_mu @ yaw_matrix(-frame.yaw).to(self.floor_mu.dtype).T  # scene frame
-        a = attn[None]
-        maps = torch.cat([a * colours, a], 0)[None]  # (1, 4, s, s)
-        out = read_view0(points[None], maps, frame, focal_ratio)[0]  # (N, 4)
-        return out[:, :3], out[:, 3]
-
     def forward(
-        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame, focal_ratio
+        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame
     ) -> dict[str, torch.Tensor]:
         """latent (C,), attn (s, s) background attention, colours (3, s, s),
         view 0's SceneFrame and focal ratio -> Gaussians and "fill" (3,)."""
@@ -115,14 +105,12 @@ class BackgroundDecoder(nn.Module):
         scene = torch.cat([latent, azimuth])  # (C + 2,)
         n = self.floor_mu.shape[0]
         pe = positional_encoding(self.floor_mu / _HALF, _PE_BANDS)
-        ac, a = self._read_view0(attn, colours, frame, focal_ratio)
-        base = ac + (1.0 - a)[:, None] * mean
-        feat = self.appearance(torch.cat([pe, scene.expand(n, -1), ac, a[:, None]], -1))
+        feat = self.appearance(torch.cat([pe, scene.expand(n, -1)], -1))
         return {
             "mu": self.floor_mu,
             "scale": self.floor_scale,
             "quat": self.floor_mu.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(n, -1),
             "opacity": self.head.opacity(feat),
-            **self.head.colour(feat, base),
+            **self.head.colour(feat, mean),
             "fill": self.head.fill(scene, mean),
         }

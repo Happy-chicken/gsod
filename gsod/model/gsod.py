@@ -160,7 +160,7 @@ class GSODModel(nn.Module):
         world floor discs (N, ...) and "fill" (3,)."""
         side = self.input_size
         gaussians = self.bg_decoder(
-            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame, self.focal_ratio
+            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame
         )
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
