@@ -9,24 +9,16 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class LossConfig:
-    """Term weights; 0 = off."""
+    """As uORF, every view."""
 
-    l1: float = 1.0  # novel views
-    ssim: float = 0.2  # 1 - SSIM, novel views
-    view0: float = 1.0  # L1 on view 0
-    mse: float = 0.0  # every view, images in [-1, 1] (uORF)
-    percept: float = 0.0  # VGG16 relu4_3 feature MSE, every view (uORF: 0.006)
-
-
-def uorf_loss() -> LossConfig:
-    """uORF's terms: MSE + perceptual over every view."""
-    return LossConfig(l1=0.0, ssim=0.0, view0=0.0, mse=1.0, percept=0.006)
+    recon: float = 1.0  # MSE, images in [-1, 1]
+    percept: float = 0.006  # MSE of VGG16 relu4_3 features
 
 
 @dataclass
 class BaseConfig:
     # --- model
-    input_size: int = 64  # encoder input side
+    input_size: int = 128  # encoder input side
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
