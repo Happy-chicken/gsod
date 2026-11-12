@@ -11,7 +11,7 @@ from gsod.utils.io import default_out_dir
 class LossConfig:
     """Every view."""
 
-    recon: float = 1.0  # L1 (3DGS)
+    recon: float = 1.0  # MSE -> L1 (l1_ramp)
     ssim: float = 0.2  # 1 - SSIM
 
 
@@ -32,6 +32,7 @@ class BaseConfig:
     lr_warmup: float = 0.06
     lr_final: float = 0.02
     draw_ramp: float = 0.1  # draw factor power 0 -> 1
+    l1_ramp: tuple[float, float] = (0.1, 0.3)  # reconstruction MSE -> L1
     grad_clip: float = 1.0  # 0 = off
     seed: int = 0
     log_every: int = 100  # steps

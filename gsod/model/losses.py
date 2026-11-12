@@ -1,6 +1,10 @@
 """Reconstruction loss (no masks), every view:
 
-    total = recon * L1 + ssim * (1 - SSIM)   (as 3DGS)
+    total = recon * ((1 - t) * MSE + t * L1) + ssim * (1 - SSIM)
+
+MSE (images in [-1, 1]) first: it chases the large errors, so objects
+separate from the floor fast; then L1 (t ramped by the trainer) for sharp
+edges, as 3DGS.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
+        self.l1_mix = 1.0  # t, set by the trainer
 
     def forward(
         self, outputs: dict[str, torch.Tensor], images: torch.Tensor
@@ -52,8 +57,10 @@ class GSODLoss(nn.Module):
         """-> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
-        # terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}  # uORF
-        terms = {"recon": F.l1_loss(rendered, images), "ssim": 1.0 - ssim(rendered, images)}
+        t = self.l1_mix
+        mse = F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0) if t < 1 else 0.0
+        l1 = F.l1_loss(rendered, images) if t > 0 else 0.0
+        terms = {"recon": (1.0 - t) * mse + t * l1, "ssim": 1.0 - ssim(rendered, images)}
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
 
         total = sum(weights[name] * value for name, value in terms.items())
