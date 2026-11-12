@@ -19,7 +19,7 @@ OBJECT_RADIUS = (0.05, 0.2)
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
 # Largest box half width / height (units of r_max).
 OBJECT_WIDTH = 1.5
-OBJECT_HEIGHT = 1.2
+OBJECT_HEIGHT = 1.6
 # Initial box size (share of its range).
 EXTENT_INIT = 0.9
 # Height of boxes and Gaussians above the floor.
