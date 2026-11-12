@@ -9,10 +9,9 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class LossConfig:
-    """Every view."""
-
-    recon: float = 1.0  # L1 (3DGS)
-    ssim: float = 0.2  # 1 - SSIM
+    recon: float = 1.0  # MSE, novel views
+    view0: float = 0.5  # MSE, view 0
+    ssim: float = 0.2  # 1 - SSIM, every view
 
 
 @dataclass

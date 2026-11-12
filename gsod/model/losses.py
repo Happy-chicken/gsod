@@ -1,6 +1,7 @@
-"""Reconstruction loss (no masks), every view:
+"""Reconstruction loss (no masks), images in [-1, 1] for MSE:
 
-    total = recon * L1 + ssim * (1 - SSIM)   (as 3DGS)
+    total = recon * MSE (novel views) + view0 * MSE (view 0)
+          + ssim * (1 - SSIM) (every view)
 """
 
 from __future__ import annotations
@@ -52,9 +53,13 @@ class GSODLoss(nn.Module):
         """-> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
-        # terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}  # uORF
-        terms = {"recon": F.l1_loss(rendered, images), "ssim": 1.0 - ssim(rendered, images)}
-        weights = {"recon": cfg.recon, "ssim": cfg.ssim}
+        x, y = 2.0 * rendered - 1.0, 2.0 * images - 1.0
+        terms = {
+            "recon": F.mse_loss(x[1:], y[1:]),
+            "view0": F.mse_loss(x[:1], y[:1]),
+            "ssim": 1.0 - ssim(rendered, images),
+        }
+        weights = {"recon": cfg.recon, "view0": cfg.view0, "ssim": cfg.ssim}
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}
