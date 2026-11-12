@@ -1,8 +1,7 @@
 """Object decoder: slot -> box about the attention anchor (its height
 spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
 
-G queries, sampled per slot from a learned Gaussian (reparameterised),
-attend among themselves and to the slot. Opacity is
+G learned queries attend among themselves and to the slot. Opacity is
 normalised per slot (the draw factor scales the slot's layer); colour = the
 colour at the slot's attention anchor + residual. Scene frame, units of R.
 """
@@ -26,10 +25,8 @@ MIN_HEIGHT = 0.01
 # Gaussian scale range and initial scale (units of r_max).
 SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
-# Gaussian queries q = mu + sigma * eps, eps ~ N(0, I) (reparameterised):
-# initial sigma (how far apart Gaussians start); fixed seed when evaluating.
+# Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
-EVAL_SEED = 0
 
 
 def _logit(p: float) -> float:
@@ -154,9 +151,7 @@ class ObjectDecoder(nn.Module):
         super().__init__()
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
-        self.n_gaussians = int(gaussians_per_slot)
-        self.query_mu = nn.Parameter(torch.zeros(d))
-        self.query_log_sigma = nn.Parameter(torch.full((d,), math.log(QUERY_STD)))
+        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
@@ -170,13 +165,7 @@ class ObjectDecoder(nn.Module):
         """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
-        shape = (K, self.n_gaussians, self.d)
-        if self.training:
-            eps = torch.randn(shape, device=slots.device, dtype=slots.dtype)
-        else:
-            gen = torch.Generator(device=slots.device).manual_seed(EVAL_SEED)
-            eps = torch.randn(shape, generator=gen, device=slots.device, dtype=slots.dtype)
-        q = self.query_mu + self.query_log_sigma.exp() * eps
+        q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
