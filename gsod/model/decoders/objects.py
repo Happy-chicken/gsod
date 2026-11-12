@@ -1,7 +1,7 @@
 """Object decoder: slot -> box about the attention anchor (its height
 spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
 
-G queries, sampled per slot from a learned Gaussian (reparameterised),
+G queries, each sampled from its own learned Gaussian (reparameterised),
 attend among themselves and to the slot. Opacity is
 normalised per slot (the draw factor scales the slot's layer); colour = the
 colour at the slot's attention anchor + residual. Scene frame, units of R.
@@ -26,9 +26,11 @@ MIN_HEIGHT = 0.01
 # Gaussian scale range and initial scale (units of r_max).
 SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
-# Gaussian queries q = mu + sigma * eps, eps ~ N(0, I) (reparameterised):
-# initial sigma (how far apart Gaussians start); fixed seed when evaluating.
+# Query i = mu_i + sigma_i * eps, eps ~ N(0, I) (reparameterised): mu_i start
+# ~ N(0, QUERY_STD^2) (how far apart Gaussians start), sigma_i at QUERY_NOISE;
+# fixed seed when evaluating.
 QUERY_STD = 2.0
+QUERY_NOISE = 0.1
 EVAL_SEED = 0
 
 
@@ -155,8 +157,8 @@ class ObjectDecoder(nn.Module):
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
         self.n_gaussians = int(gaussians_per_slot)
-        self.query_mu = nn.Parameter(torch.zeros(d))
-        self.query_log_sigma = nn.Parameter(torch.full((d,), math.log(QUERY_STD)))
+        self.query_mu = nn.Parameter(torch.randn(self.n_gaussians, d) * QUERY_STD)
+        self.query_log_sigma = nn.Parameter(torch.full((self.n_gaussians, d), math.log(QUERY_NOISE)))
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
