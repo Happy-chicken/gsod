@@ -130,15 +130,24 @@ class GSODModel(nn.Module):
         return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self,
+        slots: torch.Tensor,
+        attn: torch.Tensor,
+        values: torch.Tensor,
+        colours: torch.Tensor,
+        frame: SceneFrame,
     ) -> dict[str, torch.Tensor]:
-        """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
-        -> world Gaussians (K-1, G, ...) and box half sizes "extent" (K-1, 3)."""
+        """Object slots (K-1, C), attention (K-1, s*s), slot-attention values
+        (s*s, C), token colours (s*s, 3) -> world Gaussians (K-1, G, ...) and
+        box half sizes "extent" (K-1, 3)."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        gaussians, _, extent = self.obj_decoder(slots, anchor=anchor, ray=ray, colour=colour)
+        idx = (torch.arange(side, device=attn.device, dtype=attn.dtype) + 0.5) / side
+        vv, uu = torch.meshgrid(idx, idx, indexing="ij")
+        coords = torch.stack([uu.flatten(), vv.flatten()], -1)  # (s*s, 2), row-major
+        gaussians, _, extent = self.obj_decoder(slots, anchor, ray, colour, attn, values, coords)
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
@@ -201,10 +210,10 @@ class GSODModel(nn.Module):
         outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
-        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
+        bg_slot, slots, attn, values = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, frame),
+            "objects": self.decode_objects(slots, attn[1:], values, colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:], self.draw_power),
             "attn": attn,
