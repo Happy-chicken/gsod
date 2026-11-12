@@ -1,6 +1,6 @@
 """Reconstruction loss (no masks), every view; weight 0 = off:
 
-    total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
+    total = recon * L1 + ssim * (1 - SSIM)   (as 3DGS)
           + percept * MSE(VGG16 relu4_3)   (from percept_start, as uORF)
 """
 
@@ -79,7 +79,8 @@ class GSODLoss(nn.Module):
         """-> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
-        terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}
+        # terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}  # uORF
+        terms = {"recon": F.l1_loss(rendered, images)}
         weights = {"recon": cfg.recon}
         if cfg.ssim > 0:
             terms["ssim"], weights["ssim"] = 1.0 - ssim(rendered, images), cfg.ssim

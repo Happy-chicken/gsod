@@ -11,7 +11,7 @@ from gsod.utils.io import default_out_dir
 class LossConfig:
     """Every view; 0 = off."""
 
-    recon: float = 1.0  # MSE, images in [-1, 1] (uORF)
+    recon: float = 1.0  # L1 (3DGS)
     ssim: float = 0.2  # 1 - SSIM
     percept: float = 0.0  # MSE of VGG16 relu4_3 features (uORF: 0.006)
 
