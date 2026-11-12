@@ -1,4 +1,5 @@
-"""Object decoder: slot -> floor-standing box -> G Gaussians free in it.
+"""Object decoder: slot -> box about the attention anchor (its height
+spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
 
 G learned queries attend among themselves and to the slot. Opacity is
 normalised per slot (the draw factor scales the slot's layer); colour = the
@@ -69,7 +70,7 @@ class RegionHead(nn.Module):
         t = self.shift_bound * torch.tanh(raw[:, :2])
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
         extent = self.r_min + self.r_max * F.softplus(raw[:, 2:])
-        return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
+        return torch.cat([xy, anchor[:, 2:]], -1), extent
 
 
 class ObjectHead(nn.Module):
@@ -95,8 +96,12 @@ class ObjectHead(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
-        mu = centre[:, None] + extent[:, None] * torch.tanh(raw[..., 0:3])
-        mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
+        t = torch.tanh(raw[..., 0:3])
+        xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
+        # Height: over [centre - extent, centre + extent] cut at the floor.
+        lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)[:, None, None]
+        hi = (centre[:, 2] + extent[:, 2])[:, None, None]
+        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
         opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
         return {
