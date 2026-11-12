@@ -1,8 +1,7 @@
-"""Reconstruction loss (no masks), as uORF, over every view:
+"""Reconstruction loss (no masks), every view; weight 0 = off:
 
-    total = recon * MSE (images in [-1, 1]) + percept * MSE(VGG16 relu4_3)
-
-The perceptual term is on from percept_start (uORF: epoch 20).
+    total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
+          + percept * MSE(VGG16 relu4_3)   (from percept_start, as uORF)
 """
 
 from __future__ import annotations
@@ -82,6 +81,8 @@ class GSODLoss(nn.Module):
         rendered = outputs["rgb"]
         terms = {"recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0)}
         weights = {"recon": cfg.recon}
+        if cfg.ssim > 0:
+            terms["ssim"], weights["ssim"] = 1.0 - ssim(rendered, images), cfg.ssim
         if self.perceptual is not None and self.percept_on:
             terms["percept"] = self.perceptual(rendered, images)
             weights["percept"] = cfg.percept

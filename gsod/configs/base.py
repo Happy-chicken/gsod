@@ -9,10 +9,11 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class LossConfig:
-    """As uORF, every view."""
+    """Every view; 0 = off."""
 
-    recon: float = 1.0  # MSE, images in [-1, 1]
-    percept: float = 0.006  # MSE of VGG16 relu4_3 features; 0 = off
+    recon: float = 1.0  # MSE, images in [-1, 1] (uORF)
+    ssim: float = 0.2  # 1 - SSIM
+    percept: float = 0.0  # MSE of VGG16 relu4_3 features (uORF: 0.006)
 
 
 @dataclass
