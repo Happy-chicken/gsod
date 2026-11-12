@@ -1,7 +1,6 @@
 """Reconstruction loss (no masks), every view; weight 0 = off:
 
     total = recon * L1 + ssim * (1 - SSIM)   (as 3DGS)
-          + percept * MSE(VGG16 relu4_3)   (from percept_start, as uORF)
 """
 
 from __future__ import annotations
@@ -11,30 +10,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs.base import LossConfig
-
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-class Perceptual(nn.Module):
-    """Frozen VGG16 up to relu4_3 (ImageNet weights, as uORF)."""
-
-    def __init__(self):
-        super().__init__()
-        from torchvision.models import VGG16_Weights, vgg16
-
-        self.net = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:23].eval()
-        self.net.requires_grad_(False)
-        self.register_buffer("mean", torch.tensor(_IMAGENET_MEAN)[:, None, None], persistent=False)
-        self.register_buffer("std", torch.tensor(_IMAGENET_STD)[:, None, None], persistent=False)
-
-    def train(self, mode: bool = True):
-        return super().train(False)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """x, y (B, 3, H, W) in [0, 1] -> MSE of their features."""
-        f = self.net((torch.cat([x, y]) - self.mean) / self.std)
-        return F.mse_loss(*f.chunk(2))
 
 
 def _gaussian_window(
@@ -70,8 +45,6 @@ class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
-        self.percept_on = True  # set by the trainer
-        self.perceptual = Perceptual() if cfg.percept > 0 else None
 
     def forward(
         self, outputs: dict[str, torch.Tensor], images: torch.Tensor
@@ -84,9 +57,6 @@ class GSODLoss(nn.Module):
         weights = {"recon": cfg.recon}
         if cfg.ssim > 0:
             terms["ssim"], weights["ssim"] = 1.0 - ssim(rendered, images), cfg.ssim
-        if self.perceptual is not None and self.percept_on:
-            terms["percept"] = self.perceptual(rendered, images)
-            weights["percept"] = cfg.percept
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}
