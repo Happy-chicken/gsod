@@ -17,11 +17,8 @@ from torch import nn
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
-# Largest box half width (units of r_max); the half height has no upper limit.
-OBJECT_WIDTH = 1.5
-# Initial box half width (share of its range) and half height (units of r_max).
-EXTENT_INIT = 0.9
-HEIGHT_INIT = 1.2
+# Initial box half sizes x, y, z (units of r_max); no upper limit.
+EXTENT_INIT = (1.375, 1.375, 1.2)
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
 # Gaussian scale range and initial scale (units of r_max).
@@ -47,8 +44,8 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
 
 
 class RegionHead(nn.Module):
-    """Slot latent -> box shift (along / across view 0's ray) and half sizes:
-    width in [r_min, OBJECT_WIDTH r_max], height r_min + r_max softplus(.)."""
+    """Slot latent -> box shift (along / across view 0's ray) and half sizes
+    r_min + r_max softplus(.) (no upper limit)."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
@@ -56,12 +53,11 @@ class RegionHead(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
         self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
         self.r_min, self.r_max = r_min, r_max
-        self.width_hi = OBJECT_WIDTH * r_max
         with torch.no_grad():
             self.mlp[-1].weight.zero_()
             self.mlp[-1].bias.zero_()
-            self.mlp[-1].bias[2:4] = _logit(EXTENT_INIT)
-            self.mlp[-1].bias[4] = math.log(math.expm1(HEIGHT_INIT - r_min / r_max))
+            for i, size in enumerate(EXTENT_INIT):
+                self.mlp[-1].bias[2 + i] = math.log(math.expm1(size - r_min / r_max))
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
@@ -72,9 +68,7 @@ class RegionHead(nn.Module):
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
         t = self.shift_bound * torch.tanh(raw[:, :2])
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        width = self.r_min + (self.width_hi - self.r_min) * torch.sigmoid(raw[:, 2:4])
-        height = self.r_min + self.r_max * F.softplus(raw[:, 4:5])
-        extent = torch.cat([width, height], -1)
+        extent = self.r_min + self.r_max * F.softplus(raw[:, 2:])
         return torch.cat([xy, MIN_HEIGHT + extent[:, 2:]], -1), extent
 
 
