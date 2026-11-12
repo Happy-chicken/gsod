@@ -33,8 +33,10 @@ class GsplatSplatter:
         image_size: tuple[int, int],
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
+        features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """-> (V, C, H, W) "rgb", "depth" (premultiplied by alpha), "alpha"."""
+        """-> (V, C, H, W) "rgb", "depth" (premultiplied by alpha), "alpha";
+        with features (N, D) instead of colours: "features" (V, D, H, W), "alpha"."""
         if not gaussians["mu"].is_cuda:
             raise RuntimeError(
                 "GsplatSplatter needs CUDA tensors; this project requires CUDA"
@@ -48,7 +50,10 @@ class GsplatSplatter:
         scale = gaussians["scale"].float().contiguous()
         quat = gaussians["quat"].float().contiguous()
         opacity = gaussians["opacity"].float().contiguous()
-        colors, sh_degree = sh_coefficients(gaussians)
+        if features is None:
+            colors, sh_degree = sh_coefficients(gaussians)
+        else:
+            colors, sh_degree = features.float().contiguous(), None
 
         # gsplat takes OpenCV world-to-camera matrices.
         cam2world = cam2world.to(device=device)
@@ -76,11 +81,13 @@ class GsplatSplatter:
             eps2d=self.eps2d,
             sh_degree=sh_degree,
             packed=self.packed,
-            render_mode="RGB+D",
+            render_mode="RGB+D" if features is None else "RGB",
             rasterize_mode=self.rasterize_mode,
             camera_model="pinhole",
         )
 
+        if features is not None:
+            return {"features": rendered.permute(0, 3, 1, 2), "alpha": alpha.permute(0, 3, 1, 2)}
         return {
             "rgb": rendered[..., :3].permute(0, 3, 1, 2),
             "depth": rendered[..., 3:4].permute(0, 3, 1, 2),

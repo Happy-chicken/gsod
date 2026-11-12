@@ -1,15 +1,15 @@
 """Slot model: view 0 -> slots -> Gaussians -> splatted into every view.
 
     encode / slot attention   view 0 -> background slot + K-1 object slots
-    decode_objects            object slot -> box of cells; opacity =
-                              slot attention where a cell projects x occupancy
-    decode_background         background slot (+ view 0 where the floor shows)
-                              -> floor discs + fill colour
-    render                    per-slot layers, soft depth order, over the
-                              background
+    decode_objects            object slot -> box at its attention anchor ->
+                              Gaussians in it
+    decode_background         background slot -> floor discs + fill colour
+    render                    all Gaussians (object opacities x the slot's
+                              draw factor, floor discs) sorted and blended
+                              together; slot masks from the same blending
 
-Attention is never detached: reconstruction trains the grouping. Decoders
-work in view 0's scene frame (utils/geometry.py). Slot 0 is the background.
+Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
+background.
 """
 
 from __future__ import annotations
@@ -25,8 +25,6 @@ from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
 from gsod.utils.splatter import GsplatSplatter
 
-# Transparent parts count as a layer at the far depth with this weight.
-_ALPHA_EPS = 1e-3
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 # Draw factor: occupancy drawn fully; token count drawn at half.
@@ -84,33 +82,6 @@ def attention_anchors(
     attention points and the colour there (K, 3)."""
     p = (_ANCHOR_SHARPNESS * attn.log()).softmax(dim=1)
     return p @ points, p @ colours
-
-
-def composite(
-    layers: list[dict[str, torch.Tensor]], tau: torch.Tensor, far: torch.Tensor, background: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Slot layers in soft depth order over the background:
-
-        T_k   = prod_{j != k} (1 - alpha_j * sigmoid((d_k - d_j) / tau))
-        image = sum_k T_k * rgb_k + prod_k (1 - alpha_k) * background
-
-    Returns image (V, 3, H, W), weights (V, 1 + K, H, W), contributions
-    (V, K, 3, H, W).
-    """
-    rgb = torch.stack([layer["rgb"] for layer in layers], 1)  # (V, K, 3, H, W)
-    alpha = torch.stack([layer["alpha"] for layer in layers], 1)  # (V, K, 1, H, W)
-    acc_depth = torch.stack([layer["depth"] for layer in layers], 1)
-    depth = (acc_depth + _ALPHA_EPS * far) / (alpha + _ALPHA_EPS)
-    # [v, j, k] = d_k - d_j: j in front of k.
-    front = torch.sigmoid((depth[:, None] - depth[:, :, None]) / tau)
-    not_self = 1.0 - torch.eye(alpha.shape[1], device=alpha.device, dtype=alpha.dtype)
-    front = front * not_self[None, :, :, None, None, None]
-    transmittance = (1.0 - alpha[:, :, None] * front).prod(1)  # (V, K, 1, H, W)
-    uncovered = (1.0 - alpha).prod(1)  # (V, 1, H, W)
-    contributions = transmittance * rgb
-    image = contributions.sum(1) + uncovered * background
-    weights = torch.cat([uncovered, (transmittance * alpha)[:, :, 0]], 1)
-    return image, weights, contributions
 
 
 class GSODModel(nn.Module):
@@ -183,27 +154,41 @@ class GSODModel(nn.Module):
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
 
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
-        """A scene (forward(render=False)) rendered into cam2world (N, 4, 4)."""
-        obj = scene["objects"]["gaussians"]
-        bg = scene["background"]
-        draw, slots = scene["draw"], scene["slots"]
+        """A scene (forward(render=False)) rendered into cam2world (N, 4, 4):
+        every Gaussian, object or floor, sorted and blended together."""
+        obj, bg, draw = scene["objects"]["gaussians"], scene["background"], scene["draw"]
+        n_obj, n_gauss = obj["mu"].shape[:2]
+        floor = bg["gaussians"]
+        objects = {name: value.flatten(0, 1) for name, value in obj.items()}
+        objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
+        every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
-        layers = []
-        for k in range(slots.shape[0]):
-            layer = self.splat({name: obj[name][k] for name in obj}, *cams)
-            layers.append({name: draw[k] * value for name, value in layer.items()})
-        floor = self.splat(bg["gaussians"], *cams)
-        bg_rgb = floor["rgb"] + (1.0 - floor["alpha"]) * bg["fill"][None, :, None, None]
-        frame = scene["frame"]
-        tau = 0.25 * OBJECT_RADIUS[1] * frame.scale
-        far = (frame.origin.norm() + 2.0 * OBJECT_REGION) * frame.scale
-        image, weights, slot_rgb = composite(layers, tau, far, bg_rgb)
+        fill = bg["fill"][None, :, None, None]
+        out = self.splat(every, *cams)
+        image = out["rgb"] + (1.0 - out["alpha"]) * fill
+
+        # Decomposition from the same blending (no gradient): per-slot weights
+        # (0 = floor + fill) and per-object colour contributions.
+        with torch.no_grad():
+            every = {name: value.detach() for name, value in every.items()}
+            ids = torch.cat([
+                torch.arange(1, n_obj + 1, device=image.device).repeat_interleave(n_gauss),
+                torch.zeros(floor["mu"].shape[0], dtype=torch.long, device=image.device),
+            ])
+            onehot = F.one_hot(ids, n_obj + 1).float()
+            obj_rgb = (onehot[:, 1:, None] * every["rgb"][:, None]).flatten(1)
+            parts = self.splat(every, *cams, features=torch.cat([onehot, obj_rgb], 1))["features"]
+            weights = parts[:, : n_obj + 1].clone()
+            weights[:, 0] += (1.0 - out["alpha"][:, 0]).detach()
+            slot_rgb = parts[:, n_obj + 1 :].unflatten(1, (n_obj, 3))
+            floor_only = self.splat({name: value.detach() for name, value in floor.items()}, *cams)
+            bg_rgb = floor_only["rgb"] + (1.0 - floor_only["alpha"]) * fill.detach()
 
         return {
             "rgb": image,  # (N, 3, H, W)
             "fg_rgb": slot_rgb.sum(1),
             "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W)
-            "bg_rgb": bg_rgb,
+            "bg_rgb": bg_rgb,  # the floor alone
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
