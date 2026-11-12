@@ -22,7 +22,8 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    gaussians_per_slot: int = 512
+    ray_side: int = 64  # object Gaussians: view-0 pixel grid side
+    ray_layers: int = 2  # Gaussians per pixel (surface, back)
     decoder_hidden_dim: int = 128
     near: float = 0.1
 

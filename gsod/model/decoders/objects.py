@@ -1,9 +1,16 @@
-"""Object decoder: slot -> box about the attention anchor (its height
-spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
+"""Object decoder: geometry lifted from view 0's pixels, slots own it.
 
-G learned queries attend among themselves and to the slot. Opacity is
-normalised per slot (the draw factor scales the slot's layer); colour = the
-colour at the slot's attention anchor + residual. Scene frame, units of R.
+Every pixel of a side x side grid of view 0 carries `layers` Gaussians along
+its ray (visible surface, back), predicted from the pixel's feature mixed
+with the slots it belongs to. Ownership w = softmax over slots (background
+first) of query(pixel) . key(slot). A Gaussian owned by object slot k is
+drawn only inside k's box (RegionHead, at k's attention anchor) and by k's
+draw factor:
+
+    opacity = base * sum_k w_k * inside_k * draw_k     (k = objects)
+
+so reconstruction depends on the ownership. Colour = view 0's at the pixel
++ residual. Scene frame, units of R; t is view-0 camera depth.
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from gsod.utils.geometry import camera_directions
+
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
@@ -22,11 +31,16 @@ OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
 EXTENT_INIT = (1.375, 1.375, 1.2)
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Gaussian scale range and initial scale (units of r_max).
-SCALE_RANGE = (1.0 / 40.0, 1.0)
-SCALE_INIT = 1.0 / 8.0
-# Spread of the learned queries (how far apart Gaussians start).
-QUERY_STD = 2.0
+# Softness of a box's faces (units of R).
+BOX_EDGE = 0.02
+# A Gaussian's depth: t = t_floor * (1 - DEPTH_SPAN * sigmoid(raw)); layer starts.
+DEPTH_SPAN = 0.6
+DEPTH_INIT = (0.3, 0.15)
+# Gaussian scale range, in pixel footprints at its depth.
+PIXEL_SCALE = (0.5, 4.0)
+OPACITY_INIT = 0.9
+# Per Gaussian: depth 1, scale 3, quat 4, opacity 1, rgb 3, sh1 9.
+GAUSS_PARAMS = 21
 
 
 def _logit(p: float) -> float:
@@ -42,6 +56,16 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
     freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
     angles = x[..., None] * freqs  # (N, 3, bands)
     return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
+
+
+def inside_boxes(mu: torch.Tensor, centre: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
+    """Points (N, 3), boxes (K, 3) -> soft inside (N, K); heights cut at the floor."""
+    d = (mu[:, None, :2] - centre[None, :, :2]).abs()
+    side = torch.sigmoid((extent[None, :, :2] - d) / BOX_EDGE).prod(-1)
+    lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)
+    hi = centre[:, 2] + extent[:, 2]
+    z = mu[:, None, 2]
+    return side * torch.sigmoid((z - lo) / BOX_EDGE) * torch.sigmoid((hi - z) / BOX_EDGE)
 
 
 class RegionHead(nn.Module):
@@ -74,100 +98,91 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Gaussian feature -> raw parameters (position 3, scale 3, quat 4,
-    opacity 1, rgb 3, sh1 9) -> one Gaussian."""
+    """Gaussian feature -> raw parameters -> Gaussians along view 0's rays."""
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, layers: int):
         super().__init__()
-        r_max = OBJECT_RADIUS[1]
-        self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
-        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
-        lo, hi = (math.log(s) for s in self.scale_range)
+        self.layers = layers
+        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, GAUSS_PARAMS))
+        lo, hi = (math.log(s) for s in PIXEL_SCALE)
         with torch.no_grad():
             out = self.project[-1]
-            out.weight[3:].mul_(0.1)
-            out.weight[14:].zero_()  # view-independent at first
+            out.weight.mul_(0.1)
+            out.weight[12:].zero_()  # view-independent at first
             out.bias.zero_()
-            out.bias[3:6] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
-            out.bias[6] = 1.0  # identity quaternion (wxyz)
+            out.bias[1:4] = _logit(-lo / (hi - lo))  # one pixel footprint
+            out.bias[4] = 1.0  # identity quaternion (wxyz)
+            out.bias[8] = _logit(OPACITY_INIT)
+        self.depth_bias = nn.Parameter(torch.tensor([_logit(d) for d in DEPTH_INIT]))
 
     def forward(
-        self, feat: torch.Tensor, centre: torch.Tensor, extent: torch.Tensor, colour: torch.Tensor
+        self, feat: torch.Tensor, origin: torch.Tensor, rays: torch.Tensor, t_floor: torch.Tensor,
+        spacing: float, colours: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
-        raw = self.project(feat)
-        t = torch.tanh(raw[..., 0:3])
-        xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
-        # Height: over [centre - extent, centre + extent] cut at the floor.
-        lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)[:, None, None]
-        hi = (centre[:, 2] + extent[:, 2])[:, None, None]
-        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
-        opacity = torch.sigmoid(raw[..., 10])
-        opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
-        return {
-            "mu": mu,
-            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
-            "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "opacity": opacity,
-            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
-            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
+        """feat (N, L, d); camera origin (3,); rays (N, 3) at unit depth; floor
+        depth (N,); pixel spacing per unit depth; colours (N, 3) -> Gaussians
+        (N * L, ...), opacity before ownership."""
+        raw = self.project(feat)  # (N, L, P)
+        t = t_floor[:, None] * (1.0 - DEPTH_SPAN * torch.sigmoid(raw[..., 0] + self.depth_bias))
+        mu = origin + t[..., None] * rays[:, None]
+        out = {
+            "mu": torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1),
+            "scale": (spacing * t)[..., None] * _log_uniform(raw[..., 1:4], *PIXEL_SCALE),
+            "quat": F.normalize(raw[..., 4:8], dim=-1),
+            "opacity": torch.sigmoid(raw[..., 8]),
+            "rgb": torch.sigmoid(torch.logit(colours.clamp(0.02, 0.98))[:, None] + raw[..., 9:12]),
+            "sh1": raw[..., 12:21].unflatten(-1, (3, 3)),
         }
-
-
-class DecoderLayer(nn.Module):
-    """Self-attention among the Gaussians, cross-attention to the slot tokens,
-    FFN; pre-norm."""
-
-    def __init__(self, d_model: int, n_heads: int):
-        super().__init__()
-        self.norm_self = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm_q = nn.LayerNorm(d_model)
-        self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm_ff = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, 2 * d_model), nn.GELU(), nn.Linear(2 * d_model, d_model))
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """q (K, G, d), slot tokens k, v (K, M, d) -> (K, G, d)."""
-        x = self.norm_self(q)
-        q = q + self.self_attn(x, x, x, need_weights=False)[0]
-        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
-        return q + self.ffn(self.norm_ff(q))
+        return {name: value.flatten(0, 1) for name, value in out.items()}
 
 
 class ObjectDecoder(nn.Module):
-    """Object slots -> Gaussians, scene frame."""
+    """Pixel features + slots -> owned Gaussians along view 0's rays."""
 
-    def __init__(
-        self,
-        z_dim: int,
-        gaussians_per_slot: int,
-        hidden_dim: int,
-        *,
-        n_heads: int = 4,
-        n_tokens: int = 8,
-        n_layers: int = 2,
-    ):
+    def __init__(self, z_dim: int, ray_side: int, ray_layers: int, hidden_dim: int):
         super().__init__()
         d = int(hidden_dim)
-        self.M, self.d = int(n_tokens), d
-        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
-        self.k_proj = nn.Linear(z_dim, n_tokens * d)
-        self.v_proj = nn.Linear(z_dim, n_tokens * d)
-        self.norm_kv = nn.LayerNorm(d)
-        self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
+        self.side, self.layers = int(ray_side), int(ray_layers)
+        self.layer_embed = nn.Parameter(torch.randn(self.layers, z_dim) * 0.02)
+        self.query = nn.Linear(z_dim, z_dim)
+        self.key = nn.Linear(z_dim, z_dim)
+        self.mix = nn.Sequential(nn.Linear(2 * z_dim, d), nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True))
         self.region = RegionHead(z_dim)
-        self.head = ObjectHead(d)
+        self.head = ObjectHead(d, self.layers)
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
-        K = slots.shape[0]
+        self, slots: torch.Tensor, bg_slot: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor,
+        draw: torch.Tensor, view0: dict,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """slots (K-1, C), bg_slot (C,), anchor / ray (K-1, 3), draw (K-1,);
+        view0: "features" (C, s, s), "colours" (3, s, s), "frame",
+        "focal_ratio", "image_size" -> Gaussians (N, ...), ownership of
+        object slots (N, K-1), box centres and half sizes (K-1, 3)."""
+        frame, fr, (h, w) = view0["frame"], view0["focal_ratio"], view0["image_size"]
+        r = self.side
+        feat = F.adaptive_avg_pool2d(view0["features"][None], r)[0].flatten(1).T  # (r*r, C)
+        colours = F.adaptive_avg_pool2d(view0["colours"][None], r)[0].flatten(1).T
+
+        # View 0's rays through the grid; depth where they meet the floor.
+        idx = torch.arange(r, device=feat.device, dtype=feat.dtype)
+        v, u = torch.meshgrid((idx + 0.5) * h / r - 0.5, (idx + 0.5) * w / r - 0.5, indexing="ij")
+        rays = camera_directions(u.flatten(), v.flatten(), (h, w), fr) @ frame.rot.T  # (N, 3)
+        far = frame.origin.norm() + 2.0 * OBJECT_REGION
+        dz = rays[:, 2]
+        t_floor = torch.where(dz < -1e-6, (MIN_HEIGHT - frame.origin[2]) / dz.clamp(max=-1e-6), far).clamp(max=far)
+        spacing = 1.0 / (r * math.sqrt(fr[0] * fr[1]))
+
+        # Ownership over [background, objects]; features mixed with the owners.
+        x = feat[:, None] + self.layer_embed  # (N, L, C)
+        every = torch.cat([bg_slot[None], slots], 0)  # (K, C)
+        w_own = (self.query(x) @ self.key(every).T / math.sqrt(x.shape[-1])).softmax(-1)  # (N, L, K)
+        hidden = self.mix(torch.cat([x, w_own @ every], -1))
+        gaussians = self.head(hidden, frame.origin, rays, t_floor, spacing, colours)
+
         centre, extent = self.region(slots, anchor, ray)
-        q = self.queries.expand(K, -1, -1)
-        k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
-        v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
-        for layer in self.layers:
-            q = layer(q, k, v)
-        return self.head(q, centre, extent, colour), centre, extent
+        inside = inside_boxes(gaussians["mu"], centre, extent)  # (N*L, K-1)
+        share = w_own.flatten(0, 1)[:, 1:] * inside * draw  # (N*L, K-1)
+        total = share.sum(-1)
+        gaussians["opacity"] = gaussians["opacity"] * total
+        owner = share / total[:, None].clamp_min(1e-8)
+        return gaussians, owner, centre, extent
