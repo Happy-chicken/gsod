@@ -80,7 +80,7 @@ def attention_anchors(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """attn (K, N), token points and colours (N, 3) -> where each slot's
     attention points and the colour there (K, 3)."""
-    p = (_ANCHOR_SHARPNESS * attn.log()).softmax(dim=1)
+    p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=1)
     return p @ points, p @ colours
 
 

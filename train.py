@@ -103,11 +103,15 @@ class GSODTraining(L.LightningModule):
         images, cams = images[order], cams[order]
         progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
         self.model.draw_power = _ramp(progress, 0.0, self.cfg.draw_ramp)
+        step = self.start_epoch * self.steps_per_epoch + self.global_step
+        self.model.slot_attention.sigma = _cosine_anneal(
+            step, self.cfg.sigma_steps, self.cfg.sigma_start, self.cfg.sigma_final
+        )
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
-        self.log("train/attn_tau", self.model.slot_attention.temperature().detach(), batch_size=1)
+        self.log("train/slot_sigma", self.model.slot_attention.sigma, batch_size=1)
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
@@ -163,6 +167,12 @@ class GSODTraining(L.LightningModule):
 def _ramp(x: float, start: float, end: float) -> float:
     """0 before start, 1 after end, linear between."""
     return min(1.0, max(0.0, (x - start) / max(end - start, 1e-8)))
+
+
+def _cosine_anneal(step: int, steps: int, start: float, final: float) -> float:
+    """start -> final over steps on a cosine, then final (BO-QSA)."""
+    progress = min(step / max(steps, 1), 1.0)
+    return 0.5 * (start - final) * math.cos(math.pi * progress) + 0.5 * (start + final)
 
 
 def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
