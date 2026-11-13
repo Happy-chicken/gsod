@@ -92,4 +92,4 @@ class SlotAttention(nn.Module):
             slots = self.gru(updates.reshape(-1, D), prev.reshape(-1, D)).reshape(b, -1, D)
             slots = slots + self.mlp(self.norm_mlp(slots))
 
-        return slots[:, 0], slots[:, 1:], attn
+        return slots[:, 0], slots[:, 1:], attn, v

@@ -1,7 +1,8 @@
 """Object decoder: slot -> box about the attention anchor (its height
 spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
 
-G learned queries attend among themselves and to the slot. Opacity is
+G learned queries attend among themselves and to the slot's tokens (8 from
+the slot, 8 SlotParts part vectors). Opacity is
 normalised per slot (the draw factor scales the slot's layer); colour = the
 colour at the slot's attention anchor + residual. Scene frame, units of R.
 """
@@ -27,6 +28,9 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
+# SlotParts: number of parts, position encoding bands.
+N_PARTS = 8
+PART_PE_BANDS = 4
 
 
 def _logit(p: float) -> float:
@@ -135,6 +139,28 @@ class DecoderLayer(nn.Module):
         return q + self.ffn(self.norm_ff(q))
 
 
+class SlotParts(nn.Module):
+    """A slot's values pooled over N_PARTS soft spatial parts of its attention."""
+
+    def __init__(self, v_dim: int, d_model: int):
+        super().__init__()
+        self.assign = nn.Linear(3 + 6 * PART_PE_BANDS, N_PARTS)
+        self.out = nn.Sequential(nn.Linear(v_dim, d_model), nn.LayerNorm(d_model))
+
+    def forward(self, attn: torch.Tensor, values: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """attn (K, N), values (N, C), coords (N, 2) in [0, 1] -> (K, N_PARTS, d)."""
+        a = attn.detach()
+        p = a / a.sum(-1, keepdim=True).clamp_min(1e-8)
+        mean = p @ coords  # (K, 2)
+        std = (p @ coords.pow(2) - mean.pow(2)).clamp_min(1e-6).sqrt()
+        rel = ((coords[None] - mean[:, None]) / std[:, None]).clamp(-3.0, 3.0) / 3.0  # (K, N, 2)
+        pe = positional_encoding(torch.cat([rel, torch.zeros_like(rel[..., :1])], -1).flatten(0, 1), PART_PE_BANDS)
+        w = self.assign(pe).view(*rel.shape[:2], N_PARTS).softmax(-1)  # (K, N, M)
+        weight = attn[..., None] * w  # (K, N, M)
+        parts = weight.transpose(1, 2) @ values / weight.sum(1)[..., None].clamp_min(1e-8)  # (K, M, C)
+        return self.out(parts)
+
+
 class ObjectDecoder(nn.Module):
     """Object slots -> Gaussians, scene frame."""
 
@@ -155,19 +181,31 @@ class ObjectDecoder(nn.Module):
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
+        self.parts = SlotParts(z_dim, d)
+        self.k_part = nn.Linear(d, d)
+        self.v_part = nn.Linear(d, d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
+        self,
+        slots: torch.Tensor,
+        anchor: torch.Tensor,
+        ray: torch.Tensor,
+        colour: torch.Tensor,
+        attn: torch.Tensor,
+        values: torch.Tensor,
+        coords: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3); attn (K, N), values (N, C),
+        coords (N, 2) -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
-        k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
-        v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
+        parts = self.parts(attn, values, coords)  # (K, N_PARTS, d)
+        k = self.norm_kv(torch.cat([self.k_proj(slots).view(K, self.M, self.d), self.k_part(parts)], 1))
+        v = self.norm_kv(torch.cat([self.v_proj(slots).view(K, self.M, self.d), self.v_part(parts)], 1))
         for layer in self.layers:
             q = layer(q, k, v)
         return self.head(q, centre, extent, colour), centre, extent
