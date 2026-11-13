@@ -30,6 +30,8 @@ _ANCHOR_SHARPNESS = 2.0
 # Draw factor: occupancy drawn fully; token count drawn at half.
 FULL_OCCUPANCY = 0.8
 COUNT_HALF = 1.0
+# Least gradient an object slot's opacity gets, however small its draw factor.
+DRAW_GRAD_FLOOR = 0.05
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
@@ -160,7 +162,11 @@ class GSODModel(nn.Module):
         n_obj, n_gauss = obj["mu"].shape[:2]
         floor = bg["gaussians"]
         objects = {name: value.flatten(0, 1) for name, value in obj.items()}
-        objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
+        # Forward: opacity x draw (an empty slot draws nothing). Backward: the
+        # opacity gradient is scaled by max(draw, DRAW_GRAD_FLOOR), so an empty
+        # slot's Gaussians still learn and it can come back.
+        op, g = obj["opacity"], draw.clamp_min(DRAW_GRAD_FLOOR).detach()[:, None]
+        objects["opacity"] = (op.detach() * draw[:, None] + op * g - (op * g).detach()).flatten()
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         fill = bg["fill"][None, :, None, None]
