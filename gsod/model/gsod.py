@@ -27,22 +27,27 @@ from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Draw factor: occupancy drawn fully; token count drawn at half.
+# Draw factor: occupancy drawn fully; attention area (fraction of the
+# tokens) not drawn below AREA_EMPTY, fully from AREA_FULL.
 FULL_OCCUPANCY = 0.8
-COUNT_HALF = 1.0
+AREA_EMPTY = 0.001
+AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
     """attn (K, N) -> (K,) in [0, 1], how far each object slot is drawn:
 
-        f = min(1, occupancy / FULL_OCCUPANCY)^power * count / (count + COUNT_HALF)
-        occupancy = sum a^2 / sum a,  count = sum a
+        f = min(1, occupancy / FULL_OCCUPANCY)^power * presence
+        occupancy = sum a^2 / sum a
+        presence = clamp((mean a - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY), 0, 1)
 
-    A split object costs coverage, so one owner is preferred."""
+    Too little attention is no object (not drawn at all); a split object
+    costs coverage, so one owner is preferred."""
     count = attn.sum(-1)
     occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
     share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
-    return share.pow(power) * count / (count + COUNT_HALF)
+    presence = ((count / attn.shape[-1] - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
+    return share.pow(power) * presence
 
 
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
