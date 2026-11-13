@@ -22,10 +22,6 @@ DUPLICATE = 0.5
 UNCLAIMED = 0.5
 
 
-def _residual_mlp(dim: int, hidden_dim: int) -> nn.Module:
-    return nn.Sequential(nn.Linear(dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, dim))
-
-
 class SlotAttention(nn.Module):
     """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
 
@@ -61,7 +57,9 @@ class SlotAttention(nn.Module):
         self.project_q = nn.Linear(slot_dim, slot_dim, bias=False)
         self.gru = nn.GRUCell(slot_dim, slot_dim)
         self.norm_mlp = nn.LayerNorm(slot_dim)
-        self.mlp = _residual_mlp(slot_dim, hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        )
 
     @staticmethod
     def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
