@@ -97,8 +97,6 @@ class SlotAttention(nn.Module):
         return slots + res(slots)
 
     def forward(self, feat: torch.Tensor):
-        """feat (b, N, C) -> background slot (b, D), object slots (b, K-1, D),
-        attention (b, K, N), the tokens' values v (b, N, D)."""
         b = feat.shape[0]
         grid = self._grid(feat.shape[1], feat.device)
         feat = feat + self.pos_proj(grid)
@@ -125,4 +123,4 @@ class SlotAttention(nn.Module):
             bg = self._update(self.gru_bg, self.to_res_bg, updates[:, :1], bg)
             fg = self._update(self.gru, self.to_res, updates[:, 1:], fg)
 
-        return bg[:, 0], fg, attn, v
+        return bg[:, 0], fg, attn
