@@ -1,10 +1,18 @@
-"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background."""
+"""Slot attention; slot 0 is the background.
+
+The background starts from a learned query (BO-QSA, Jia et al., ICLR 2023,
+noise included); object slots start per image from k-means++ on the keys
+(cosine distance, the background query the first centre; Arthur &
+Vassilvitskii 2007), refined by a few Lloyd steps. Updates and the bi-level
+last iteration as BO-QSA.
+"""
 
 from __future__ import annotations
 
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
 
@@ -12,6 +20,8 @@ from torch.nn import init
 SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
+# Lloyd steps after the k-means++ seeding.
+KMEANS_ITERS = 2
 
 
 class SlotAttention(nn.Module):
@@ -31,10 +41,11 @@ class SlotAttention(nn.Module):
         self.iters = iters
         self.eps = eps
         self.slot_dim = slot_dim
+        self.n_objects = num_slots - 1
         self.sigma = SIGMA_START
 
-        self.slots_init = nn.Embedding(num_slots, slot_dim)
-        init.xavier_uniform_(self.slots_init.weight)
+        self.bg_query = nn.Parameter(torch.empty(1, 1, slot_dim))
+        init.xavier_uniform_(self.bg_query)
         self.pos_proj = nn.Linear(4, in_dim)
         self.feat_mlp = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -68,16 +79,52 @@ class SlotAttention(nn.Module):
         a, b = 0.5 * (SIGMA_START - SIGMA_FINAL), 0.5 * (SIGMA_START + SIGMA_FINAL)
         self.sigma = a * math.cos(math.pi * progress) + b
 
+    @torch.no_grad()
+    def _kmeans_pp(self, k: torch.Tensor, q_bg: torch.Tensor) -> torch.Tensor:
+        """Keys (b, N, D), background query (b, 1, D) -> token membership
+        (b, K-1, N) of the object clusters (0 / 1, none empty)."""
+        b, n_tok, _ = k.shape
+        kn = F.normalize(k, dim=-1)
+        rows = torch.arange(b, device=k.device)
+        centres = [F.normalize(q_bg[:, 0], dim=-1)]
+        dist = 1.0 - (kn * centres[0][:, None]).sum(-1)  # (b, N) to the nearest centre
+        seeds = []
+        for _ in range(self.n_objects):
+            weight = dist.clamp_min(0.0).pow(2)
+            if self.training:
+                idx = torch.multinomial(weight + 1e-12, 1)[:, 0]
+            else:
+                idx = weight.argmax(-1)
+            seeds.append(idx)
+            centres.append(kn[rows, idx])
+            dist = torch.minimum(dist, 1.0 - (kn * centres[-1][:, None]).sum(-1))
+        centres = torch.stack(centres, 1)  # (b, K, D)
+
+        def assign(c):
+            return F.one_hot((kn @ c.transpose(1, 2)).argmax(-1), c.shape[1]).transpose(1, 2).float()
+
+        for _ in range(KMEANS_ITERS):  # Lloyd, the background centre fixed
+            member = assign(centres)
+            mean = F.normalize(member @ kn, dim=-1)
+            moved = torch.where(member.sum(-1, keepdim=True) > 0, mean, centres)
+            centres = torch.cat([centres[:, :1], moved[:, 1:]], 1)
+        member = assign(centres)[:, 1:]
+        seed = F.one_hot(torch.stack(seeds, 1), n_tok).float()  # (b, K-1, N)
+        return torch.where(member.sum(-1, keepdim=True) > 0, member, seed)
+
     def forward(self, feat: torch.Tensor):
         b, D = feat.shape[0], self.slot_dim
         feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
         feat = self.norm_feature(feat)
         k, v = self.project_k(feat), self.project_v(feat)
 
-        mu = self.slots_init.weight.expand(b, -1, -1)
-        slots_init = mu
+        mu = self.bg_query.expand(b, -1, -1)
+        bg_init = mu
         if self.training and self.sigma > 0:
-            slots_init = mu + torch.randn_like(mu) * self.sigma * mu.detach()
+            bg_init = mu + torch.randn_like(mu) * self.sigma * mu.detach()
+        w = self._kmeans_pp(k, self.project_q(self.norm_slots(bg_init)))
+        fg_init = (w @ feat) / w.sum(-1, keepdim=True)
+        slots_init = torch.cat([bg_init, fg_init], 1)
         slots = slots_init
 
         attn = None
