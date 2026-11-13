@@ -106,7 +106,6 @@ class GSODTraining(L.LightningModule):
         loss, terms = self.criterion(outputs, images)
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
-        self.log("train/slot_sigma", self.model.slot_attention.sigma, batch_size=1)
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
