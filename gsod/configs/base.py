@@ -32,10 +32,6 @@ class BaseConfig:
     lr_warmup: float = 0.06
     lr_final: float = 0.02
     draw_ramp: float = 0.1  # draw factor power 0 -> 1
-    # Slot-init noise sigma, cosine-annealed over sigma_steps steps (BO-QSA).
-    sigma_start: float = 1.0
-    sigma_final: float = 0.0
-    sigma_steps: int = 30000
     grad_clip: float = 1.0  # 0 = off
     seed: int = 0
     log_every: int = 100  # steps

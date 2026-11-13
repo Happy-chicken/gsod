@@ -2,8 +2,8 @@
 background (its decoder gives it that role, as uORF).
 
 Every slot starts from its own learned query (an embedding); in training
-noise is added, mu + eps * sigma * mu.detach(), sigma cosine-annealed by the
-trainer (0 in evaluation). Logits: q . k / sqrt(D), softmax over slots; the
+noise is added, mu + eps * sigma * mu.detach(), sigma cosine-annealed
+SIGMA_START -> SIGMA_FINAL over SIGMA_STEPS steps (anneal; 0 in evaluation). Logits: q . k / sqrt(D), softmax over slots; the
 weighted mean divides by the attention's sum over tokens + epsilon (1.0);
 GRU, then a residual MLP. The last iteration starts from the detached slots
 plus a straight-through path to the initial queries (bi-level).
@@ -11,9 +11,16 @@ plus a straight-through path to the initial queries (bi-level).
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import init
+
+# Initial-query noise schedule (BO-QSA defaults).
+SIGMA_START = 1.0
+SIGMA_FINAL = 0.0
+SIGMA_STEPS = 30000
 
 
 class SlotAttention(nn.Module):
@@ -35,7 +42,7 @@ class SlotAttention(nn.Module):
         self.iters = iters
         self.eps = eps
         self.slot_dim = slot_dim
-        self.sigma = 0.0  # initial-query noise, set by the trainer
+        self.sigma = SIGMA_START  # initial-query noise, see anneal
 
         self.slots_init = nn.Embedding(num_slots, slot_dim)
         init.xavier_uniform_(self.slots_init.weight)
@@ -66,6 +73,12 @@ class SlotAttention(nn.Module):
         lin = torch.linspace(0.0, 1.0, side, device=device)
         y, x = torch.meshgrid(lin, lin, indexing="ij")
         return torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1).reshape(1, n_tokens, 4)
+
+    def anneal(self, step: int) -> None:
+        """Noise sigma at a training step: cosine SIGMA_START -> SIGMA_FINAL."""
+        progress = min(step / SIGMA_STEPS, 1.0)
+        a, b = 0.5 * (SIGMA_START - SIGMA_FINAL), 0.5 * (SIGMA_START + SIGMA_FINAL)
+        self.sigma = a * math.cos(math.pi * progress) + b
 
     def forward(self, feat: torch.Tensor):
         """feat (b, N, C) -> background slot (b, D), object slots (b, K-1, D),
