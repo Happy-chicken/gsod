@@ -1,15 +1,10 @@
-"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background.
-
-After the first iteration, duplicate object slots move to unclaimed tokens
-(or are left to go empty).
-"""
+"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background."""
 
 from __future__ import annotations
 
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
 
@@ -17,9 +12,6 @@ from torch.nn import init
 SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
-# Re-seeding thresholds: shared attention share; 1 - max cosine.
-DUPLICATE = 0.5
-UNCLAIMED = 0.5
 
 
 class SlotAttention(nn.Module):
@@ -76,29 +68,6 @@ class SlotAttention(nn.Module):
         a, b = 0.5 * (SIGMA_START - SIGMA_FINAL), 0.5 * (SIGMA_START + SIGMA_FINAL)
         self.sigma = a * math.cos(math.pi * progress) + b
 
-    @torch.no_grad()
-    def _reseed(self, attn: torch.Tensor, q: torch.Tensor, k: torch.Tensor, feat: torch.Tensor):
-        """New slot values (b, K, D) and moved mask (b, K)."""
-        a = attn.clone()
-        a[:, 0] = 0.0  # background excluded
-        mass = a.sum(-1)
-        shared = torch.minimum(a[:, :, None], a[:, None]).sum(-1)
-        weaker = mass[:, :, None] < mass[:, None]
-        duplicate = ((shared / mass[:, :, None].clamp_min(1e-8) > DUPLICATE) & weaker).any(-1)
-        unclaimed = 1.0 - torch.einsum("bkd,bnd->bkn", F.normalize(q, dim=-1), F.normalize(k, dim=-1)).amax(1)
-        new = torch.zeros_like(q)
-        moved = torch.zeros_like(duplicate)
-        for i in range(q.shape[0]):
-            u = unclaimed[i].clone()
-            for j in duplicate[i].nonzero().flatten().tolist():
-                n = int(u.argmax())
-                if u[n] <= UNCLAIMED:
-                    break
-                new[i, j] = feat[i, n]
-                moved[i, j] = True
-                u[n] = -1.0
-        return new, moved
-
     def forward(self, feat: torch.Tensor):
         b, D = feat.shape[0], self.slot_dim
         feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
@@ -113,10 +82,6 @@ class SlotAttention(nn.Module):
 
         attn = None
         for i in range(self.iters):
-            if i == 1:  # re-seed duplicates
-                new, moved = self._reseed(attn, self.project_q(self.norm_slots(slots)), k, feat)
-                slots = torch.where(moved[..., None], new, slots)
-                slots_init = torch.where(moved[..., None], new, slots_init)
             if i == self.iters - 1:  # bi-level
                 slots = slots.detach() + slots_init - slots_init.detach()
             prev = slots
