@@ -101,8 +101,6 @@ class GSODTraining(L.LightningModule):
         ref = self.rng.randrange(images.shape[0])
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order], cams[order]
-        progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
-        self.model.draw_power = _ramp(progress, 0.0, self.cfg.draw_ramp)
         self.model.slot_attention.anneal(self.start_epoch * self.steps_per_epoch + self.global_step)
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
@@ -159,11 +157,6 @@ class GSODTraining(L.LightningModule):
         (self.out / f"{suffix}_state.json").write_text(
             json.dumps({"epoch": epoch, "best_psnr": self.best_psnr})
         )
-
-
-def _ramp(x: float, start: float, end: float) -> float:
-    """0 before start, 1 after end, linear between."""
-    return min(1.0, max(0.0, (x - start) / max(end - start, 1e-8)))
 
 
 def _lr_factor(cfg: BaseConfig, epoch: float) -> float:

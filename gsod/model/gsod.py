@@ -27,19 +27,14 @@ from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Draw factor: occupancy drawn fully; attention area (fraction of tokens) ramp.
-FULL_OCCUPANCY = 0.8
+# Draw factor: attention area (fraction of tokens) ramp.
 AREA_EMPTY = 0.001
 AREA_FULL = 0.004
 
 
-def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
-    """attn (K, N) -> (K,): min(1, occupancy / FULL_OCCUPANCY)^power * area ramp."""
-    count = attn.sum(-1)
-    occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
-    share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
-    presence = ((count / attn.shape[-1] - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
-    return share.pow(power) * presence
+def draw_factor(attn: torch.Tensor) -> torch.Tensor:
+    """attn (K, N) -> (K,): 0 below AREA_EMPTY, 1 from AREA_FULL."""
+    return ((attn.mean(-1) - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
 
 
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
@@ -102,7 +97,6 @@ class GSODModel(nn.Module):
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
-        self.draw_power = 1.0
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -203,7 +197,7 @@ class GSODModel(nn.Module):
         scene = {
             "objects": self.decode_objects(slots, attn[1:], colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
-            "draw": draw_factor(attn[1:], self.draw_power),
+            "draw": draw_factor(attn[1:]),
             "attn": attn,
             "slots": slots,
             "frame": frame,
