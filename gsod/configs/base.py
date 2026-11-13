@@ -13,6 +13,7 @@ class LossConfig:
 
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
+    attn: float = 0.2  # 2D attention reconstruction
 
 
 @dataclass

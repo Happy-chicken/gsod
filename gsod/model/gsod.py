@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
+from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
@@ -104,6 +104,7 @@ class GSODModel(nn.Module):
         )
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
+        self.attn_decoder = AttnDecoder(z_dim)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -112,6 +113,7 @@ class GSODModel(nn.Module):
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
+            "AttnDecoder": self.attn_decoder,
         }
 
     # -- stages ---------------------------------------------------------------
@@ -202,4 +204,11 @@ class GSODModel(nn.Module):
             "slots": slots,
             "frame": frame,
         }
-        return self.render(scene, cam2world) if render else scene
+        if not render:
+            return scene
+        out = self.render(scene, cam2world)
+        # 2D attention reconstruction of view 0 (background: the floor render).
+        bg = F.interpolate(out["bg_rgb"][0:1], size=self.input_size, mode="area")[0].flatten(1).T
+        out["attn_rgb"] = self.attn_decoder(slots, attn, bg)
+        out["attn_target"] = colours
+        return out

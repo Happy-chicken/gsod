@@ -1,9 +1,10 @@
-"""Gaussian decoders: ``ObjectDecoder`` for the object slots,
-``BackgroundDecoder`` for the background slot; each builds its own head."""
+"""Decoders: ``ObjectDecoder`` / ``BackgroundDecoder`` (Gaussians) and
+``AttnDecoder`` (2D attention reconstruction)."""
 
 from __future__ import annotations
 
+from gsod.model.decoders.attention import AttnDecoder
 from gsod.model.decoders.background import BackgroundDecoder
 from gsod.model.decoders.objects import ObjectDecoder
 
-__all__ = ["ObjectDecoder", "BackgroundDecoder"]
+__all__ = ["AttnDecoder", "ObjectDecoder", "BackgroundDecoder"]
