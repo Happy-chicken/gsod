@@ -1,9 +1,9 @@
 """Slot attention: a background slot + K-1 object slots (uORF).
 
-Logits: learned temperature * cos(query, key), softmax over slots. The
-background has its own query, GRU and MLP; object slots are seeded from
-tokens unlike the background query (farthest point sampling). Both are
-refined BO-QSA style (detached iterations, straight-through last step).
+Logits: learned temperature * cos(query, key), softmax over slots. As
+BO-QSA: every slot starts from its own learned query, refined with detached
+iterations and a straight-through last step to the queries. The background
+has its own query, GRU and MLP (uORF).
 """
 
 from __future__ import annotations
@@ -16,24 +16,6 @@ from torch import nn
 from torch.nn import init
 
 _TAU_INIT, _TAU_MIN, _TAU_MAX = 5.0, 1.0, 50.0
-
-
-@torch.no_grad()
-def seed_tokens(objectness: torch.Tensor, positions: torch.Tensor, k: int) -> torch.Tensor:
-    """Farthest point sampling weighted by objectness: objectness (b, N),
-    token positions (N, 2) -> (b, k) token indices. The first is the most
-    object-like token; each next maximises objectness (scaled to [0, 1] per
-    image) times the distance to the nearest seed so far."""
-    lo = objectness.amin(-1, keepdim=True)
-    hi = objectness.amax(-1, keepdim=True)
-    o = (objectness - lo) / (hi - lo).clamp_min(1e-8)
-    idx = [o.argmax(-1)]
-    nearest = torch.cdist(positions[idx[0]], positions)  # (b, N)
-    for _ in range(k - 1):
-        nxt = (o * nearest).argmax(-1)
-        idx.append(nxt)
-        nearest = torch.minimum(nearest, torch.cdist(positions[nxt], positions))
-    return torch.stack(idx, -1)
 
 
 class SlotAttention(nn.Module):
@@ -58,9 +40,10 @@ class SlotAttention(nn.Module):
         self.log_tau = nn.Parameter(torch.tensor(math.log(_TAU_INIT)))
 
         self.n_objects = num_slots - 1
-        self.seed_proj = nn.Linear(in_dim, slot_dim)
         self.bg_query = nn.Parameter(torch.empty(1, 1, slot_dim))
+        self.fg_query = nn.Parameter(torch.empty(1, self.n_objects, slot_dim))
         init.xavier_uniform_(self.bg_query)
+        init.xavier_uniform_(self.fg_query)
 
         self.to_k = nn.Linear(in_dim, slot_dim, bias=False)
         self.to_v = nn.Linear(in_dim, slot_dim, bias=False)
@@ -124,11 +107,7 @@ class SlotAttention(nn.Module):
         tau = self.temperature()
 
         bg_init = self.bg_query.expand(b, -1, -1)
-        q_bg = F.normalize(self.to_q_bg(bg_init), dim=-1)  # (b, 1, D)
-        objectness = 1.0 - torch.einsum("bid,bjd->bj", q_bg, k.detach())
-        idx = seed_tokens(objectness, grid[0, :, :2], self.n_objects)  # (b, K-1)
-        picked = torch.gather(feat, 1, idx[..., None].expand(-1, -1, feat.shape[-1]))
-        fg_init = self.seed_proj(picked)
+        fg_init = self.fg_query.expand(b, -1, -1)
         bg, fg = bg_init, fg_init
 
         attn = None
