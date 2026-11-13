@@ -27,19 +27,17 @@ from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Draw factor ramps: occupancy, attention area (fraction of tokens).
-OCC_EMPTY = 0.4
+# Draw factor: occupancy drawn fully; attention area (fraction of tokens) ramp.
 FULL_OCCUPANCY = 0.8
 AREA_EMPTY = 0.001
 AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
-    """attn (K, N) -> (K,): occupancy ramp^power * area ramp."""
+    """attn (K, N) -> (K,): min(1, occupancy / FULL_OCCUPANCY)^power * area ramp."""
     count = attn.sum(-1)
     occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
-    # >= 1e-6: power 0 draws every slot.
-    share = ((occupancy - OCC_EMPTY) / (FULL_OCCUPANCY - OCC_EMPTY)).clamp(1e-6, 1.0)
+    share = (occupancy / FULL_OCCUPANCY).clamp(1e-6, 1.0)
     presence = ((count / attn.shape[-1] - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
     return share.pow(power) * presence
 
