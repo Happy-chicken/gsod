@@ -1,11 +1,5 @@
-"""Slot attention; slot 0 is the background.
-
-The background starts from a learned query (BO-QSA, Jia et al., ICLR 2023,
-noise included); object slots start per image from k-means++ on the keys
-(cosine distance, the background query the first centre; Arthur &
-Vassilvitskii 2007), refined by a few Lloyd steps. Updates and the bi-level
-last iteration as BO-QSA.
-"""
+"""Slot attention: learned background query (BO-QSA), object slots from
+k-means++ on the keys."""
 
 from __future__ import annotations
 
@@ -20,7 +14,7 @@ from torch.nn import init
 SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
-# Lloyd steps after the k-means++ seeding.
+# Lloyd steps after seeding.
 KMEANS_ITERS = 2
 
 
@@ -81,13 +75,12 @@ class SlotAttention(nn.Module):
 
     @torch.no_grad()
     def _kmeans_pp(self, k: torch.Tensor, q_bg: torch.Tensor) -> torch.Tensor:
-        """Keys (b, N, D), background query (b, 1, D) -> token membership
-        (b, K-1, N) of the object clusters (0 / 1, none empty)."""
+        """Object cluster membership (b, K-1, N)."""
         b, n_tok, _ = k.shape
         kn = F.normalize(k, dim=-1)
         rows = torch.arange(b, device=k.device)
         centres = [F.normalize(q_bg[:, 0], dim=-1)]
-        dist = 1.0 - (kn * centres[0][:, None]).sum(-1)  # (b, N) to the nearest centre
+        dist = 1.0 - (kn * centres[0][:, None]).sum(-1)
         seeds = []
         for _ in range(self.n_objects):
             weight = dist.clamp_min(0.0).pow(2)
@@ -103,7 +96,7 @@ class SlotAttention(nn.Module):
         def assign(c):
             return F.one_hot((kn @ c.transpose(1, 2)).argmax(-1), c.shape[1]).transpose(1, 2).float()
 
-        for _ in range(KMEANS_ITERS):  # Lloyd, the background centre fixed
+        for _ in range(KMEANS_ITERS):  # background centre fixed
             member = assign(centres)
             mean = F.normalize(member @ kn, dim=-1)
             moved = torch.where(member.sum(-1, keepdim=True) > 0, mean, centres)

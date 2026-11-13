@@ -27,9 +27,7 @@ from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Draw factor: occupancy not drawn below OCC_EMPTY, fully from FULL_OCCUPANCY;
-# attention area (fraction of the tokens) not drawn below AREA_EMPTY, fully
-# from AREA_FULL.
+# Draw factor ramps: occupancy, attention area (fraction of tokens).
 OCC_EMPTY = 0.4
 FULL_OCCUPANCY = 0.8
 AREA_EMPTY = 0.001
@@ -37,18 +35,10 @@ AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor, power: float = 1.0) -> torch.Tensor:
-    """attn (K, N) -> (K,) in [0, 1], how far each object slot is drawn:
-
-        f = share^power * presence
-        share = clamp((occupancy - OCC_EMPTY) / (FULL_OCCUPANCY - OCC_EMPTY), 0, 1)
-        presence = clamp((mean a - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY), 0, 1)
-        occupancy = sum a^2 / sum a
-
-    A slot with too little attention, or mostly sharing its tokens, is no
-    object (not drawn); a split object costs coverage, so one owner is
-    preferred. share >= 1e-6 keeps power 0 drawing every slot."""
+    """attn (K, N) -> (K,): occupancy ramp^power * area ramp."""
     count = attn.sum(-1)
     occupancy = attn.pow(2).sum(-1) / count.clamp_min(1e-8)
+    # >= 1e-6: power 0 draws every slot.
     share = ((occupancy - OCC_EMPTY) / (FULL_OCCUPANCY - OCC_EMPTY)).clamp(1e-6, 1.0)
     presence = ((count / attn.shape[-1] - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
     return share.pow(power) * presence
