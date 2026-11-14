@@ -32,8 +32,6 @@ SCALE_INIT = 1.0 / 8.0
 QUERY_STD = 2.0
 # Largest pixel-refinement shift (units of r_max).
 REFINE_SHIFT = 0.25
-# Pixel refinement ramps in over this share of training.
-REFINE_RAMP = 0.3
 
 
 def _logit(p: float) -> float:
@@ -113,11 +111,9 @@ class ObjectHead(nn.Module):
         image: torch.Tensor,
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
-        strength: float,
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), box centre / half sizes / colour (K, 3), view 0's
-        features (1, C, s, s) and image (1, 3, H, W), refinement strength ->
-        Gaussians (K, G, ...)."""
+        features (1, C, s, s) and image (1, 3, H, W) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
         t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
@@ -130,7 +126,7 @@ class ObjectHead(nn.Module):
         at = mu.detach().reshape(1, -1, 3)
         pix = torch.cat([project_and_sample(at, maps.detach(), frame, focal_ratio),
                          project_and_sample(at, image, frame, focal_ratio)], -1).view(*mu.shape[:2], -1)
-        mu = mu + strength * self.shift * torch.tanh(self.refine(torch.cat([feat, pix], -1)))
+        mu = mu + self.shift * torch.tanh(self.refine(torch.cat([feat, pix], -1)))
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
 
         opacity = torch.sigmoid(raw[..., 10])
@@ -200,7 +196,6 @@ class ObjectDecoder(nn.Module):
         image: torch.Tensor,
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
-        strength: float = 1.0,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray, colour (K, 3); view 0's features
         (1, C, s, s) and image (1, 3, H, W) -> Gaussians, centres, half sizes."""
@@ -211,5 +206,5 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, centre, extent, colour, maps, image, frame, focal_ratio, strength)
+        gaussians = self.head(q, centre, extent, colour, maps, image, frame, focal_ratio)
         return gaussians, centre, extent

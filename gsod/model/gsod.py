@@ -97,7 +97,6 @@ class GSODModel(nn.Module):
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
-        self.refine_strength = 1.0  # pixel refinement, ramped in training
 
         self.encoder = Encoder(3, z_dim=z_dim)
         self.slot_attention = SlotAttention(
@@ -140,7 +139,7 @@ class GSODModel(nn.Module):
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
         gaussians, _, extent = self.obj_decoder(
-            slots, anchor, ray, colour, maps, image, frame, self.focal_ratio, self.refine_strength
+            slots, anchor, ray, colour, maps, image, frame, self.focal_ratio
         )
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
