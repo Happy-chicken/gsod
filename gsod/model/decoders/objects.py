@@ -2,8 +2,7 @@
 spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
 
 G learned queries attend among themselves and to the slot. Each Gaussian is
-then refined (small shift, opacity, colour) from view 0's features and image
-where it projects. Opacity is normalised per slot (the draw factor scales the
+then shifted slightly from view 0's features and image where it projects. Opacity is normalised per slot (the draw factor scales the
 slot's layer); colour = the colour at the slot's attention anchor + residual.
 Scene frame, units of R.
 """
@@ -33,6 +32,8 @@ SCALE_INIT = 1.0 / 8.0
 QUERY_STD = 2.0
 # Largest pixel-refinement shift (units of r_max).
 REFINE_SHIFT = 0.25
+# Pixel refinement ramps in over this share of training.
+REFINE_RAMP = 0.3
 
 
 def _logit(p: float) -> float:
@@ -81,7 +82,7 @@ class RegionHead(nn.Module):
 
 class ObjectHead(nn.Module):
     """Gaussian feature -> raw parameters (position 3, scale 3, quat 4,
-    opacity 1, rgb 3, sh1 9) -> one Gaussian, refined from view 0's pixels."""
+    opacity 1, rgb 3, sh1 9) -> one Gaussian, shifted from view 0's pixels."""
 
     def __init__(self, d_model: int, pix_dim: int):
         super().__init__()
@@ -89,8 +90,8 @@ class ObjectHead(nn.Module):
         self.shift = REFINE_SHIFT * r_max
         self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
         self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
-        # Pixel refinement: shift 3, opacity 1, rgb 3; zero at first.
-        self.refine = nn.Sequential(nn.Linear(d_model + pix_dim + 3, d_model), nn.ReLU(True), nn.Linear(d_model, 7))
+        # Pixel refinement: position shift only; zero at first.
+        self.refine = nn.Sequential(nn.Linear(d_model + pix_dim + 3, d_model), nn.ReLU(True), nn.Linear(d_model, 3))
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
             out = self.project[-1]
@@ -112,9 +113,11 @@ class ObjectHead(nn.Module):
         image: torch.Tensor,
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
+        strength: float,
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), box centre / half sizes / colour (K, 3), view 0's
-        features (1, C, s, s) and image (1, 3, H, W) -> Gaussians (K, G, ...)."""
+        features (1, C, s, s) and image (1, 3, H, W), refinement strength ->
+        Gaussians (K, G, ...)."""
         raw = self.project(feat)
         t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
@@ -123,22 +126,21 @@ class ObjectHead(nn.Module):
         hi = (centre[:, 2] + extent[:, 2])[:, None, None]
         mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
-        # Refine from what view 0 shows where each Gaussian projects.
+        # Shift by what view 0 shows where each Gaussian projects (pixels detached).
         at = mu.detach().reshape(1, -1, 3)
-        pix = torch.cat([project_and_sample(at, maps, frame, focal_ratio),
+        pix = torch.cat([project_and_sample(at, maps.detach(), frame, focal_ratio),
                          project_and_sample(at, image, frame, focal_ratio)], -1).view(*mu.shape[:2], -1)
-        delta = self.refine(torch.cat([feat, pix], -1))
-        mu = mu + self.shift * torch.tanh(delta[..., :3])
+        mu = mu + strength * self.shift * torch.tanh(self.refine(torch.cat([feat, pix], -1)))
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
 
-        opacity = torch.sigmoid(raw[..., 10] + delta[..., 3])
+        opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
         return {
             "mu": mu,
             "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": opacity,
-            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14] + delta[..., 4:7]),
+            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
@@ -198,6 +200,7 @@ class ObjectDecoder(nn.Module):
         image: torch.Tensor,
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
+        strength: float = 1.0,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray, colour (K, 3); view 0's features
         (1, C, s, s) and image (1, 3, H, W) -> Gaussians, centres, half sizes."""
@@ -208,5 +211,5 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, centre, extent, colour, maps, image, frame, focal_ratio)
+        gaussians = self.head(q, centre, extent, colour, maps, image, frame, focal_ratio, strength)
         return gaussians, centre, extent

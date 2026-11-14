@@ -32,6 +32,7 @@ from gsod.model.evaluate import (
     SEGMENTATION_KEYS,
     evaluate,
 )
+from gsod.model.decoders.objects import REFINE_RAMP
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
@@ -102,6 +103,8 @@ class GSODTraining(L.LightningModule):
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order], cams[order]
         self.model.slot_attention.anneal(self.start_epoch * self.steps_per_epoch + self.global_step)
+        progress = (self.start_epoch + self.global_step / self.steps_per_epoch) / self.cfg.epochs
+        self.model.refine_strength = min(1.0, progress / REFINE_RAMP)
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
         for name, value in terms.items():
