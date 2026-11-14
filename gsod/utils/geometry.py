@@ -141,9 +141,9 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
-def read_view0(points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio) -> torch.Tensor:
-    """Scene-frame points (B, P, 3) -> maps (B, C, s, s) read bilinearly where
-    each point projects in view 0 (B, P, C); 0 behind the camera or off the image."""
+def project_and_sample(points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio) -> torch.Tensor:
+    """Scene-frame points (B, P, 3) projected into view 0 -> maps (B, C, h, w)
+    sampled bilinearly there (B, P, C); 0 behind the camera or off the image."""
     cam = (points - frame.origin) @ frame.rot
     front = cam[..., 2] > 1e-3
     z = torch.where(front, cam[..., 2], torch.ones_like(cam[..., 2]))
