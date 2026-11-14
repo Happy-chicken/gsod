@@ -2,7 +2,7 @@
 spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
 
 G learned queries attend among themselves and to the slot. Each Gaussian is
-then refined (small shift, scale, rotation) from view 0's features and image where it projects. Opacity is normalised per slot (the draw factor scales the
+then refined (small shift, scale, rotation) from view 0's multi-scale features where it projects. Opacity is normalised per slot (the draw factor scales the
 slot's layer); colour = the colour at the slot's attention anchor + residual.
 Scene frame, units of R.
 """
@@ -34,6 +34,8 @@ QUERY_STD = 2.0
 REFINE_SHIFT = 0.25
 # Largest pixel-refinement scale change (log2).
 REFINE_SCALE = 1.0
+# Encoder feature maps the refinement samples (scales s, s/2, s/4).
+REFINE_LEVELS = 3
 
 
 def _logit(p: float) -> float:
@@ -91,7 +93,7 @@ class ObjectHead(nn.Module):
         self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
         self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
         # Pixel refinement: shift 3, log2 scale 3, quat 4; zero at first.
-        self.refine = nn.Sequential(nn.Linear(d_model + pix_dim + 3, d_model), nn.ReLU(True), nn.Linear(d_model, 10))
+        self.refine = nn.Sequential(nn.Linear(d_model + REFINE_LEVELS * pix_dim, d_model), nn.ReLU(True), nn.Linear(d_model, 10))
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
             out = self.project[-1]
@@ -109,13 +111,12 @@ class ObjectHead(nn.Module):
         centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
-        maps: torch.Tensor,
-        image: torch.Tensor,
+        maps: list[torch.Tensor],
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), box centre / half sizes / colour (K, 3), view 0's
-        features (1, C, s, s) and image (1, 3, H, W) -> Gaussians (K, G, ...)."""
+        feature maps [(1, C, h, w)] -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
         t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
@@ -126,8 +127,8 @@ class ObjectHead(nn.Module):
 
         # Shift by what view 0 shows where each Gaussian projects (pixels detached).
         at = mu.detach().reshape(1, -1, 3)
-        pix = torch.cat([project_and_sample(at, maps.detach(), frame, focal_ratio),
-                         project_and_sample(at, image, frame, focal_ratio)], -1).view(*mu.shape[:2], -1)
+        pix = torch.cat([project_and_sample(at, m.detach(), frame, focal_ratio) for m in maps], -1)
+        pix = pix.view(*mu.shape[:2], -1)
         delta = self.refine(torch.cat([feat, pix], -1))
         mu = mu + self.shift * torch.tanh(delta[..., :3])
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
@@ -196,13 +197,12 @@ class ObjectDecoder(nn.Module):
         anchor: torch.Tensor,
         ray: torch.Tensor,
         colour: torch.Tensor,
-        maps: torch.Tensor,
-        image: torch.Tensor,
+        maps: list[torch.Tensor],
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3); view 0's features
-        (1, C, s, s) and image (1, 3, H, W) -> Gaussians, centres, half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3); view 0's feature maps
+        [(1, C, h, w)] -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
@@ -210,5 +210,5 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, centre, extent, colour, maps, image, frame, focal_ratio)
+        gaussians = self.head(q, centre, extent, colour, maps, frame, focal_ratio)
         return gaussians, centre, extent

@@ -34,7 +34,8 @@ class Encoder(nn.Module):
             nn.Conv2d(z_dim * 2, z_dim, 3, stride=1, padding=1, padding_mode="replicate"), nn.ReLU(True)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """-> output (B, C, H, W) and multi-scale maps [H, H/2, H/4]."""
         _, _, h, w = x.shape
         ys = torch.linspace(-1, 1, h, device=x.device)
         xs = torch.linspace(-1, 1, w, device=x.device)
@@ -51,4 +52,5 @@ class Encoder(nn.Module):
         x_down_3 = self.enc_down_3(x_down_2)
         x_up_3 = self.enc_up_3(x_down_3)
         x_up_2 = self.enc_up_2(torch.cat([x_up_3, x_down_2], dim=1))
-        return self.enc_up_1(torch.cat([x_up_2, x_down_1], dim=1))
+        out = self.enc_up_1(torch.cat([x_up_2, x_down_1], dim=1))
+        return out, [out, x_down_2, x_down_3]
