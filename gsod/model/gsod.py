@@ -118,8 +118,7 @@ class GSODModel(nn.Module):
 
     # -- stages ---------------------------------------------------------------
     def encode(self, images: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """images (N, 3, H, W) -> encoder tokens (N, s*s, C), s = input_size,
-        and multi-scale feature maps [s, s/2, s/4]."""
+        """images (N, 3, H, W) -> tokens (N, s*s, C), feature maps [s, s/2, s/4]."""
         small = F.interpolate(images, size=self.input_size, mode="bilinear", align_corners=False)
         out, maps = self.encoder(small)
         return out.flatten(start_dim=2).permute(0, 2, 1), maps
@@ -132,9 +131,8 @@ class GSODModel(nn.Module):
         frame: SceneFrame,
         maps: list[torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3),
-        view 0's multi-scale features -> world Gaussians (K-1, G, ...) and box
-        half sizes "extent" (K-1, 3)."""
+        """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
+        -> world Gaussians (K-1, G, ...), half sizes "extent" (K-1, 3)."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)

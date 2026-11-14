@@ -35,7 +35,7 @@ class Encoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """-> output (B, C, H, W) and multi-scale maps [H, H/2, H/4]."""
+        """-> output (B, C, H, W), maps [H, H/2, H/4]."""
         _, _, h, w = x.shape
         ys = torch.linspace(-1, 1, h, device=x.device)
         xs = torch.linspace(-1, 1, w, device=x.device)

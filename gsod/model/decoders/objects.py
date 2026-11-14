@@ -1,10 +1,5 @@
-"""Object decoder: slot -> box about the attention anchor (its height
-spans centre +- extent_z, cut just above the floor) -> G Gaussians free in it.
-
-G learned queries attend among themselves and to the slot. Each Gaussian is
-then refined (small shift, scale, rotation) from view 0's multi-scale features where it projects. Opacity is normalised per slot (the draw factor scales the
-slot's layer); colour = the colour at the slot's attention anchor + residual.
-Scene frame, units of R.
+"""Object decoder: slot -> box at the attention anchor -> G Gaussians in it,
+refined (shift, scale, rotation) from view 0's features. Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -30,11 +25,9 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
-# Largest pixel-refinement shift (units of r_max).
+# Pixel refinement: max shift (r_max), max scale change (log2), feature levels.
 REFINE_SHIFT = 0.25
-# Largest pixel-refinement scale change (log2).
 REFINE_SCALE = 1.0
-# Encoder feature maps the refinement samples (scales s, s/2, s/4).
 REFINE_LEVELS = 3
 
 
@@ -83,8 +76,7 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Gaussian feature -> raw parameters (position 3, scale 3, quat 4,
-    opacity 1, rgb 3, sh1 9) -> one Gaussian, refined from view 0's pixels."""
+    """Gaussian feature -> one Gaussian, refined from view 0's features."""
 
     def __init__(self, d_model: int, pix_dim: int):
         super().__init__()
@@ -92,7 +84,7 @@ class ObjectHead(nn.Module):
         self.shift = REFINE_SHIFT * r_max
         self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
         self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
-        # Pixel refinement: shift 3, log2 scale 3, quat 4; zero at first.
+        # Refinement: shift 3, log2 scale 3, quat 4; zero at first.
         self.refine = nn.Sequential(nn.Linear(d_model + REFINE_LEVELS * pix_dim, d_model), nn.ReLU(True), nn.Linear(d_model, 10))
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
@@ -115,8 +107,7 @@ class ObjectHead(nn.Module):
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box centre / half sizes / colour (K, 3), view 0's
-        feature maps [(1, C, h, w)] -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
         t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
@@ -125,7 +116,7 @@ class ObjectHead(nn.Module):
         hi = (centre[:, 2] + extent[:, 2])[:, None, None]
         mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
-        # Shift by what view 0 shows where each Gaussian projects (pixels detached).
+        # Sample view 0's features (detached) where each Gaussian projects.
         at = mu.detach().reshape(1, -1, 3)
         pix = torch.cat([project_and_sample(at, m.detach(), frame, focal_ratio) for m in maps], -1)
         pix = pix.view(*mu.shape[:2], -1)
@@ -201,8 +192,7 @@ class ObjectDecoder(nn.Module):
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3); view 0's feature maps
-        [(1, C, h, w)] -> Gaussians, centres, half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
