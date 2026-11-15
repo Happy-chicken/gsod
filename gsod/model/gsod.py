@@ -19,13 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
-from gsod.model.decoders.objects import (
-    OBJECT_RADIUS,
-    OBJECT_REGION,
-    TOKEN_QUERIES,
-    box_bounds,
-    ray_box,
-)
+from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, TOKEN_QUERIES
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
@@ -90,23 +84,19 @@ def attention_anchors(
 
 
 @torch.no_grad()
-def select_tokens(attn: torch.Tensor, hits: torch.Tensor, n: int) -> torch.Tensor:
-    """attn (K, N), hits (K-1, N) ray meets box -> (K-1, n): evenly spaced owned
-    hits, else hits by ownership then attention."""
+def select_tokens(attn: torch.Tensor, n: int) -> torch.Tensor:
+    """attn (K, N) -> (K-1, n): evenly spaced owned tokens, topped up by attention."""
     owner = attn.argmax(0)
     out = []
     for k in range(1, attn.shape[0]):
-        a, hit = attn[k], hits[k - 1]
-        owned = (owner == k) & hit
+        a, owned = attn[k], owner == k
         count = int(owned.sum())
         if count >= n:
             step = torch.linspace(0, count - 1, n, device=a.device).long()
             picks = owned.nonzero()[:, 0][step]
         else:
-            n_hit = max(int(hit.sum()), 1)
-            score = torch.where(hit, a + 2.0 * owned, a - 2.0)
-            picks = score.topk(min(n, n_hit)).indices
-            picks = picks.repeat(-(-n // picks.numel()))[:n]
+            rest = torch.where(owned, torch.full_like(a, -1.0), a).topk(n - count).indices
+            picks = torch.cat([owned.nonzero()[:, 0], rest])
         out.append(picks)
     return torch.stack(out)
 
@@ -170,14 +160,11 @@ class GSODModel(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        # Tokens each object slot owns, rays through its box -> token queries.
+        # Tokens each object slot owns -> token queries.
         uv = token_uv(side, attn)
         dirs = F.normalize(_token_rays(frame, side, self.image_size, self.focal_ratio), dim=-1)
         centre, extent = self.obj_decoder.region(slots, anchor, ray)
-        with torch.no_grad():
-            t_in, t_out = ray_box(frame.origin, dirs[None].expand(len(slots), -1, -1), *box_bounds(centre, extent))
-            hits = t_out >= t_in.clamp_min(0.0)
-        idx = select_tokens(attn, hits, TOKEN_QUERIES)  # (K-1, T)
+        idx = select_tokens(attn, TOKEN_QUERIES)  # (K-1, T)
         a = attn[1:].gather(1, idx)[..., None]
         picked = torch.cat([tokens[idx], uv[idx], a, dirs[idx]], -1)
         gaussians = self.obj_decoder(slots, centre, extent, colour, picked, frame.origin)

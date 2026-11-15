@@ -1,5 +1,5 @@
 """Object decoder: slot -> box at the attention anchor -> Gaussians from fixed
-queries and from the slot's tokens (on their rays), in the box. Units of R.
+queries (in the box) and from the slot's tokens (on their rays). Units of R.
 """
 
 from __future__ import annotations
@@ -41,22 +41,6 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
     freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
     angles = x[..., None] * freqs  # (N, 3, bands)
     return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
-
-
-def box_bounds(centre: torch.Tensor, extent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Box centre, half sizes (K, 3) -> lo, hi corners (K, 3), cut at the floor."""
-    lo, hi = centre - extent, centre + extent
-    return torch.cat([lo[:, :2], lo[:, 2:].clamp_min(MIN_HEIGHT)], -1), hi
-
-
-def ray_box(
-    origin: torch.Tensor, dirs: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rays origin + t dirs (K, T, 3) vs boxes (K, 3) -> entry, exit t (K, T)."""
-    safe = torch.where(dirs.abs() < 1e-6, torch.full_like(dirs, 1e-6), dirs)
-    t1 = (lo[:, None] - origin) / safe
-    t2 = (hi[:, None] - origin) / safe
-    return torch.minimum(t1, t2).amax(-1), torch.maximum(t1, t2).amin(-1)
 
 
 class RegionHead(nn.Module):
@@ -120,15 +104,15 @@ class ObjectHead(nn.Module):
         t = torch.tanh(raw[:, :n_fixed, 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent] cut at the floor.
-        box_lo, box_hi = box_bounds(centre, extent)
-        lo, hi = box_lo[:, None, 2:], box_hi[:, None, 2:]
+        lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)[:, None, None]
+        hi = (centre[:, 2] + extent[:, 2])[:, None, None]
         fixed = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
-        # Token Gaussians: on their ray, inside the box.
-        t_in, t_out = ray_box(origin, dirs, box_lo, box_hi)
-        t_in = t_in.clamp_min(0.0)
-        t_out = torch.maximum(t_out, t_in)
-        depth = t_in + (t_out - t_in) * 0.5 * (torch.tanh(raw[:, n_fixed:, 0]) + 1.0)
-        mu = torch.cat([fixed, origin + depth[..., None] * dirs], 1)
+        # Token Gaussians: on their ray, depth about the box centre's.
+        t0 = ((centre - origin)[:, None] * dirs).sum(-1, keepdim=True)  # (K, T, 1)
+        depth = t0 + extent[:, None, :2].mean(-1, keepdim=True) * torch.tanh(raw[:, n_fixed:, 0:1])
+        token = origin + depth * dirs
+        token = torch.cat([token[..., :2], token[..., 2:].clamp_min(MIN_HEIGHT)], -1)
+        mu = torch.cat([fixed, token], 1)
 
         opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
