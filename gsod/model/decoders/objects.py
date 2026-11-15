@@ -1,6 +1,5 @@
-"""Object decoder: slot -> box at the attention anchor -> Gaussians: half
-from fixed queries (in the box), half from tokens the slot owns (on their
-view-0 rays). Scene frame, units of R.
+"""Object decoder: slot -> box at the attention anchor -> Gaussians from fixed
+queries and from the slot's tokens (on their rays), in the box. Units of R.
 """
 
 from __future__ import annotations
@@ -53,8 +52,7 @@ def box_bounds(centre: torch.Tensor, extent: torch.Tensor) -> tuple[torch.Tensor
 def ray_box(
     origin: torch.Tensor, dirs: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rays origin (3,) + t dirs (K, T, 3) against boxes lo, hi (K, 3) ->
-    entry, exit t (K, T); entry > exit where a ray misses."""
+    """Rays origin + t dirs (K, T, 3) vs boxes (K, 3) -> entry, exit t (K, T)."""
     safe = torch.where(dirs.abs() < 1e-6, torch.full_like(dirs, 1e-6), dirs)
     t1 = (lo[:, None] - origin) / safe
     t2 = (hi[:, None] - origin) / safe
@@ -116,9 +114,7 @@ class ObjectHead(nn.Module):
         origin: torch.Tensor,
         dirs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box centre / half sizes / colour (K, 3), view 0's
-        origin (3,) and the token Gaussians' ray directions (K, T, 3), the
-        last T of G -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), box, colour (K, 3), token rays (K, T, 3) (last T) -> Gaussians."""
         raw = self.project(feat)
         n_fixed = feat.shape[1] - dirs.shape[1]
         t = torch.tanh(raw[:, :n_fixed, 0:3])
@@ -201,10 +197,7 @@ class ObjectDecoder(nn.Module):
         tokens: torch.Tensor,
         origin: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """slots (K, C); box centre / half sizes (self.region), colour (K, 3);
-        the selected tokens' features (K, T, C), uv (K, T, 2) in [-1, 1],
-        attention (K, T, 1) and ray directions (K, T, 3) as one (K, T, C+6);
-        view 0's origin (3,) -> Gaussians."""
+        """slots (K, C), box, colour (K, 3), tokens [feature, uv, attn, ray] (K, T, C+6) -> Gaussians."""
         K = slots.shape[0]
         feat, uv, a, dirs = tokens.split([tokens.shape[-1] - 6, 2, 1, 3], -1)
         pe = positional_encoding(uv.flatten(0, 1), TOKEN_PE_BANDS).view(*uv.shape[:2], -1)

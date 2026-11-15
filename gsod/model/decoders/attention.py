@@ -1,9 +1,5 @@
-"""2D attention reconstruction: the attention as masks over view 0's tokens.
-
-Every token's colour depends on every slot, so the loss reaches every slot.
-An object slot only draws near its attention centre (an envelope sized like
-an object); farther out it falls back to the background, so one slot cannot
-explain two separate objects.
+"""2D reconstruction of view 0 with the attention as masks; an object slot
+draws only within an object-sized envelope about its centre, else background.
 """
 
 from __future__ import annotations
@@ -40,8 +36,7 @@ class AttnDecoder(nn.Module):
         depth: torch.Tensor,
         focal_ratio: tuple[float, float],
     ) -> torch.Tensor:
-        """slots (K-1, C), attn (K, N) (row 0 background), bg colours (N, 3),
-        token uv (N, 2), anchor depths in view 0 (K-1,) -> colours (N, 3)."""
+        """slots (K-1, C), attn (K, N), bg (N, 3), uv (N, 2), depth (K-1,) -> (N, 3)."""
         p = attn[1:] / attn[1:].sum(-1, keepdim=True).clamp_min(1e-8)
         centre = p @ uv  # (K-1, 2)
         focal = torch.tensor(focal_ratio, device=uv.device, dtype=uv.dtype)

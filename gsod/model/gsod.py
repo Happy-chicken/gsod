@@ -59,7 +59,7 @@ def _token_rays(
 
 
 def token_uv(side: int, like: torch.Tensor) -> torch.Tensor:
-    """(side*side, 2) token centres in view 0, in [-1, 1] (grid_sample's convention)."""
+    """(side*side, 2) token centres in [-1, 1]."""
     lin = (torch.arange(side, device=like.device, dtype=like.dtype) + 0.5) / side * 2.0 - 1.0
     vv, uu = torch.meshgrid(lin, lin, indexing="ij")
     return torch.stack([uu.flatten(), vv.flatten()], -1)
@@ -91,10 +91,8 @@ def attention_anchors(
 
 @torch.no_grad()
 def select_tokens(attn: torch.Tensor, hits: torch.Tensor, n: int) -> torch.Tensor:
-    """attn (K, N) (row 0 background), hits (K-1, N): the token's ray meets
-    the slot's box -> (K-1, n) indices per object slot: n evenly spaced among
-    owned tokens that hit, else hits ranked owned first then by attention
-    (repeated if too few)."""
+    """attn (K, N), hits (K-1, N) ray meets box -> (K-1, n): evenly spaced owned
+    hits, else hits by ownership then attention."""
     owner = attn.argmax(0)
     out = []
     for k in range(1, attn.shape[0]):
@@ -167,9 +165,7 @@ class GSODModel(nn.Module):
         frame: SceneFrame,
         tokens: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Object slots (K-1, C), attention (K, s*s) (row 0 background), token
-        colours (s*s, 3), encoder tokens (s*s, C) -> world Gaussians
-        (K-1, G, ...), half sizes "extent" (K-1, 3)."""
+        """slots (K-1, C), attn (K, s*s), colours, tokens (s*s, .) -> Gaussians, extent, anchor."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
