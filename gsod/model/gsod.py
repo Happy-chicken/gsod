@@ -175,12 +175,10 @@ class GSODModel(nn.Module):
         """Background slots (1 + B, C), all slots' attention (K_all, s*s) (background
         first), token colours (s*s, 3) -> world floor Gaussians (N, ...), "fill"."""
         side, n_bg = self.input_size, bg_slots.shape[0]
-        # Detail slots' tokens (rays meeting the floor) -> their floor points.
+        # Detail slots' most attended tokens (rays meeting the floor) -> floor points.
         rays = _token_rays(frame, side, self.image_size, self.focal_ratio)
-        down = (rays[:, 2] < -1e-6).to(attn_all.dtype)
-        detail = attn_all[1:n_bg] * down
-        rest = torch.cat([attn_all[:1], attn_all[n_bg:]]).amax(0, keepdim=True)  # other slots
-        idx = select_tokens(torch.cat([rest, detail]), DETAIL_TOKENS)  # (B, T)
+        detail = attn_all[1:n_bg]
+        idx = torch.where(rays[:, 2] < -1e-6, detail, -1.0).topk(DETAIL_TOKENS, -1).indices  # (B, T)
         floor = _at_height(frame, rays, DETAIL_LIFT) @ yaw_matrix(frame.yaw)[:2, :2].T.to(rays.dtype)
         gaussians = self.bg_decoder(
             bg_slots,
@@ -189,6 +187,7 @@ class GSODModel(nn.Module):
             frame,
             floor[idx],
             token_uv(side, attn_all)[idx],
+            detail.gather(1, idx),
         )
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}

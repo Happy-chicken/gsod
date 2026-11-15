@@ -113,9 +113,10 @@ class DetailTokens(nn.Module):
             out.bias[3] = _logit(DETAIL_OPACITY_INIT)
 
     def forward(
-        self, latents: torch.Tensor, xy: torch.Tensor, uv: torch.Tensor, mean: torch.Tensor
+        self, latents: torch.Tensor, xy: torch.Tensor, uv: torch.Tensor, attn: torch.Tensor, mean: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        """latents (B, C), floor xy, uv (B, T, 2), mean colour (3,) -> Gaussians (B * T, ...)."""
+        """latents (B, C), floor xy, uv (B, T, 2), attention (B, T), mean colour
+        (3,) -> Gaussians (B * T, ...); opacity scaled by the attention."""
         q = self.query(positional_encoding(uv.flatten(0, 1), _PE_BANDS)).view(*uv.shape[:2], -1)
         raw = self.mlp(torch.cat([q, latents[:, None].expand(-1, q.shape[1], -1)], -1))
         lo, hi = (math.log(v) for v in DETAIL_SCALE)
@@ -126,7 +127,7 @@ class DetailTokens(nn.Module):
             "mu": torch.cat([xy, torch.full_like(xy[..., :1], DETAIL_LIFT)], -1),
             "scale": torch.cat([scale_xy, torch.full_like(scale_xy[..., :1], THICKNESS)], -1),
             "quat": torch.stack([half.cos(), zero, zero, half.sin()], -1),
-            "opacity": torch.sigmoid(raw[..., 3]),
+            "opacity": torch.sigmoid(raw[..., 3]) * attn,
             "rgb": torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + raw[..., 4:7]),
             "sh1": raw[..., 7:16].unflatten(-1, (3, 3)),
         }
@@ -160,10 +161,11 @@ class BackgroundDecoder(nn.Module):
         frame,
         detail_xy: torch.Tensor,
         detail_uv: torch.Tensor,
+        detail_attn: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """latents (1 + B, C) (global, detail), attn (s, s) background attention,
-        colours (3, s, s), SceneFrame, detail tokens' floor xy and uv (B, T, 2)
-        -> Gaussians, "fill"."""
+        colours (3, s, s), SceneFrame, detail tokens' floor xy, uv (B, T, 2) and
+        attention (B, T) -> Gaussians, "fill"."""
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
         yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latents.dtype)
@@ -171,7 +173,7 @@ class BackgroundDecoder(nn.Module):
         n = len(self.centre)
         base = torch.cat([self.feature, positional_encoding(self.centre / _HALF, _PE_BANDS)], -1)
         glob = self.global_group(torch.cat([base, scene.expand(n, -1)], -1), self.centre, self.spacing, mean, 0.0)
-        detail = self.detail(latents[1:], detail_xy, detail_uv, mean)
+        detail = self.detail(latents[1:], detail_xy, detail_uv, detail_attn, mean)
 
         out = {k: torch.cat([glob[k], detail[k]]) for k in glob}
         out["fill"] = torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + self.fill_out(scene))
