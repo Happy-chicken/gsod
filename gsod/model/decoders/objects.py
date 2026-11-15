@@ -1,5 +1,6 @@
-"""Object decoder: slot -> box at the attention anchor -> G Gaussians in it.
-Scene frame, units of R.
+"""Object decoder: slot -> box at the attention anchor -> Gaussians: half
+from fixed queries (in the box), half from tokens the slot owns (on their
+view-0 rays). Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
+# Gaussians per slot from tokens (the rest from fixed queries); token PE bands.
+TOKEN_QUERIES = 256
+TOKEN_PE_BANDS = 4
 
 
 def _logit(p: float) -> float:
@@ -92,15 +96,26 @@ class ObjectHead(nn.Module):
         centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
+        origin: torch.Tensor,
+        dirs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), box centre / half sizes / colour (K, 3), view 0's
+        origin (3,) and the token Gaussians' ray directions (K, T, 3), the
+        last T of G -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
-        t = torch.tanh(raw[..., 0:3])
+        n_fixed = feat.shape[1] - dirs.shape[1]
+        t = torch.tanh(raw[:, :n_fixed, 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent] cut at the floor.
         lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)[:, None, None]
         hi = (centre[:, 2] + extent[:, 2])[:, None, None]
-        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
+        fixed = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
+        # Token Gaussians: on their ray, depth about the box centre's.
+        t0 = ((centre - origin)[:, None] * dirs).sum(-1, keepdim=True)  # (K, T, 1)
+        depth = t0 + extent[:, None, :2].mean(-1, keepdim=True) * torch.tanh(raw[:, n_fixed:, 0:1])
+        token = origin + depth * dirs
+        token = torch.cat([token[..., :2], token[..., 2:].clamp_min(MIN_HEIGHT)], -1)
+        mu = torch.cat([fixed, token], 1)
 
         opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
@@ -151,7 +166,8 @@ class ObjectDecoder(nn.Module):
         super().__init__()
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
-        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
+        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot) - TOKEN_QUERIES, d) * QUERY_STD)
+        self.token_query = nn.Linear(z_dim + 2 + 4 * TOKEN_PE_BANDS + 1, d)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
@@ -165,13 +181,21 @@ class ObjectDecoder(nn.Module):
         anchor: torch.Tensor,
         ray: torch.Tensor,
         colour: torch.Tensor,
+        tokens: torch.Tensor,
+        origin: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3); the selected tokens'
+        features (K, T, C), uv (K, T, 2) in [-1, 1], attention (K, T, 1) and
+        ray directions (K, T, 3) as one (K, T, C+6); view 0's origin (3,)
+        -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
-        q = self.queries.expand(K, -1, -1)
+        feat, uv, a, dirs = tokens.split([tokens.shape[-1] - 6, 2, 1, 3], -1)
+        pe = positional_encoding(uv.flatten(0, 1), TOKEN_PE_BANDS).view(*uv.shape[:2], -1)
+        q_token = self.token_query(torch.cat([feat.detach(), pe, a], -1))
+        q = torch.cat([self.queries.expand(K, -1, -1), q_token], 1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, centre, extent, colour), centre, extent
+        return self.head(q, centre, extent, colour, origin, dirs), centre, extent
