@@ -1,4 +1,5 @@
-"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background."""
+"""Slot attention (BO-QSA, Jia et al., ICLR 2023); the first 1 + BG_DETAIL
+slots are the background (global, then detail)."""
 
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ from torch.nn import init
 SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
+# Background slots beyond the global one (detail).
+BG_DETAIL = 2
 
 
 class SlotAttention(nn.Module):
@@ -33,7 +36,8 @@ class SlotAttention(nn.Module):
         self.slot_dim = slot_dim
         self.sigma = SIGMA_START
 
-        self.slots_init = nn.Embedding(num_slots, slot_dim)
+        self.n_bg = 1 + BG_DETAIL
+        self.slots_init = nn.Embedding(num_slots + BG_DETAIL, slot_dim)
         init.xavier_uniform_(self.slots_init.weight)
         self.pos_proj = nn.Linear(4, in_dim)
         self.feat_mlp = nn.Sequential(
@@ -92,4 +96,4 @@ class SlotAttention(nn.Module):
             slots = self.gru(updates.reshape(-1, D), prev.reshape(-1, D)).reshape(b, -1, D)
             slots = slots + self.mlp(self.norm_mlp(slots))
 
-        return slots[:, 0], slots[:, 1:], attn
+        return slots[:, : self.n_bg], slots[:, self.n_bg :], attn
