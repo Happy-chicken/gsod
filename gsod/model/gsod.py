@@ -77,23 +77,18 @@ def attention_anchors(
 
 
 @torch.no_grad()
-def select_tokens(attn: torch.Tensor, uv: torch.Tensor, n: int) -> torch.Tensor:
-    """attn (K, N) (row 0 background), token uv (N, 2) -> (K-1, n) indices per
-    object slot: farthest points over the tokens it owns, topped up by its
-    highest attention elsewhere."""
+def select_tokens(attn: torch.Tensor, n: int) -> torch.Tensor:
+    """attn (K, N) (row 0 background) -> (K-1, n) indices per object slot:
+    n evenly spaced among the tokens it owns, topped up by its highest
+    attention elsewhere."""
     owner = attn.argmax(0)
     out = []
     for k in range(1, attn.shape[0]):
         a, owned = attn[k], owner == k
         count = int(owned.sum())
         if count >= n:
-            dist = torch.where(owned, torch.full_like(a, float("inf")), torch.full_like(a, -1.0))
-            i = torch.where(owned, a, torch.full_like(a, -1.0)).argmax()
-            picks = torch.empty(n, dtype=torch.long, device=a.device)
-            for j in range(n):
-                picks[j] = i
-                dist = torch.minimum(dist, (uv - uv[i]).pow(2).sum(-1))
-                i = dist.argmax()
+            step = torch.linspace(0, count - 1, n, device=a.device).long()
+            picks = owned.nonzero()[:, 0][step]
         else:
             rest = torch.where(owned, torch.full_like(a, -1.0), a).topk(n - count).indices
             picks = torch.cat([owned.nonzero()[:, 0], rest])
@@ -167,7 +162,7 @@ class GSODModel(nn.Module):
         vv, uu = torch.meshgrid(lin, lin, indexing="ij")
         uv = torch.stack([uu.flatten(), vv.flatten()], -1)
         dirs = F.normalize(_token_rays(frame, side, self.image_size, self.focal_ratio), dim=-1)
-        idx = select_tokens(attn, uv, TOKEN_QUERIES)  # (K-1, T)
+        idx = select_tokens(attn, TOKEN_QUERIES)  # (K-1, T)
         a = attn[1:].gather(1, idx)[..., None]
         picked = torch.cat([tokens[idx], uv[idx], a, dirs[idx]], -1)
         gaussians, _, extent = self.obj_decoder(slots, anchor, ray, colour, picked, frame.origin)
