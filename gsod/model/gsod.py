@@ -19,11 +19,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
-from gsod.model.decoders.background import DETAIL_LIFT, DETAIL_TOKENS
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, TOKEN_QUERIES
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world, yaw_matrix
+from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
 from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
@@ -170,24 +169,13 @@ class GSODModel(nn.Module):
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
-        self, bg_slots: torch.Tensor, attn_all: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
-        """Background slots (1 + B, C), all slots' attention (K_all, s*s) (background
-        first), token colours (s*s, 3) -> world floor Gaussians (N, ...), "fill"."""
-        side, n_bg = self.input_size, bg_slots.shape[0]
-        # Detail slots' most attended tokens (rays meeting the floor) -> floor points.
-        rays = _token_rays(frame, side, self.image_size, self.focal_ratio)
-        detail = attn_all[1:n_bg]
-        idx = torch.where(rays[:, 2] < -1e-6, detail, -1.0).topk(DETAIL_TOKENS, -1).indices  # (B, T)
-        floor = _at_height(frame, rays, DETAIL_LIFT) @ yaw_matrix(frame.yaw)[:2, :2].T.to(rays.dtype)
+        """Background slot (C,), attention (s*s,), token colours (s*s, 3) ->
+        world floor discs (N, ...) and "fill" (3,)."""
+        side = self.input_size
         gaussians = self.bg_decoder(
-            bg_slots,
-            attn_all[:n_bg].sum(0).reshape(side, side),
-            colours.T.reshape(3, side, side),
-            frame,
-            floor[idx],
-            token_uv(side, attn_all)[idx],
-            detail.gather(1, idx),
+            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame
         )
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
@@ -231,7 +219,6 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
-            "bg_attn": scene["bg_attn"],  # (1 + B, s*s)
             "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
@@ -241,16 +228,13 @@ class GSODModel(nn.Module):
         outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
-        bg_slots, slots, attn_all = (x[0] for x in self.slot_attention(tokens))
-        n_bg = bg_slots.shape[0]
-        attn = torch.cat([attn_all[:n_bg].sum(0, keepdim=True), attn_all[n_bg:]])  # row 0: background
+        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
             "objects": self.decode_objects(slots, attn, colours, frame),
-            "background": self.decode_background(bg_slots, attn_all, colours, frame),
+            "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:]),
             "attn": attn,
-            "bg_attn": attn_all[:n_bg],  # global, detail
             "slots": slots,
             "frame": frame,
         }
@@ -259,6 +243,6 @@ class GSODModel(nn.Module):
         out = self.render(scene, cam2world)
         # Global 2D mixture of view 0 (competition among slots).
         bg = F.interpolate(out["bg_rgb"][0:1], size=self.input_size, mode="area")[0].flatten(1).T
-        out["attn_rgb"] = self.attn_decoder(bg_slots, slots, bg, token_uv(self.input_size, attn))
+        out["attn_rgb"] = self.attn_decoder(bg_slot, slots, bg, token_uv(self.input_size, attn))
         out["attn_target"] = colours
         return out

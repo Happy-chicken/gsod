@@ -32,15 +32,14 @@ class AttnDecoder(nn.Module):
         self.background = _mlp(z_dim + 2 + 4 * BANDS, hidden_dim, 1)  # logit
 
     def forward(
-        self, bg_slots: torch.Tensor, slots: torch.Tensor, bg: torch.Tensor, uv: torch.Tensor
+        self, bg_slot: torch.Tensor, slots: torch.Tensor, bg: torch.Tensor, uv: torch.Tensor
     ) -> torch.Tensor:
-        """bg_slots (B, C), slots (K-1, C), floor colours (N, 3), uv (N, 2) -> (N, 3)."""
+        """bg_slot (C,), slots (K-1, C), floor colours (N, 3), uv (N, 2) -> (N, 3)."""
         pe = positional_encoding(uv, BANDS)  # (N, P)
-        n, n_bg = pe.shape[0], bg_slots.shape[0]
-        everything = torch.cat([bg_slots, slots], 0)
+        n = pe.shape[0]
+        everything = torch.cat([bg_slot[None], slots], 0)  # (K, C)
         inp = torch.cat([everything[:, None].expand(-1, n, -1), pe[None].expand(len(everything), -1, -1)], -1)
-        obj = self.objects(inp[n_bg:])
-        bg_logit = self.background(inp[:n_bg]).logsumexp(0, keepdim=True)
-        logits = torch.cat([bg_logit, obj[..., 3:]], 0)  # (K, N, 1)
+        obj = self.objects(inp[1:])
+        logits = torch.cat([self.background(inp[:1]), obj[..., 3:]], 0)  # (K, N, 1)
         colours = torch.cat([bg[None], torch.sigmoid(obj[..., :3])], 0)  # (K, N, 3)
         return (logits.softmax(0) * colours).sum(0)
