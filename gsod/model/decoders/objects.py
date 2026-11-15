@@ -1,5 +1,5 @@
-"""Object decoder: slot -> box at the attention anchor -> G Gaussians in it,
-refined (shift, scale, rotation) from view 0's features. Scene frame, units of R.
+"""Object decoder: slot -> box at the attention anchor -> G Gaussians in it.
+Scene frame, units of R.
 """
 
 from __future__ import annotations
@@ -9,8 +9,6 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-from gsod.utils.geometry import SceneFrame, project_and_sample
 
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
@@ -25,10 +23,6 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
-# Pixel refinement: max shift (r_max), max scale change (log2), feature levels.
-REFINE_SHIFT = 0.25
-REFINE_SCALE = 1.0
-REFINE_LEVELS = 3
 
 
 def _logit(p: float) -> float:
@@ -76,16 +70,13 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Gaussian feature -> one Gaussian, refined from view 0's features."""
+    """Gaussian feature -> one Gaussian."""
 
-    def __init__(self, d_model: int, pix_dim: int):
+    def __init__(self, d_model: int):
         super().__init__()
         r_max = OBJECT_RADIUS[1]
-        self.shift = REFINE_SHIFT * r_max
         self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
         self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
-        # Refinement: shift 3, log2 scale 3, quat 4; zero at first.
-        self.refine = nn.Sequential(nn.Linear(d_model + REFINE_LEVELS * pix_dim, d_model), nn.ReLU(True), nn.Linear(d_model, 10))
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
             out = self.project[-1]
@@ -94,8 +85,6 @@ class ObjectHead(nn.Module):
             out.bias.zero_()
             out.bias[3:6] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
             out.bias[6] = 1.0  # identity quaternion (wxyz)
-            self.refine[-1].weight.zero_()
-            self.refine[-1].bias.zero_()
 
     def forward(
         self,
@@ -103,9 +92,6 @@ class ObjectHead(nn.Module):
         centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
-        maps: list[torch.Tensor],
-        frame: SceneFrame,
-        focal_ratio: tuple[float, float],
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
@@ -116,21 +102,12 @@ class ObjectHead(nn.Module):
         hi = (centre[:, 2] + extent[:, 2])[:, None, None]
         mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
-        # Sample view 0's features (detached) where each Gaussian projects.
-        at = mu.detach().reshape(1, -1, 3)
-        pix = torch.cat([project_and_sample(at, m.detach(), frame, focal_ratio) for m in maps], -1)
-        pix = pix.view(*mu.shape[:2], -1)
-        delta = self.refine(torch.cat([feat, pix], -1))
-        mu = mu + self.shift * torch.tanh(delta[..., :3])
-        mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-
         opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
         return {
             "mu": mu,
-            "scale": (_log_uniform(raw[..., 3:6], *self.scale_range)
-                      * 2.0 ** (REFINE_SCALE * torch.tanh(delta[..., 3:6]))).clamp(*self.scale_range),
-            "quat": F.normalize(raw[..., 6:10] + delta[..., 6:10], dim=-1),
+            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": opacity,
             "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
@@ -180,7 +157,7 @@ class ObjectDecoder(nn.Module):
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
-        self.head = ObjectHead(d, z_dim)
+        self.head = ObjectHead(d)
 
     def forward(
         self,
@@ -188,9 +165,6 @@ class ObjectDecoder(nn.Module):
         anchor: torch.Tensor,
         ray: torch.Tensor,
         colour: torch.Tensor,
-        maps: list[torch.Tensor],
-        frame: SceneFrame,
-        focal_ratio: tuple[float, float],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians, centres, half sizes."""
         K = slots.shape[0]
@@ -200,5 +174,4 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, centre, extent, colour, maps, frame, focal_ratio)
-        return gaussians, centre, extent
+        return self.head(q, centre, extent, colour), centre, extent

@@ -117,11 +117,10 @@ class GSODModel(nn.Module):
         }
 
     # -- stages ---------------------------------------------------------------
-    def encode(self, images: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """images (N, 3, H, W) -> tokens (N, s*s, C), feature maps [s, s/2, s/4]."""
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """images (N, 3, H, W) -> encoder tokens (N, s*s, C), s = input_size."""
         small = F.interpolate(images, size=self.input_size, mode="bilinear", align_corners=False)
-        out, maps = self.encoder(small)
-        return out.flatten(start_dim=2).permute(0, 2, 1), maps
+        return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
         self,
@@ -129,7 +128,6 @@ class GSODModel(nn.Module):
         attn: torch.Tensor,
         colours: torch.Tensor,
         frame: SceneFrame,
-        maps: list[torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         """Object slots (K-1, C), attention (K-1, s*s), token colours (s*s, 3)
         -> world Gaussians (K-1, G, ...), half sizes "extent" (K-1, 3)."""
@@ -137,9 +135,7 @@ class GSODModel(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        gaussians, _, extent = self.obj_decoder(
-            slots, anchor, ray, colour, maps, frame, self.focal_ratio
-        )
+        gaussians, _, extent = self.obj_decoder(slots, anchor, ray, colour)
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
@@ -200,12 +196,12 @@ class GSODModel(nn.Module):
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
         """images (N, 3, H, W) in [0, 1], cam2world (N, 4, 4) -> render
         outputs, or with render=False the decoded scene."""
-        tokens, maps = self.encode(images[0:1])
+        tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn[1:], colours, frame, maps),
+            "objects": self.decode_objects(slots, attn[1:], colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:]),
             "attn": attn,
