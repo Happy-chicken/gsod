@@ -44,6 +44,19 @@ def _rgb(chw: np.ndarray) -> np.ndarray:
     return (np.clip(chw.transpose(1, 2, 0), 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
+# Background slots in the attention panel: global white, details orange, cyan.
+BG_COLOURS = np.array([[1.0, 1.0, 1.0], [1.0, 0.55, 0.1], [0.1, 0.8, 1.0]])
+
+
+def _bg_tile(bg_attn: np.ndarray, size) -> tuple[np.ndarray, str]:
+    """Background slots' attention (B, s, s) -> one coloured tile and caption."""
+    up = np.stack([upsample_labels(a, size) for a in bg_attn])  # (B, H, W)
+    colours = BG_COLOURS[np.arange(len(up)) % len(BG_COLOURS)]
+    image = np.clip(np.einsum("bhw,bc->hwc", up, colours), 0, 1)
+    parts = ", ".join(("g" if b == 0 else "d") + f" {100 * float(a.mean()):.0f}" for b, a in enumerate(up))
+    return (image * 255 + 0.5).astype(np.uint8), f"bg {float(up.sum(0).mean()):.0%} ({parts})"
+
+
 def _gray(hw: np.ndarray) -> np.ndarray:
     g = (np.clip(hw, 0, 1) * 255 + 0.5).astype(np.uint8)
     return np.repeat(g[..., None], 3, axis=-1)
@@ -80,10 +93,10 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
 
     out = {"view0": view(0)}
     attn_up = np.stack([upsample_labels(a, size) for a in rec["attn"]])
-    out["view0"]["attention"] = [(colorize(attn_up.argmax(0)), "attention mask")] + [
-        (_gray(a), f"{'bg' if k == 0 else f's{k}'} {float(a.mean()):.0%}")
-        for k, a in enumerate(attn_up)
-    ]
+    out["view0"]["attention"] = [
+        (colorize(attn_up.argmax(0)), "attention mask"),
+        _bg_tile(rec["bg_attn"], size),
+    ] + [(_gray(a), f"s{k} {float(a.mean()):.0%}") for k, a in enumerate(attn_up) if k > 0]
     if rec["rgb"].shape[0] > 1:
         out["view1"] = view(1)
     return out

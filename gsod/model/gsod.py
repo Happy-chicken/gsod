@@ -224,6 +224,7 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
+            "bg_attn": scene["bg_attn"],  # (1 + B, s*s)
             "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
@@ -242,6 +243,7 @@ class GSODModel(nn.Module):
             "background": self.decode_background(bg_slots, attn_all[:n_bg], colours, frame),
             "draw": draw_factor(attn[1:]),
             "attn": attn,
+            "bg_attn": attn_all[:n_bg],  # global, detail
             "slots": slots,
             "frame": frame,
         }

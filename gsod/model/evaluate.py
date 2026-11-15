@@ -124,6 +124,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "alpha": np_(result["slot_alpha"]),  # (V, K, H, W), 0 = uncovered
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (V, H, W)
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
+        "bg_attn": np_(result["bg_attn"]).reshape(-1, side, side),  # global, detail
         "occupancy": occupancy,
         "draw": np_(result["draw"]),  # (K-1,)
         "extent": np_(result["extent"]),  # (K-1, 3)
