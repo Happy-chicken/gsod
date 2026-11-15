@@ -22,7 +22,7 @@ from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, TOKEN_QUERIES
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world, yaw_matrix
+from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
 from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
@@ -172,15 +172,15 @@ class GSODModel(nn.Module):
         self, bg_slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
         """Background slots (1 + B, C), their attention (1 + B, s*s), token colours
-        (s*s, 3) -> world floor discs (N, ...) and "fill" (3,)."""
+        (s*s, 3) -> world floor Gaussians (N, ...) and "fill" (3,)."""
         side = self.input_size
-        # Detail slots' anchors: their attention over token rays meeting the floor.
-        rays = _token_rays(frame, side, self.image_size, self.focal_ratio)
-        floor = _at_height(frame, rays, 0.0).clamp(-3.0, 3.0)
-        p = attn[1:] / attn[1:].sum(-1, keepdim=True).clamp_min(1e-8)
-        anchors = (p @ floor) @ yaw_matrix(frame.yaw)[:2, :2].T.to(floor.dtype)  # world-aligned
         gaussians = self.bg_decoder(
-            bg_slots, attn.sum(0).reshape(side, side), colours.T.reshape(3, side, side), frame, anchors
+            bg_slots,
+            attn.sum(0).reshape(side, side),
+            colours.T.reshape(3, side, side),
+            attn[1:].reshape(-1, side, side),
+            frame,
+            self.focal_ratio,
         )
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
