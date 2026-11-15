@@ -44,6 +44,23 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
     return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
 
 
+def box_bounds(centre: torch.Tensor, extent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Box centre, half sizes (K, 3) -> lo, hi corners (K, 3), cut at the floor."""
+    lo, hi = centre - extent, centre + extent
+    return torch.cat([lo[:, :2], lo[:, 2:].clamp_min(MIN_HEIGHT)], -1), hi
+
+
+def ray_box(
+    origin: torch.Tensor, dirs: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rays origin (3,) + t dirs (K, T, 3) against boxes lo, hi (K, 3) ->
+    entry, exit t (K, T); entry > exit where a ray misses."""
+    safe = torch.where(dirs.abs() < 1e-6, torch.full_like(dirs, 1e-6), dirs)
+    t1 = (lo[:, None] - origin) / safe
+    t2 = (hi[:, None] - origin) / safe
+    return torch.minimum(t1, t2).amax(-1), torch.maximum(t1, t2).amin(-1)
+
+
 class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes
     r_min + r_max softplus(.) (no upper limit)."""
@@ -107,15 +124,15 @@ class ObjectHead(nn.Module):
         t = torch.tanh(raw[:, :n_fixed, 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent] cut at the floor.
-        lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)[:, None, None]
-        hi = (centre[:, 2] + extent[:, 2])[:, None, None]
+        box_lo, box_hi = box_bounds(centre, extent)
+        lo, hi = box_lo[:, None, 2:], box_hi[:, None, 2:]
         fixed = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
-        # Token Gaussians: on their ray, depth about the box centre's.
-        t0 = ((centre - origin)[:, None] * dirs).sum(-1, keepdim=True)  # (K, T, 1)
-        depth = t0 + extent[:, None, :2].mean(-1, keepdim=True) * torch.tanh(raw[:, n_fixed:, 0:1])
-        token = origin + depth * dirs
-        token = torch.cat([token[..., :2], token[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        mu = torch.cat([fixed, token], 1)
+        # Token Gaussians: on their ray, inside the box.
+        t_in, t_out = ray_box(origin, dirs, box_lo, box_hi)
+        t_in = t_in.clamp_min(0.0)
+        t_out = torch.maximum(t_out, t_in)
+        depth = t_in + (t_out - t_in) * 0.5 * (torch.tanh(raw[:, n_fixed:, 0]) + 1.0)
+        mu = torch.cat([fixed, origin + depth[..., None] * dirs], 1)
 
         opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
@@ -178,18 +195,17 @@ class ObjectDecoder(nn.Module):
     def forward(
         self,
         slots: torch.Tensor,
-        anchor: torch.Tensor,
-        ray: torch.Tensor,
+        centre: torch.Tensor,
+        extent: torch.Tensor,
         colour: torch.Tensor,
         tokens: torch.Tensor,
         origin: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3); the selected tokens'
-        features (K, T, C), uv (K, T, 2) in [-1, 1], attention (K, T, 1) and
-        ray directions (K, T, 3) as one (K, T, C+6); view 0's origin (3,)
-        -> Gaussians, centres, half sizes."""
+    ) -> dict[str, torch.Tensor]:
+        """slots (K, C); box centre / half sizes (self.region), colour (K, 3);
+        the selected tokens' features (K, T, C), uv (K, T, 2) in [-1, 1],
+        attention (K, T, 1) and ray directions (K, T, 3) as one (K, T, C+6);
+        view 0's origin (3,) -> Gaussians."""
         K = slots.shape[0]
-        centre, extent = self.region(slots, anchor, ray)
         feat, uv, a, dirs = tokens.split([tokens.shape[-1] - 6, 2, 1, 3], -1)
         pe = positional_encoding(uv.flatten(0, 1), TOKEN_PE_BANDS).view(*uv.shape[:2], -1)
         q_token = self.token_query(torch.cat([feat.detach(), pe, a], -1))
@@ -198,4 +214,4 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, centre, extent, colour, origin, dirs), centre, extent
+        return self.head(q, centre, extent, colour, origin, dirs)
