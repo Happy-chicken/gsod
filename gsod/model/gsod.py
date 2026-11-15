@@ -19,10 +19,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
+from gsod.model.decoders.background import DETAIL_LIFT, DETAIL_TOKENS
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, TOKEN_QUERIES
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
+from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world, yaw_matrix
 from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
@@ -169,18 +170,25 @@ class GSODModel(nn.Module):
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
-        self, bg_slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self, bg_slots: torch.Tensor, attn_all: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
-        """Background slots (1 + B, C), their attention (1 + B, s*s), token colours
-        (s*s, 3) -> world floor Gaussians (N, ...) and "fill" (3,)."""
-        side = self.input_size
+        """Background slots (1 + B, C), all slots' attention (K_all, s*s) (background
+        first), token colours (s*s, 3) -> world floor Gaussians (N, ...), "fill"."""
+        side, n_bg = self.input_size, bg_slots.shape[0]
+        # Detail slots' tokens (rays meeting the floor) -> their floor points.
+        rays = _token_rays(frame, side, self.image_size, self.focal_ratio)
+        down = (rays[:, 2] < -1e-6).to(attn_all.dtype)
+        detail = attn_all[1:n_bg] * down
+        rest = torch.cat([attn_all[:1], attn_all[n_bg:]]).amax(0, keepdim=True)  # other slots
+        idx = select_tokens(torch.cat([rest, detail]), DETAIL_TOKENS)  # (B, T)
+        floor = _at_height(frame, rays, DETAIL_LIFT) @ yaw_matrix(frame.yaw)[:2, :2].T.to(rays.dtype)
         gaussians = self.bg_decoder(
             bg_slots,
-            attn.sum(0).reshape(side, side),
+            attn_all[:n_bg].sum(0).reshape(side, side),
             colours.T.reshape(3, side, side),
-            attn[1:].reshape(-1, side, side),
             frame,
-            self.focal_ratio,
+            floor[idx],
+            token_uv(side, attn_all)[idx],
         )
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
@@ -240,7 +248,7 @@ class GSODModel(nn.Module):
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
             "objects": self.decode_objects(slots, attn, colours, frame),
-            "background": self.decode_background(bg_slots, attn_all[:n_bg], colours, frame),
+            "background": self.decode_background(bg_slots, attn_all, colours, frame),
             "draw": draw_factor(attn[1:]),
             "attn": attn,
             "bg_attn": attn_all[:n_bg],  # global, detail

@@ -1,7 +1,6 @@
-"""Background decoder: floor anchors, each with a learned feature and two
-groups of flat Gaussians: global (from the global background slot) and detail
-(from the detail slots, mixed by their attention at the anchor; slightly
-above, so they cover the global group). No pixel is read. World-aligned.
+"""Background decoder: global slot -> floor anchors with flat Gaussians;
+detail slots -> flat Gaussians on the floor under the tokens they own (just
+above the global group). No pixel is read. World-aligned.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import torch
 from torch import nn
 
 from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
-from gsod.utils.geometry import project_and_sample, yaw_matrix
 
 # Anchors: inner grid over the object region, outer grid to +-_HALF.
 _INNER_SIDE = 10
@@ -21,14 +19,14 @@ _HALF = 3.0
 _PE_BANDS = 6
 ANCHOR_DIM = 32
 GLOBAL_PER_ANCHOR = 4
-DETAIL_PER_ANCHOR = 4
-# Gaussian scale ranges (units of anchor spacing), thickness, detail lift (R).
+DETAIL_TOKENS = 256
+# Scale ranges (global: anchor spacing; detail: R), thickness, detail lift (R).
 GLOBAL_SCALE = (1.0 / 4.0, 1.5)
-DETAIL_SCALE = (1.0 / 16.0, 0.5)
+DETAIL_SCALE = (0.005, 0.05)
 THICKNESS = 0.005
 DETAIL_LIFT = 1e-3
 GLOBAL_OPACITY_INIT = 0.95
-DETAIL_OPACITY_INIT = 0.05
+DETAIL_OPACITY_INIT = 0.5
 # Per Gaussian: offset 2, log scale 2, angle 1, opacity 1, rgb 3, sh1 9.
 _ATTRS = 18
 
@@ -96,6 +94,45 @@ class GaussianGroup(nn.Module):
         return {k: v.flatten(0, 1) for k, v in out.items()}
 
 
+class DetailTokens(nn.Module):
+    """Detail slots + their tokens' floor points -> flat Gaussians there."""
+
+    def __init__(self, z_dim: int, hidden: int):
+        super().__init__()
+        self.query = nn.Linear(2 + 4 * _PE_BANDS, hidden)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden + z_dim, hidden), nn.ReLU(True),
+            nn.Linear(hidden, hidden), nn.ReLU(True),
+            nn.Linear(hidden, 16),  # log scale 2, angle 1, opacity 1, rgb 3, sh1 9
+        )
+        with torch.no_grad():
+            out = self.mlp[-1]
+            out.weight.mul_(0.1)
+            out.weight[7:].zero_()
+            out.bias.zero_()
+            out.bias[3] = _logit(DETAIL_OPACITY_INIT)
+
+    def forward(
+        self, latents: torch.Tensor, xy: torch.Tensor, uv: torch.Tensor, mean: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """latents (B, C), floor xy, uv (B, T, 2), mean colour (3,) -> Gaussians (B * T, ...)."""
+        q = self.query(positional_encoding(uv.flatten(0, 1), _PE_BANDS)).view(*uv.shape[:2], -1)
+        raw = self.mlp(torch.cat([q, latents[:, None].expand(-1, q.shape[1], -1)], -1))
+        lo, hi = (math.log(v) for v in DETAIL_SCALE)
+        scale_xy = torch.exp(lo + (hi - lo) * torch.sigmoid(raw[..., 0:2]))
+        half = 0.5 * math.pi * torch.tanh(raw[..., 2])
+        zero = torch.zeros_like(half)
+        out = {
+            "mu": torch.cat([xy, torch.full_like(xy[..., :1], DETAIL_LIFT)], -1),
+            "scale": torch.cat([scale_xy, torch.full_like(scale_xy[..., :1], THICKNESS)], -1),
+            "quat": torch.stack([half.cos(), zero, zero, half.sin()], -1),
+            "opacity": torch.sigmoid(raw[..., 3]),
+            "rgb": torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + raw[..., 4:7]),
+            "sh1": raw[..., 7:16].unflatten(-1, (3, 3)),
+        }
+        return {k: v.flatten(0, 1) for k, v in out.items()}
+
+
 class BackgroundDecoder(nn.Module):
     """Background slots -> anchored floor Gaussians and a fill colour."""
 
@@ -109,9 +146,7 @@ class BackgroundDecoder(nn.Module):
         self.global_group = GaussianGroup(
             ANCHOR_DIM + d_pe + z_dim + 2, hidden_dim, GLOBAL_PER_ANCHOR, GLOBAL_SCALE, GLOBAL_OPACITY_INIT
         )
-        self.detail_group = GaussianGroup(
-            ANCHOR_DIM + d_pe + z_dim, hidden_dim, DETAIL_PER_ANCHOR, DETAIL_SCALE, DETAIL_OPACITY_INIT
-        )
+        self.detail = DetailTokens(z_dim, hidden_dim)
         self.fill_out = nn.Linear(z_dim + 2, 3)
         with torch.no_grad():
             self.fill_out.weight.zero_()  # the mean colour at first
@@ -122,12 +157,13 @@ class BackgroundDecoder(nn.Module):
         latents: torch.Tensor,
         attn: torch.Tensor,
         colours: torch.Tensor,
-        detail_attn: torch.Tensor,
         frame,
-        focal_ratio: tuple[float, float],
+        detail_xy: torch.Tensor,
+        detail_uv: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """latents (1 + B, C) (global, detail), attn (s, s) background attention,
-        colours (3, s, s), detail attention (B, s, s), SceneFrame -> Gaussians, "fill"."""
+        colours (3, s, s), SceneFrame, detail tokens' floor xy and uv (B, T, 2)
+        -> Gaussians, "fill"."""
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
         yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latents.dtype)
@@ -135,13 +171,7 @@ class BackgroundDecoder(nn.Module):
         n = len(self.centre)
         base = torch.cat([self.feature, positional_encoding(self.centre / _HALF, _PE_BANDS)], -1)
         glob = self.global_group(torch.cat([base, scene.expand(n, -1)], -1), self.centre, self.spacing, mean, 0.0)
-
-        # Detail latent per anchor: detail slots weighted by their attention there.
-        at = torch.cat([self.centre, torch.zeros_like(self.centre[:, :1])], -1)
-        at = (at @ yaw_matrix(-yaw).to(at.dtype).T)[None]  # view 0's scene frame
-        a = project_and_sample(at, detail_attn[None], frame, focal_ratio)[0] + 1e-4  # (A, B)
-        latent = (a / a.sum(-1, keepdim=True)) @ latents[1:]
-        detail = self.detail_group(torch.cat([base, latent], -1), self.centre, self.spacing, mean, DETAIL_LIFT)
+        detail = self.detail(latents[1:], detail_xy, detail_uv, mean)
 
         out = {k: torch.cat([glob[k], detail[k]]) for k in glob}
         out["fill"] = torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + self.fill_out(scene))
