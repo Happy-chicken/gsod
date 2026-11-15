@@ -141,17 +141,15 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
-def project_and_sample(
-    points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio, mode: str = "bilinear"
-) -> torch.Tensor:
+def project_and_sample(points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio) -> torch.Tensor:
     """Scene-frame points (B, P, 3) projected into view 0 -> maps (B, C, h, w)
-    sampled there (B, P, C); 0 behind the camera or off the image."""
+    sampled bilinearly there (B, P, C); 0 behind the camera or off the image."""
     cam = (points - frame.origin) @ frame.rot
     front = cam[..., 2] > 1e-3
     z = torch.where(front, cam[..., 2], torch.ones_like(cam[..., 2]))
     # grid_sample coordinates (align_corners=False): pixel centres at integers.
     grid = torch.stack([2.0 * focal_ratio[0] * cam[..., 0] / z, 2.0 * focal_ratio[1] * cam[..., 1] / z], -1)
-    out = F.grid_sample(maps, grid[:, None], mode=mode, align_corners=False)[:, :, 0]
+    out = F.grid_sample(maps, grid[:, None], mode="bilinear", align_corners=False)[:, :, 0]
     return out.transpose(1, 2) * front[..., None]
 
 

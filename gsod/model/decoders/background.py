@@ -1,7 +1,8 @@
 """Background decoder: background slot -> floor discs + fill colour.
 
-Disc colour = view 0's pixel where the background clearly owns it, away from
-object edges; elsewhere the mean colour + MLP(PE(x), latent, azimuth). World-aligned.
+Disc colour = the background's mean view-0 colour + MLP(PE(x), latent,
+view-0 azimuth) residual. Nothing is read per pixel, so the background
+cannot copy an object onto the floor. World-aligned.
 """
 
 from __future__ import annotations
@@ -9,11 +10,9 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
-from gsod.utils.geometry import project_and_sample, yaw_matrix
 
 _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
@@ -21,9 +20,6 @@ _HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
-# Pixels read where background attention >= BG_OWN, BG_MARGIN tokens from edges.
-BG_OWN = 0.9
-BG_MARGIN = 2
 
 
 def _mlp(d_in: int, hidden: int) -> nn.Sequential:
@@ -99,16 +95,10 @@ class BackgroundDecoder(nn.Module):
         self.register_buffer("floor_scale", scale, persistent=False)
 
     def forward(
-        self,
-        latent: torch.Tensor,
-        attn: torch.Tensor,
-        colours: torch.Tensor,
-        frame,
-        image: torch.Tensor,
-        focal_ratio: tuple[float, float],
+        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame
     ) -> dict[str, torch.Tensor]:
         """latent (C,), attn (s, s) background attention, colours (3, s, s),
-        view 0's SceneFrame and image (1, 3, H, W) -> Gaussians and "fill" (3,)."""
+        view 0's SceneFrame -> Gaussians and "fill" (3,)."""
         mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
         yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
@@ -116,21 +106,11 @@ class BackgroundDecoder(nn.Module):
         n = self.floor_mu.shape[0]
         pe = positional_encoding(self.floor_mu / _HALF, _PE_BANDS)
         feat = self.appearance(torch.cat([pe, scene.expand(n, -1)], -1))
-        colour = self.head.colour(feat, mean)
-        # View 0's pixel where the background clearly owns it (no gradient).
-        with torch.no_grad():
-            own = (attn >= BG_OWN).to(attn.dtype)[None, None]
-            k = 2 * BG_MARGIN + 1
-            own = 1.0 - F.max_pool2d(1.0 - own, k, stride=1, padding=BG_MARGIN)
-            at = (self.floor_mu @ yaw_matrix(-yaw).to(latent.dtype).T)[None]
-            gate = project_and_sample(at, own, frame, focal_ratio, mode="nearest")[0]
-            pixel = project_and_sample(at, image, frame, focal_ratio)[0]
-        colour["rgb"] = gate * pixel + (1.0 - gate) * colour["rgb"]
         return {
             "mu": self.floor_mu,
             "scale": self.floor_scale,
             "quat": self.floor_mu.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(n, -1),
             "opacity": self.head.opacity(feat),
-            **colour,
+            **self.head.colour(feat, mean),
             "fill": self.head.fill(scene, mean),
         }
