@@ -58,6 +58,13 @@ def _token_rays(
     return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
 
 
+def token_uv(side: int, like: torch.Tensor) -> torch.Tensor:
+    """(side*side, 2) token centres in view 0, in [-1, 1] (grid_sample's convention)."""
+    lin = (torch.arange(side, device=like.device, dtype=like.dtype) + 0.5) / side * 2.0 - 1.0
+    vv, uu = torch.meshgrid(lin, lin, indexing="ij")
+    return torch.stack([uu.flatten(), vv.flatten()], -1)
+
+
 def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
     """Where the rays reach height z (N, 2); rays not going down stay at the camera."""
     t = ((z - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
@@ -168,9 +175,7 @@ class GSODModel(nn.Module):
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
         # Tokens each object slot owns, rays through its box -> token queries.
-        lin = (torch.arange(side, device=attn.device, dtype=attn.dtype) + 0.5) / side * 2.0 - 1.0
-        vv, uu = torch.meshgrid(lin, lin, indexing="ij")
-        uv = torch.stack([uu.flatten(), vv.flatten()], -1)
+        uv = token_uv(side, attn)
         dirs = F.normalize(_token_rays(frame, side, self.image_size, self.focal_ratio), dim=-1)
         centre, extent = self.obj_decoder.region(slots, anchor, ray)
         with torch.no_grad():
@@ -180,7 +185,7 @@ class GSODModel(nn.Module):
         a = attn[1:].gather(1, idx)[..., None]
         picked = torch.cat([tokens[idx], uv[idx], a, dirs[idx]], -1)
         gaussians = self.obj_decoder(slots, centre, extent, colour, picked, frame.origin)
-        return {"gaussians": to_world(gaussians, frame), "extent": extent}
+        return {"gaussians": to_world(gaussians, frame), "extent": extent, "anchor": anchor}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -257,6 +262,9 @@ class GSODModel(nn.Module):
         out = self.render(scene, cam2world)
         # 2D attention reconstruction of view 0 (background: the floor render).
         bg = F.interpolate(out["bg_rgb"][0:1], size=self.input_size, mode="area")[0].flatten(1).T
-        out["attn_rgb"] = self.attn_decoder(slots, attn, bg)
+        anchor = scene["objects"]["anchor"]
+        depth = ((anchor - frame.origin) @ frame.rot)[:, 2].clamp_min(1e-3)
+        uv = token_uv(self.input_size, attn)
+        out["attn_rgb"] = self.attn_decoder(slots, attn, bg, uv, depth, self.focal_ratio)
         out["attn_target"] = colours
         return out

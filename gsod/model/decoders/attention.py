@@ -1,6 +1,9 @@
 """2D attention reconstruction: the attention as masks over view 0's tokens.
 
 Every token's colour depends on every slot, so the loss reaches every slot.
+An object slot only draws near its attention centre (an envelope sized like
+an object); farther out it falls back to the background, so one slot cannot
+explain two separate objects.
 """
 
 from __future__ import annotations
@@ -8,13 +11,15 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from gsod.model.decoders.objects import positional_encoding
+from gsod.model.decoders.objects import OBJECT_RADIUS, positional_encoding
 
 BANDS = 4
+# Envelope radius (units of r_max), projected into view 0.
+ENVELOPE = 1.5
 
 
 class AttnDecoder(nn.Module):
-    """Object slots -> colour per token (spatial broadcast); mixed by attention."""
+    """Object slots -> colour per token about the slot's centre; mixed by attention."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
@@ -26,13 +31,26 @@ class AttnDecoder(nn.Module):
             nn.Linear(hidden_dim, 3),
         )
 
-    def forward(self, slots: torch.Tensor, attn: torch.Tensor, bg: torch.Tensor) -> torch.Tensor:
-        """slots (K-1, C), attn (K, N) (row 0 background), bg colours (N, 3) -> (N, 3)."""
-        side = int(round(attn.shape[1] ** 0.5))
-        lin = torch.linspace(-1.0, 1.0, side, device=attn.device)
-        y, x = torch.meshgrid(lin, lin, indexing="ij")
-        pe = positional_encoding(torch.stack([x, y], -1).reshape(-1, 2), BANDS)  # (N, P)
-        k, n = slots.shape[0], pe.shape[0]
-        inp = torch.cat([slots[:, None].expand(-1, n, -1), pe[None].expand(k, -1, -1)], -1)
-        colours = torch.cat([bg[None], torch.sigmoid(self.mlp(inp))], 0)  # (K, N, 3)
+    def forward(
+        self,
+        slots: torch.Tensor,
+        attn: torch.Tensor,
+        bg: torch.Tensor,
+        uv: torch.Tensor,
+        depth: torch.Tensor,
+        focal_ratio: tuple[float, float],
+    ) -> torch.Tensor:
+        """slots (K-1, C), attn (K, N) (row 0 background), bg colours (N, 3),
+        token uv (N, 2), anchor depths in view 0 (K-1,) -> colours (N, 3)."""
+        p = attn[1:] / attn[1:].sum(-1, keepdim=True).clamp_min(1e-8)
+        centre = p @ uv  # (K-1, 2)
+        focal = torch.tensor(focal_ratio, device=uv.device, dtype=uv.dtype)
+        sigma = 2.0 * focal * ENVELOPE * OBJECT_RADIUS[1] / depth[:, None]  # (K-1, 2)
+        rel = (uv[None] - centre[:, None]) / sigma[:, None]  # (K-1, N, 2)
+        w = torch.exp(-0.5 * rel.pow(2).sum(-1, keepdim=True))
+        k, n = rel.shape[:2]
+        pe = positional_encoding((rel.clamp(-3.0, 3.0) / 3.0).flatten(0, 1), BANDS).view(k, n, -1)
+        inp = torch.cat([slots[:, None].expand(-1, n, -1), pe], -1)
+        objects = w * torch.sigmoid(self.mlp(inp)) + (1.0 - w) * bg[None]
+        colours = torch.cat([bg[None], objects], 0)  # (K, N, 3)
         return (attn[..., None] * colours).sum(0)
