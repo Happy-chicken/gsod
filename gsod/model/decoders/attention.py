@@ -1,5 +1,6 @@
-"""2D reconstruction of view 0 with the attention as masks; an object slot
-draws only within an object-sized envelope about its centre, else background.
+"""Global 2D component: every slot decodes a colour and a mask logit at every
+view-0 token (spatial broadcast); masks are a softmax over slots, so slots
+compete everywhere. The background colour is the floor render.
 """
 
 from __future__ import annotations
@@ -7,45 +8,38 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from gsod.model.decoders.objects import OBJECT_RADIUS, positional_encoding
+from gsod.model.decoders.objects import positional_encoding
 
 BANDS = 4
-# Envelope radius (units of r_max), projected into view 0.
-ENVELOPE = 1.5
+
+
+def _mlp(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_dim, out_dim),
+    )
 
 
 class AttnDecoder(nn.Module):
-    """Object slots -> colour per token about the slot's centre; mixed by attention."""
+    """Slots -> view-0 colours (N, 3) mixed by decoded masks."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(z_dim + 2 + 4 * BANDS, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 3),
-        )
+        self.objects = _mlp(z_dim + 2 + 4 * BANDS, hidden_dim, 4)  # rgb, logit
+        self.background = _mlp(z_dim + 2 + 4 * BANDS, hidden_dim, 1)  # logit
 
     def forward(
-        self,
-        slots: torch.Tensor,
-        attn: torch.Tensor,
-        bg: torch.Tensor,
-        uv: torch.Tensor,
-        depth: torch.Tensor,
-        focal_ratio: tuple[float, float],
+        self, bg_slot: torch.Tensor, slots: torch.Tensor, bg: torch.Tensor, uv: torch.Tensor
     ) -> torch.Tensor:
-        """slots (K-1, C), attn (K, N), bg (N, 3), uv (N, 2), depth (K-1,) -> (N, 3)."""
-        p = attn[1:] / attn[1:].sum(-1, keepdim=True).clamp_min(1e-8)
-        centre = p @ uv  # (K-1, 2)
-        focal = torch.tensor(focal_ratio, device=uv.device, dtype=uv.dtype)
-        sigma = 2.0 * focal * ENVELOPE * OBJECT_RADIUS[1] / depth[:, None]  # (K-1, 2)
-        rel = (uv[None] - centre[:, None]) / sigma[:, None]  # (K-1, N, 2)
-        w = torch.exp(-0.5 * rel.pow(2).sum(-1, keepdim=True))
-        k, n = rel.shape[:2]
-        pe = positional_encoding((rel.clamp(-3.0, 3.0) / 3.0).flatten(0, 1), BANDS).view(k, n, -1)
-        inp = torch.cat([slots[:, None].expand(-1, n, -1), pe], -1)
-        objects = w * torch.sigmoid(self.mlp(inp)) + (1.0 - w) * bg[None]
-        colours = torch.cat([bg[None], objects], 0)  # (K, N, 3)
-        return (attn[..., None] * colours).sum(0)
+        """bg_slot (C,), slots (K-1, C), floor colours (N, 3), uv (N, 2) -> (N, 3)."""
+        pe = positional_encoding(uv, BANDS)  # (N, P)
+        n = pe.shape[0]
+        everything = torch.cat([bg_slot[None], slots], 0)  # (K, C)
+        inp = torch.cat([everything[:, None].expand(-1, n, -1), pe[None].expand(len(everything), -1, -1)], -1)
+        obj = self.objects(inp[1:])
+        logits = torch.cat([self.background(inp[:1]), obj[..., 3:]], 0)  # (K, N, 1)
+        colours = torch.cat([bg[None], torch.sigmoid(obj[..., :3])], 0)  # (K, N, 3)
+        return (logits.softmax(0) * colours).sum(0)

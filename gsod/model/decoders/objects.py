@@ -164,7 +164,7 @@ class ObjectDecoder(nn.Module):
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
         self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot) - TOKEN_QUERIES, d) * QUERY_STD)
-        self.token_query = nn.Linear(z_dim + 2 + 4 * TOKEN_PE_BANDS + 1, d)
+        self.token_query = nn.Linear(2 + 4 * TOKEN_PE_BANDS, d)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
@@ -181,11 +181,11 @@ class ObjectDecoder(nn.Module):
         tokens: torch.Tensor,
         origin: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """slots (K, C), box, colour (K, 3), tokens [feature, uv, attn, ray] (K, T, C+6) -> Gaussians."""
+        """slots (K, C), box, colour (K, 3), tokens [uv, ray] (K, T, 5) -> Gaussians."""
         K = slots.shape[0]
-        feat, uv, a, dirs = tokens.split([tokens.shape[-1] - 6, 2, 1, 3], -1)
+        uv, dirs = tokens.split([2, 3], -1)
         pe = positional_encoding(uv.flatten(0, 1), TOKEN_PE_BANDS).view(*uv.shape[:2], -1)
-        q_token = self.token_query(torch.cat([feat.detach(), pe, a], -1))
+        q_token = self.token_query(pe)
         q = torch.cat([self.queries.expand(K, -1, -1), q_token], 1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
