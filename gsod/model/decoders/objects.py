@@ -1,5 +1,5 @@
-"""Object decoder: slot -> box at the attention anchor -> Gaussians from fixed
-queries (in the box) and from the slot's tokens (on their rays). Units of R.
+"""Object decoder: slot -> box at the attention anchor -> Gaussians in it, from
+fixed queries and from token queries (the slot's tokens: feature + uv). Units of R.
 """
 
 from __future__ import annotations
@@ -95,24 +95,15 @@ class ObjectHead(nn.Module):
         centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
-        origin: torch.Tensor,
-        dirs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box, colour (K, 3), token rays (K, T, 3) (last T) -> Gaussians."""
+        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.project(feat)
-        n_fixed = feat.shape[1] - dirs.shape[1]
-        t = torch.tanh(raw[:, :n_fixed, 0:3])
+        t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent] cut at the floor.
         lo = (centre[:, 2] - extent[:, 2]).clamp_min(MIN_HEIGHT)[:, None, None]
         hi = (centre[:, 2] + extent[:, 2])[:, None, None]
-        fixed = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
-        # Token Gaussians: on their ray, depth about the box centre's.
-        t0 = ((centre - origin)[:, None] * dirs).sum(-1, keepdim=True)  # (K, T, 1)
-        depth = t0 + extent[:, None, :2].mean(-1, keepdim=True) * torch.tanh(raw[:, n_fixed:, 0:1])
-        token = origin + depth * dirs
-        token = torch.cat([token[..., :2], token[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        mu = torch.cat([fixed, token], 1)
+        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
         opacity = torch.sigmoid(raw[..., 10])
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
@@ -164,7 +155,7 @@ class ObjectDecoder(nn.Module):
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
         self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot) - TOKEN_QUERIES, d) * QUERY_STD)
-        self.token_query = nn.Linear(2 + 4 * TOKEN_PE_BANDS, d)
+        self.token_query = nn.Linear(z_dim + 2 + 4 * TOKEN_PE_BANDS, d)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
@@ -179,16 +170,15 @@ class ObjectDecoder(nn.Module):
         extent: torch.Tensor,
         colour: torch.Tensor,
         tokens: torch.Tensor,
-        origin: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """slots (K, C), box, colour (K, 3), tokens [uv, ray] (K, T, 5) -> Gaussians."""
+        """slots (K, C), box, colour (K, 3), tokens [feature, uv] (K, T, C + 2) -> Gaussians."""
         K = slots.shape[0]
-        uv, dirs = tokens.split([2, 3], -1)
+        feat, uv = tokens.split([tokens.shape[-1] - 2, 2], -1)
         pe = positional_encoding(uv.flatten(0, 1), TOKEN_PE_BANDS).view(*uv.shape[:2], -1)
-        q_token = self.token_query(pe)
+        q_token = self.token_query(torch.cat([feat.detach(), pe], -1))
         q = torch.cat([self.queries.expand(K, -1, -1), q_token], 1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, centre, extent, colour, origin, dirs)
+        return self.head(q, centre, extent, colour)
