@@ -1,6 +1,5 @@
-"""Global 2D component: every slot decodes a colour and a mask logit at every
-view-0 token (spatial broadcast); masks are a softmax over slots, so slots
-compete everywhere. The background colour is the floor render.
+"""Global 2D component: view 0 colours mixed by the attention (as masks), so
+every token's error reaches every slot's attention.
 """
 
 from __future__ import annotations
@@ -13,33 +12,26 @@ from gsod.model.decoders.objects import positional_encoding
 BANDS = 4
 
 
-def _mlp(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Module:
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden_dim),
-        nn.ReLU(inplace=True),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(inplace=True),
-        nn.Linear(hidden_dim, out_dim),
-    )
-
-
 class AttnDecoder(nn.Module):
-    """Slots -> view-0 colours (N, 3) mixed by decoded masks."""
+    """Object slots -> colour per token (spatial broadcast); mixed by attention."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
-        self.objects = _mlp(z_dim + 2 + 4 * BANDS, hidden_dim, 4)  # rgb, logit
-        self.background = _mlp(z_dim + 2 + 4 * BANDS, hidden_dim, 1)  # logit
+        self.mlp = nn.Sequential(
+            nn.Linear(z_dim + 2 + 4 * BANDS, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 3),
+        )
 
-    def forward(
-        self, bg_slot: torch.Tensor, slots: torch.Tensor, bg: torch.Tensor, uv: torch.Tensor
-    ) -> torch.Tensor:
-        """bg_slot (C,), slots (K-1, C), floor colours (N, 3), uv (N, 2) -> (N, 3)."""
-        pe = positional_encoding(uv, BANDS)  # (N, P)
-        n = pe.shape[0]
-        everything = torch.cat([bg_slot[None], slots], 0)  # (K, C)
-        inp = torch.cat([everything[:, None].expand(-1, n, -1), pe[None].expand(len(everything), -1, -1)], -1)
-        obj = self.objects(inp[1:])
-        logits = torch.cat([self.background(inp[:1]), obj[..., 3:]], 0)  # (K, N, 1)
-        colours = torch.cat([bg[None], torch.sigmoid(obj[..., :3])], 0)  # (K, N, 3)
-        return (logits.softmax(0) * colours).sum(0)
+    def forward(self, slots: torch.Tensor, attn: torch.Tensor, bg: torch.Tensor) -> torch.Tensor:
+        """slots (K-1, C), attn (K, N) (row 0 background), bg colours (N, 3) -> (N, 3)."""
+        side = int(round(attn.shape[1] ** 0.5))
+        lin = torch.linspace(-1.0, 1.0, side, device=attn.device)
+        y, x = torch.meshgrid(lin, lin, indexing="ij")
+        pe = positional_encoding(torch.stack([x, y], -1).reshape(-1, 2), BANDS)  # (N, P)
+        k, n = slots.shape[0], pe.shape[0]
+        inp = torch.cat([slots[:, None].expand(-1, n, -1), pe[None].expand(k, -1, -1)], -1)
+        colours = torch.cat([bg[None], torch.sigmoid(self.mlp(inp))], 0)  # (K, N, 3)
+        return (attn[..., None] * colours).sum(0)

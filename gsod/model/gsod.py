@@ -6,7 +6,7 @@
     decode_background         background slot -> floor discs + fill colour
     render                    all Gaussians blended together; masks from the
                               same blending
-    attn_decoder              global 2D mixture of view 0 (auxiliary loss)
+    attn_decoder              global 2D mixture of view 0 by the attention
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
 background.
@@ -45,13 +45,6 @@ def _token_rays(
     v = (idx + 0.5) * h / side - 0.5
     vv, uu = torch.meshgrid(v, u, indexing="ij")
     return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
-
-
-def token_uv(side: int, like: torch.Tensor) -> torch.Tensor:
-    """(side*side, 2) token centres in [-1, 1]."""
-    lin = (torch.arange(side, device=like.device, dtype=like.dtype) + 0.5) / side * 2.0 - 1.0
-    vv, uu = torch.meshgrid(lin, lin, indexing="ij")
-    return torch.stack([uu.flatten(), vv.flatten()], -1)
 
 
 def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
@@ -211,6 +204,6 @@ class GSODModel(nn.Module):
         out = self.render(scene, cam2world)
         # Global 2D mixture of view 0 (competition among slots).
         bg = F.interpolate(out["bg_rgb"][0:1], size=self.input_size, mode="area")[0].flatten(1).T
-        out["attn_rgb"] = self.attn_decoder(bg_slot, slots, bg, token_uv(self.input_size, attn))
+        out["attn_rgb"] = self.attn_decoder(slots, attn, bg)
         out["attn_target"] = colours
         return out
