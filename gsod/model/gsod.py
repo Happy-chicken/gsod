@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
-from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, TOKEN_QUERIES
+from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, VISIBLE_TOKENS
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
@@ -83,24 +83,6 @@ def attention_anchors(
     return p @ points, p @ colours
 
 
-@torch.no_grad()
-def select_tokens(attn: torch.Tensor, n: int) -> torch.Tensor:
-    """attn (K, N) -> (K-1, n): evenly spaced owned tokens, topped up by attention."""
-    owner = attn.argmax(0)
-    out = []
-    for k in range(1, attn.shape[0]):
-        a, owned = attn[k], owner == k
-        count = int(owned.sum())
-        if count >= n:
-            step = torch.linspace(0, count - 1, n, device=a.device).long()
-            picks = owned.nonzero()[:, 0][step]
-        else:
-            rest = torch.where(owned, torch.full_like(a, -1.0), a).topk(n - count).indices
-            picks = torch.cat([owned.nonzero()[:, 0], rest])
-        out.append(picks)
-    return torch.stack(out)
-
-
 class GSODModel(nn.Module):
     def __init__(
         self,
@@ -109,7 +91,7 @@ class GSODModel(nn.Module):
         z_dim: int = 64,
         num_slots: int = 6,
         attn_iter: int = 3,
-        gaussians_per_slot: int = 512,
+        gaussians_per_slot: int = 128,
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),
         near: float = 0.1,
@@ -153,20 +135,23 @@ class GSODModel(nn.Module):
         attn: torch.Tensor,
         colours: torch.Tensor,
         frame: SceneFrame,
-        tokens: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """slots (K-1, C), attn (K, s*s), token colours (s*s, 3), encoder tokens
-        (s*s, C) -> Gaussians, extent."""
+        """slots (K-1, C), attn (K, s*s), token colours (s*s, 3) -> Gaussians, extent."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        # Tokens each object slot owns -> token queries.
-        uv = token_uv(side, attn)
         centre, extent = self.obj_decoder.region(slots, anchor, ray)
-        idx = select_tokens(attn, TOKEN_QUERIES)  # (K-1, T)
-        picked = torch.cat([tokens[idx], uv[idx]], -1)
-        gaussians = self.obj_decoder(slots, centre, extent, colour, picked)
+        completion = self.obj_decoder(slots, centre, extent, colour)
+        # Visible surface on each slot's most attended token rays.
+        a = attn[1:]
+        idx = a.topk(min(VISIBLE_TOKENS, a.shape[1]), -1).indices  # (K-1, T)
+        dirs = F.normalize(_token_rays(frame, side, self.image_size, self.focal_ratio), dim=-1)
+        visible = self.obj_decoder.visible(
+            slots, token_uv(side, attn)[idx], dirs[idx], a.gather(1, idx), frame.origin,
+            centre, extent, colour, 1.0 / (self.focal_ratio[0] * side),
+        )
+        gaussians = {k: torch.cat([visible[k], completion[k]], 1) for k in completion}
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
@@ -232,7 +217,7 @@ class GSODModel(nn.Module):
         bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn, colours, frame, tokens[0]),
+            "objects": self.decode_objects(slots, attn, colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "draw": draw_factor(attn[1:]),
             "attn": attn,

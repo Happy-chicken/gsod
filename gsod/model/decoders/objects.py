@@ -1,5 +1,7 @@
-"""Object decoder: slot -> box at the attention anchor -> Gaussians in it, from
-fixed queries and from token queries (the slot's tokens: feature + uv). Units of R.
+"""Object decoder. Visible surface: a Gaussian on each of the slot's most
+attended view-0 token rays, opacity = its attention there, so all slots compete
+on the visible surface. Completion: fixed queries in the box at the attention
+anchor. Depth, colour, shape come from the slot only. Units of R.
 """
 
 from __future__ import annotations
@@ -23,9 +25,9 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
-# Gaussians per slot from tokens (the rest from fixed queries); token PE bands.
-TOKEN_QUERIES = 256
-TOKEN_PE_BANDS = 4
+# Visible surface: tokens per slot, uv PE bands.
+VISIBLE_TOKENS = 1024
+VISIBLE_PE_BANDS = 6
 
 
 def _logit(p: float) -> float:
@@ -117,6 +119,56 @@ class ObjectHead(nn.Module):
         }
 
 
+class VisibleSurface(nn.Module):
+    """[slot, PE(uv)] -> a Gaussian on that token's view-0 ray; opacity = attention."""
+
+    def __init__(self, z_dim: int, hidden: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(z_dim + 2 + 4 * VISIBLE_PE_BANDS, hidden), nn.ReLU(True),
+            nn.Linear(hidden, hidden), nn.ReLU(True),
+            nn.Linear(hidden, 14),  # depth 1, log scale 1, rgb 3, sh1 9
+        )
+        with torch.no_grad():
+            out = self.mlp[-1]
+            out.weight.mul_(0.1)
+            out.weight[5:].zero_()  # view-independent at first
+            out.bias.zero_()
+
+    def forward(
+        self,
+        slots: torch.Tensor,
+        uv: torch.Tensor,
+        dirs: torch.Tensor,
+        attn: torch.Tensor,
+        origin: torch.Tensor,
+        centre: torch.Tensor,
+        extent: torch.Tensor,
+        colour: torch.Tensor,
+        token_width: float,
+    ) -> dict[str, torch.Tensor]:
+        """slots (K, C); uv (K, T, 2), unit rays (K, T, 3), attention (K, T); view 0's
+        origin; box, colour (K, 3); token width per unit depth -> Gaussians (K, T, ...)."""
+        pe = positional_encoding(uv.flatten(0, 1), VISIBLE_PE_BANDS).view(*uv.shape[:2], -1)
+        raw = self.mlp(torch.cat([slots[:, None].expand(-1, uv.shape[1], -1), pe], -1))
+        # Depth about the box centre's on this ray, +- the box half width.
+        t0 = ((centre - origin)[:, None] * dirs).sum(-1)
+        depth = (t0 + extent[:, None, :2].mean(-1) * torch.tanh(raw[..., 0])).clamp_min(1e-3)
+        mu = origin + depth[..., None] * dirs
+        mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
+        size = depth * token_width * torch.exp(raw[..., 1].clamp(-1.0, 1.0))
+        quat = torch.zeros_like(mu[..., :1]).expand(-1, -1, 4).clone()
+        quat[..., 0] = 1.0
+        return {
+            "mu": mu,
+            "scale": size[..., None].expand(-1, -1, 3),
+            "quat": quat,
+            "opacity": attn,
+            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 2:5]),
+            "sh1": raw[..., 5:14].unflatten(-1, (3, 3)),
+        }
+
+
 class DecoderLayer(nn.Module):
     """Self-attention among the Gaussians, cross-attention to the slot tokens,
     FFN; pre-norm."""
@@ -154,14 +206,14 @@ class ObjectDecoder(nn.Module):
         super().__init__()
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
-        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot) - TOKEN_QUERIES, d) * QUERY_STD)
-        self.token_query = nn.Linear(z_dim + 2 + 4 * TOKEN_PE_BANDS, d)
+        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
         self.k_proj = nn.Linear(z_dim, n_tokens * d)
         self.v_proj = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
+        self.visible = VisibleSurface(z_dim, d)
 
     def forward(
         self,
@@ -169,14 +221,10 @@ class ObjectDecoder(nn.Module):
         centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
-        tokens: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """slots (K, C), box, colour (K, 3), tokens [feature, uv] (K, T, C + 2) -> Gaussians."""
+        """slots (K, C), box, colour (K, 3) -> completion Gaussians (K, G, ...)."""
         K = slots.shape[0]
-        feat, uv = tokens.split([tokens.shape[-1] - 2, 2], -1)
-        pe = positional_encoding(uv.flatten(0, 1), TOKEN_PE_BANDS).view(*uv.shape[:2], -1)
-        q_token = self.token_query(torch.cat([feat.detach(), pe], -1))
-        q = torch.cat([self.queries.expand(K, -1, -1), q_token], 1)
+        q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
