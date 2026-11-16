@@ -139,17 +139,15 @@ class GSODModel(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        centre, extent = self.obj_decoder.region(slots, anchor, ray)
-        completion = self.obj_decoder(slots, centre, extent, colour)
-        # Visible surface on each slot's most attended token rays.
+        # Each slot's most attended tokens: uv, rays, attention.
         a = attn[1:]
         idx = a.topk(min(VISIBLE_TOKENS, a.shape[1]), -1).indices  # (K-1, T)
         dirs = F.normalize(_token_rays(frame, side, self.image_size, self.focal_ratio), dim=-1)
-        visible = self.obj_decoder.visible(
-            slots, token_uv(side, attn)[idx], dirs[idx], a.gather(1, idx), frame.origin,
-            centre, extent, colour, 1.0 / (self.focal_ratio[0] * side),
+        gaussians, extent = self.obj_decoder(
+            slots, anchor, ray, colour,
+            token_uv(side, attn)[idx], dirs[idx], a.gather(1, idx),
+            frame.origin, 1.0 / (self.focal_ratio[0] * side),
         )
-        gaussians = {k: torch.cat([visible[k], completion[k]], 1) for k in completion}
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(

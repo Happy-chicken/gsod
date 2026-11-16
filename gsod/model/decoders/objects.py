@@ -218,15 +218,25 @@ class ObjectDecoder(nn.Module):
     def forward(
         self,
         slots: torch.Tensor,
-        centre: torch.Tensor,
-        extent: torch.Tensor,
+        anchor: torch.Tensor,
+        ray: torch.Tensor,
         colour: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """slots (K, C), box, colour (K, 3) -> completion Gaussians (K, G, ...)."""
+        uv: torch.Tensor,
+        dirs: torch.Tensor,
+        attn: torch.Tensor,
+        origin: torch.Tensor,
+        token_width: float,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """slots (K, C); anchor, ray, colour (K, 3); chosen tokens' uv (K, T, 2),
+        unit rays (K, T, 3), attention (K, T); view 0's origin; token width per
+        unit depth -> Gaussians (K, T + G, ...) (visible, completion), half sizes."""
         K = slots.shape[0]
+        centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, centre, extent, colour)
+        completion = self.head(q, centre, extent, colour)
+        visible = self.visible(slots, uv, dirs, attn, origin, centre, extent, colour, token_width)
+        return {key: torch.cat([visible[key], completion[key]], 1) for key in completion}, extent
