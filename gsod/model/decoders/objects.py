@@ -15,7 +15,7 @@ from torch import nn
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
-# Initial box half sizes x, y, z (units of r_max); no upper limit.
+# Initial box half sizes x, y, z (units of r_max).
 EXTENT_INIT = (1.375, 1.375, 1.2)
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
@@ -69,19 +69,20 @@ def compete(gaussians: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes
-    r_min + r_max softplus(.) (no upper limit)."""
+    (bounded: one box holds one object)."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
         r_min, r_max = OBJECT_RADIUS
         self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
         self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
-        self.r_min, self.r_max = r_min, r_max
+        self.r_min = r_min
+        self.register_buffer("extent_max", r_max * torch.tensor([1.75, 1.75, 2.5]), persistent=False)
         with torch.no_grad():
             self.mlp[-1].weight.zero_()
             self.mlp[-1].bias.zero_()
             for i, size in enumerate(EXTENT_INIT):
-                self.mlp[-1].bias[2 + i] = math.log(math.expm1(size - r_min / r_max))
+                self.mlp[-1].bias[2 + i] = _logit((size * r_max - r_min) / (self.extent_max[i].item() - r_min))
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
@@ -92,7 +93,7 @@ class RegionHead(nn.Module):
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
         t = self.shift_bound * torch.tanh(raw[:, :2])
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        extent = self.r_min + self.r_max * F.softplus(raw[:, 2:])
+        extent = self.r_min + (self.extent_max - self.r_min) * torch.sigmoid(raw[:, 2:])
         return torch.cat([xy, anchor[:, 2:]], -1), extent
 
 
