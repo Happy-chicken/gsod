@@ -1,6 +1,7 @@
 """Reconstruction loss (no masks), every view:
 
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
+            + attn * MSE of the 2D attention reconstruction (view 0, tokens)
 """
 
 from __future__ import annotations
@@ -55,8 +56,9 @@ class GSODLoss(nn.Module):
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),
+            "attn": F.mse_loss(2.0 * outputs["attn_rgb"] - 1.0, 2.0 * outputs["attn_target"] - 1.0),
         }
-        weights = {"recon": cfg.recon, "ssim": cfg.ssim}
+        weights = {"recon": cfg.recon, "ssim": cfg.ssim, "attn": cfg.attn}
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}
