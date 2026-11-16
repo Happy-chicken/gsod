@@ -2,6 +2,8 @@
 
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
             + attn * MSE of the 2D attention reconstruction (view 0, tokens)
+
+The adversarial term (loss.gan) is added in train.py.
 """
 
 from __future__ import annotations
