@@ -148,7 +148,7 @@ class GSODModel(nn.Module):
             token_uv(side, attn)[idx], dirs[idx], a.gather(1, idx),
             a.reshape(-1, 1, side, side), frame, self.focal_ratio,
         )
-        return {"gaussians": to_world(gaussians, frame), "extent": extent}
+        return {"gaussians": to_world(gaussians, frame), "extent": extent, "n_visible": idx.shape[1]}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -162,6 +162,15 @@ class GSODModel(nn.Module):
         fill = gaussians.pop("fill")
         return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
 
+    def _splat_views(self, view0: dict, rest: dict, cam2world: torch.Tensor, **kw) -> dict[str, torch.Tensor]:
+        """Gaussians view0 into cam2world[0], rest into the other views -> (N, ...)."""
+        cams = (self.image_size, self.focal_ratio, self.near)
+        out = self.splat(view0, cam2world[:1], *cams, **kw)
+        if cam2world.shape[0] == 1:
+            return out
+        more = self.splat(rest, cam2world[1:], *cams, **kw)
+        return {key: torch.cat([out[key], more[key]]) for key in out}
+
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
         """A scene (forward(render=False)) rendered into cam2world (N, 4, 4):
         every Gaussian, object or floor, sorted and blended together."""
@@ -169,27 +178,33 @@ class GSODModel(nn.Module):
         n_obj, n_gauss = obj["mu"].shape[:2]
         floor = bg["gaussians"]
         objects = {name: value.flatten(0, 1) for name, value in obj.items()}
-        objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
+        opacity = obj["opacity"] * draw[:, None]
+        objects["opacity"] = opacity.flatten()
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
-        cams = (cam2world, self.image_size, self.focal_ratio, self.near)
+        # View 0 shows no completion Gaussians: they stand for what it cannot see.
+        hidden = torch.ones_like(opacity)
+        hidden[:, scene["objects"]["n_visible"] :] = 0.0
+        view0 = {**every, "opacity": torch.cat([(opacity * hidden).flatten(), floor["opacity"]])}
         fill = bg["fill"][None, :, None, None]
-        out = self.splat(every, *cams)
+        out = self._splat_views(view0, every, cam2world)
         image = out["rgb"] + (1.0 - out["alpha"]) * fill
 
         # Decomposition from the same blending (no gradient): per-slot weights
         # (0 = floor + fill) and per-object colour contributions.
         with torch.no_grad():
             every = {name: value.detach() for name, value in every.items()}
+            view0 = {name: value.detach() for name, value in view0.items()}
             ids = torch.cat([
                 torch.arange(1, n_obj + 1, device=image.device).repeat_interleave(n_gauss),
                 torch.zeros(floor["mu"].shape[0], dtype=torch.long, device=image.device),
             ])
             onehot = F.one_hot(ids, n_obj + 1).float()
             obj_rgb = (onehot[:, 1:, None] * every["rgb"][:, None]).flatten(1)
-            parts = self.splat(every, *cams, features=torch.cat([onehot, obj_rgb], 1))["features"]
+            parts = self._splat_views(view0, every, cam2world, features=torch.cat([onehot, obj_rgb], 1))["features"]
             weights = parts[:, : n_obj + 1].clone()
             weights[:, 0] += (1.0 - out["alpha"][:, 0]).detach()
             slot_rgb = parts[:, n_obj + 1 :].unflatten(1, (n_obj, 3))
+            cams = (cam2world, self.image_size, self.focal_ratio, self.near)
             floor_only = self.splat({name: value.detach() for name, value in floor.items()}, *cams)
             bg_rgb = floor_only["rgb"] + (1.0 - floor_only["alpha"]) * fill.detach()
 

@@ -129,12 +129,12 @@ class VisibleSurface(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(z_dim + 2 + 4 * VISIBLE_PE_BANDS, hidden), nn.ReLU(True),
             nn.Linear(hidden, hidden), nn.ReLU(True),
-            nn.Linear(hidden, 14),  # depth 1, log scale 1, rgb 3, sh1 9
+            nn.Linear(hidden, 13),  # depth 1, rgb 3, sh1 9
         )
         with torch.no_grad():
             out = self.mlp[-1]
             out.weight.mul_(0.1)
-            out.weight[5:].zero_()  # view-independent at first
+            out.weight[4:].zero_()  # view-independent at first
             out.bias.zero_()
 
     def forward(
@@ -158,7 +158,7 @@ class VisibleSurface(nn.Module):
         depth = (t0 + extent[:, None, :2].mean(-1) * torch.tanh(raw[..., 0])).clamp_min(1e-3)
         mu = origin + depth[..., None] * dirs
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        size = depth * token_width * torch.exp(raw[..., 1].clamp(-1.0, 1.0))
+        size = 0.5 * depth * token_width  # one layer: each covers its own token
         quat = torch.zeros_like(mu[..., :1]).expand(-1, -1, 4).clone()
         quat[..., 0] = 1.0
         return {
@@ -166,8 +166,8 @@ class VisibleSurface(nn.Module):
             "scale": size[..., None].expand(-1, -1, 3),
             "quat": quat,
             "opacity": attn,
-            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 2:5]),
-            "sh1": raw[..., 5:14].unflatten(-1, (3, 3)),
+            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 1:4]),
+            "sh1": raw[..., 4:13].unflatten(-1, (3, 3)),
         }
 
 
