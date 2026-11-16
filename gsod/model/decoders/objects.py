@@ -1,7 +1,7 @@
 """Object decoder. Visible surface: a Gaussian on each of the slot's most
 attended view-0 token rays, opacity = its attention there, so all slots compete
 on the visible surface. Completion: fixed queries in the box at the attention
-anchor. Depth, colour, shape come from the slot only. Units of R.
+anchor, opacity x the slot's attention where each projects in view 0. Depth, colour, shape come from the slot only. Units of R.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from gsod.utils.geometry import SceneFrame, project_and_sample
 
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
@@ -224,12 +226,13 @@ class ObjectDecoder(nn.Module):
         uv: torch.Tensor,
         dirs: torch.Tensor,
         attn: torch.Tensor,
-        origin: torch.Tensor,
-        token_width: float,
+        attn_maps: torch.Tensor,
+        frame: SceneFrame,
+        focal_ratio: tuple[float, float],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """slots (K, C); anchor, ray, colour (K, 3); chosen tokens' uv (K, T, 2),
-        unit rays (K, T, 3), attention (K, T); view 0's origin; token width per
-        unit depth -> Gaussians (K, T + G, ...) (visible, completion), half sizes."""
+        unit rays (K, T, 3), attention (K, T); attention maps (K, 1, s, s); view
+        0's frame -> Gaussians (K, T + G, ...) (visible, completion), half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
@@ -238,5 +241,8 @@ class ObjectDecoder(nn.Module):
         for layer in self.layers:
             q = layer(q, k, v)
         completion = self.head(q, centre, extent, colour)
-        visible = self.visible(slots, uv, dirs, attn, origin, centre, extent, colour, token_width)
+        support = project_and_sample(completion["mu"], attn_maps, frame, focal_ratio)[..., 0]
+        completion["opacity"] = completion["opacity"] * support
+        token_width = 1.0 / (focal_ratio[0] * attn_maps.shape[-1])
+        visible = self.visible(slots, uv, dirs, attn, frame.origin, centre, extent, colour, token_width)
         return {key: torch.cat([visible[key], completion[key]], 1) for key in completion}, extent

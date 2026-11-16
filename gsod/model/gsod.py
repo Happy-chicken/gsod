@@ -146,7 +146,7 @@ class GSODModel(nn.Module):
         gaussians, extent = self.obj_decoder(
             slots, anchor, ray, colour,
             token_uv(side, attn)[idx], dirs[idx], a.gather(1, idx),
-            frame.origin, 1.0 / (self.focal_ratio[0] * side),
+            a.reshape(-1, 1, side, side), frame, self.focal_ratio,
         )
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
