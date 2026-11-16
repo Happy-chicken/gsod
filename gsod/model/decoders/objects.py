@@ -1,7 +1,5 @@
-"""Object decoder. Visible surface: a Gaussian on each of the slot's most
-attended view-0 token rays, opacity = its attention there, so all slots compete
-on the visible surface. Completion: fixed queries in the box at the attention
-anchor, opacity x the slot's attention where each projects in view 0. Depth, colour, shape come from the slot only. Units of R.
+"""Object decoder: visible surface (on token rays, opacity = attention) and
+completion (fixed queries in the box, x attention where they project). Units of R.
 """
 
 from __future__ import annotations
@@ -149,16 +147,15 @@ class VisibleSurface(nn.Module):
         colour: torch.Tensor,
         token_width: float,
     ) -> dict[str, torch.Tensor]:
-        """slots (K, C); uv (K, T, 2), unit rays (K, T, 3), attention (K, T); view 0's
-        origin; box, colour (K, 3); token width per unit depth -> Gaussians (K, T, ...)."""
+        """slots (K, C); tokens' uv, rays, attention (K, T, .); box, colour -> Gaussians (K, T, ...)."""
         pe = positional_encoding(uv.flatten(0, 1), VISIBLE_PE_BANDS).view(*uv.shape[:2], -1)
         raw = self.mlp(torch.cat([slots[:, None].expand(-1, uv.shape[1], -1), pe], -1))
-        # Depth about the box centre's on this ray, +- the box half width.
+        # Depth: box centre's on this ray +- the box half width.
         t0 = ((centre - origin)[:, None] * dirs).sum(-1)
         depth = (t0 + extent[:, None, :2].mean(-1) * torch.tanh(raw[..., 0])).clamp_min(1e-3)
         mu = origin + depth[..., None] * dirs
         mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        size = 0.5 * depth * token_width  # one layer: each covers its own token
+        size = 0.5 * depth * token_width  # covers its own token only
         quat = torch.zeros_like(mu[..., :1]).expand(-1, -1, 4).clone()
         quat[..., 0] = 1.0
         return {
@@ -230,9 +227,8 @@ class ObjectDecoder(nn.Module):
         frame: SceneFrame,
         focal_ratio: tuple[float, float],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3); chosen tokens' uv (K, T, 2),
-        unit rays (K, T, 3), attention (K, T); attention maps (K, 1, s, s); view
-        0's frame -> Gaussians (K, T + G, ...) (visible, completion), half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3); tokens' uv, rays, attention (K, T, .);
+        attention maps (K, 1, s, s) -> Gaussians (K, T + G, ...) (visible, completion), extent."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)

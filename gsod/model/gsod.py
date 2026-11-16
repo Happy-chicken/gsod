@@ -4,9 +4,8 @@
     decode_objects            object slot -> box at its attention anchor ->
                               Gaussians in it
     decode_background         background slot -> floor discs + fill colour
-    render                    all Gaussians (object opacities x the slot's
-                              floor discs) sorted and blended
-                              together; slot masks from the same blending
+    render                    all Gaussians blended together; in view 0 each
+                              slot shows by its attention; masks from the same blending
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
 background.
@@ -136,7 +135,7 @@ class GSODModel(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        # Each slot's most attended tokens: uv, rays, attention.
+        # Each slot's most attended tokens.
         a = attn[1:]
         idx = a.topk(min(VISIBLE_TOKENS, a.shape[1]), -1).indices  # (K-1, T)
         dirs = F.normalize(_token_rays(frame, side, self.image_size, self.focal_ratio), dim=-1)
@@ -177,8 +176,7 @@ class GSODModel(nn.Module):
         objects = {name: value.flatten(0, 1) for name, value in obj.items()}
         opacity = obj["opacity"]
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
-        # View 0: every slot shows by its attention. No completion Gaussians
-        # (they stand for what view 0 cannot see); floor discs x background attention.
+        # View 0: no completion; floor discs x background attention.
         hidden = torch.ones_like(opacity)
         hidden[:, scene["objects"]["n_visible"] :] = 0.0
         side = self.input_size
