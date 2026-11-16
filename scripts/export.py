@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Export scenes' Gaussians as 3DGS .ply (all, objects, background, per
-slot).
+slot); object opacity is scaled by the draw factor.
 
     python scripts/export.py --dataset room_chair --checkpoint <run dir> --scenes 0 1 2
 """
@@ -58,9 +58,10 @@ def main() -> None:
         item = data[index]
         with torch.no_grad():
             scene = model(item["images"], item["cam2world"], render=False)
-        obj, frame = scene["objects"]["gaussians"], scene["frame"]
+        obj, draw, frame = scene["objects"]["gaussians"], scene["draw"], scene["frame"]
         c = frame.centre.tolist()
-        slots = [{k: v[k_] for k, v in obj.items()} for k_ in range(obj["mu"].shape[0])]
+        slots = [{**{k: v[k_] for k, v in obj.items()}, "opacity": obj["opacity"][k_] * draw[k_]}
+                 for k_ in range(draw.shape[0])]
         parts = {f"slot{k + 1}": g for k, g in enumerate(slots)}
         parts["objects"] = {k: torch.cat([s[k] for s in slots]) for k in slots[0]}
         parts["background"] = scene["background"]["gaussians"]

@@ -4,8 +4,8 @@
     decode_objects            object slot -> box at its attention anchor ->
                               Gaussians in it
     decode_background         background slot -> floor discs + fill colour
-    render                    all Gaussians blended together; masks from the
-                              same blending
+    render                    all Gaussians blended together (object opacity x
+                              draw factor); masks from the same blending
     attn_decoder              global 2D mixture of view 0 by the attention
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
@@ -33,6 +33,14 @@ from gsod.utils.splatter import GsplatSplatter
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
+# Draw factor: owned area mean(attn^2) (fraction of tokens) ramp.
+AREA_EMPTY = 0.001
+AREA_FULL = 0.004
+
+
+def draw_factor(attn: torch.Tensor) -> torch.Tensor:
+    """attn (K, N) -> (K,): 0 below AREA_EMPTY owned area, 1 from AREA_FULL."""
+    return ((attn.pow(2).mean(-1) - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
 
 
 def _token_rays(
@@ -147,10 +155,11 @@ class GSODModel(nn.Module):
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
         """A scene (forward(render=False)) rendered into cam2world (N, 4, 4):
         every Gaussian, object or floor, sorted and blended together."""
-        obj, bg = scene["objects"]["gaussians"], scene["background"]
+        obj, bg, draw = scene["objects"]["gaussians"], scene["background"], scene["draw"]
         n_obj, n_gauss = obj["mu"].shape[:2]
         floor = bg["gaussians"]
         objects = {name: value.flatten(0, 1) for name, value in obj.items()}
+        objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         fill = bg["fill"][None, :, None, None]
@@ -182,6 +191,7 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
+            "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
 
@@ -196,6 +206,7 @@ class GSODModel(nn.Module):
             "objects": self.decode_objects(slots, attn, colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "attn": attn,
+            "draw": draw_factor(attn[1:]),
             "slots": slots,
             "frame": frame,
         }
