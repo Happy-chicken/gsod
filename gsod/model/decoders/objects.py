@@ -1,5 +1,6 @@
-"""Object decoder: visible surface (on token rays, opacity = attention) and
-completion (fixed queries in the box, x attention where they project). Units of R.
+"""Object decoder: slot -> box at the attention anchor -> G Gaussians in it.
+compete: each Gaussian's opacity x its slot's share of the density there (uORF's
+compositing rule on Gaussians). Units of R.
 """
 
 from __future__ import annotations
@@ -9,8 +10,6 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-from gsod.utils.geometry import SceneFrame, project_and_sample
 
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
@@ -25,9 +24,6 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
-# Visible surface: tokens per slot, uv PE bands.
-VISIBLE_TOKENS = 1024
-VISIBLE_PE_BANDS = 6
 
 
 def _logit(p: float) -> float:
@@ -43,6 +39,32 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
     freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
     angles = x[..., None] * freqs  # (N, 3, bands)
     return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
+
+
+def _rotation(q: torch.Tensor) -> torch.Tensor:
+    """Unit wxyz quaternions (..., 4) -> rotation matrices (..., 3, 3)."""
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+    ], -1).unflatten(-1, (3, 3))
+
+
+def compete(gaussians: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Gaussians (K, G, ...) -> opacity x the slot's share of all slots'
+    density at each centre: sigma_k(x) / sum_j sigma_j(x)."""
+    K, G = gaussians["mu"].shape[:2]
+    mu = gaussians["mu"].reshape(-1, 3)
+    rot = _rotation(F.normalize(gaussians["quat"].reshape(-1, 4), dim=-1))
+    alpha = gaussians["opacity"].reshape(-1)
+    local = torch.einsum("gab,igb->iga", rot.transpose(1, 2), mu[:, None] - mu[None])
+    local = local / gaussians["scale"].reshape(1, -1, 3)
+    density = alpha * torch.exp(-0.5 * local.pow(2).sum(-1))  # (N, N): at centre i from g
+    per_slot = density.view(-1, K, G).sum(-1)  # (N, K)
+    own = per_slot.view(K, G, K).diagonal(dim1=0, dim2=2).T  # (K, G): own slot's density
+    share = own / per_slot.view(K, G, K).sum(-1).clamp_min(1e-8)
+    return {**gaussians, "opacity": gaussians["opacity"] * share}
 
 
 class RegionHead(nn.Module):
@@ -119,55 +141,6 @@ class ObjectHead(nn.Module):
         }
 
 
-class VisibleSurface(nn.Module):
-    """[slot, PE(uv)] -> a Gaussian on that token's view-0 ray; opacity = attention."""
-
-    def __init__(self, z_dim: int, hidden: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(z_dim + 2 + 4 * VISIBLE_PE_BANDS, hidden), nn.ReLU(True),
-            nn.Linear(hidden, hidden), nn.ReLU(True),
-            nn.Linear(hidden, 13),  # depth 1, rgb 3, sh1 9
-        )
-        with torch.no_grad():
-            out = self.mlp[-1]
-            out.weight.mul_(0.1)
-            out.weight[4:].zero_()  # view-independent at first
-            out.bias.zero_()
-
-    def forward(
-        self,
-        slots: torch.Tensor,
-        uv: torch.Tensor,
-        dirs: torch.Tensor,
-        attn: torch.Tensor,
-        origin: torch.Tensor,
-        centre: torch.Tensor,
-        extent: torch.Tensor,
-        colour: torch.Tensor,
-        token_width: float,
-    ) -> dict[str, torch.Tensor]:
-        """slots (K, C); tokens' uv, rays, attention (K, T, .); box, colour -> Gaussians (K, T, ...)."""
-        pe = positional_encoding(uv.flatten(0, 1), VISIBLE_PE_BANDS).view(*uv.shape[:2], -1)
-        raw = self.mlp(torch.cat([slots[:, None].expand(-1, uv.shape[1], -1), pe], -1))
-        # Depth: box centre's on this ray +- the box half width.
-        t0 = ((centre - origin)[:, None] * dirs).sum(-1)
-        depth = (t0 + extent[:, None, :2].mean(-1) * torch.tanh(raw[..., 0])).clamp_min(1e-3)
-        mu = origin + depth[..., None] * dirs
-        mu = torch.cat([mu[..., :2], mu[..., 2:].clamp_min(MIN_HEIGHT)], -1)
-        size = 0.5 * depth * token_width  # covers its own token only
-        quat = torch.zeros_like(mu[..., :1]).expand(-1, -1, 4).clone()
-        quat[..., 0] = 1.0
-        return {
-            "mu": mu,
-            "scale": size[..., None].expand(-1, -1, 3),
-            "quat": quat,
-            "opacity": attn,
-            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 1:4]),
-            "sh1": raw[..., 4:13].unflatten(-1, (3, 3)),
-        }
-
-
 class DecoderLayer(nn.Module):
     """Self-attention among the Gaussians, cross-attention to the slot tokens,
     FFN; pre-norm."""
@@ -212,23 +185,11 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
-        self.visible = VisibleSurface(z_dim, d)
 
     def forward(
-        self,
-        slots: torch.Tensor,
-        anchor: torch.Tensor,
-        ray: torch.Tensor,
-        colour: torch.Tensor,
-        uv: torch.Tensor,
-        dirs: torch.Tensor,
-        attn: torch.Tensor,
-        attn_maps: torch.Tensor,
-        frame: SceneFrame,
-        focal_ratio: tuple[float, float],
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3); tokens' uv, rays, attention (K, T, .);
-        attention maps (K, 1, s, s) -> Gaussians (K, T + G, ...) (visible, completion), extent."""
+        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians (K, G, ...), half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
@@ -236,9 +197,4 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        completion = self.head(q, centre, extent, colour)
-        support = project_and_sample(completion["mu"], attn_maps, frame, focal_ratio)[..., 0]
-        completion["opacity"] = completion["opacity"] * support
-        token_width = 1.0 / (focal_ratio[0] * attn_maps.shape[-1])
-        visible = self.visible(slots, uv, dirs, attn, frame.origin, centre, extent, colour, token_width)
-        return {key: torch.cat([visible[key], completion[key]], 1) for key in completion}, extent
+        return self.head(q, centre, extent, colour), extent
