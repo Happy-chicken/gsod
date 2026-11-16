@@ -5,7 +5,7 @@
                               Gaussians in it
     decode_background         background slot -> floor discs + fill colour
     render                    all Gaussians (object opacities x the slot's
-                              draw factor, floor discs) sorted and blended
+                              floor discs) sorted and blended
                               together; slot masks from the same blending
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
@@ -22,21 +22,18 @@ from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION, VISIBLE_TOKENS
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, camera_directions, scene_frame, to_world
+from gsod.utils.geometry import (
+    SceneFrame,
+    camera_directions,
+    project_and_sample,
+    scene_frame,
+    to_world,
+    yaw_matrix,
+)
 from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Draw factor: attention area (fraction of tokens) ramp.
-AREA_EMPTY = 0.001
-AREA_FULL = 0.004
-
-
-def draw_factor(attn: torch.Tensor) -> torch.Tensor:
-    """attn (K, N) -> (K,): 0 below AREA_EMPTY, 1 from AREA_FULL."""
-    return ((attn.mean(-1) - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
-
-
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
 
 
@@ -174,17 +171,20 @@ class GSODModel(nn.Module):
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
         """A scene (forward(render=False)) rendered into cam2world (N, 4, 4):
         every Gaussian, object or floor, sorted and blended together."""
-        obj, bg, draw = scene["objects"]["gaussians"], scene["background"], scene["draw"]
+        obj, bg, frame = scene["objects"]["gaussians"], scene["background"], scene["frame"]
         n_obj, n_gauss = obj["mu"].shape[:2]
         floor = bg["gaussians"]
         objects = {name: value.flatten(0, 1) for name, value in obj.items()}
-        opacity = obj["opacity"] * draw[:, None]
-        objects["opacity"] = opacity.flatten()
+        opacity = obj["opacity"]
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
-        # View 0 shows no completion Gaussians: they stand for what it cannot see.
+        # View 0: every slot shows by its attention. No completion Gaussians
+        # (they stand for what view 0 cannot see); floor discs x background attention.
         hidden = torch.ones_like(opacity)
         hidden[:, scene["objects"]["n_visible"] :] = 0.0
-        view0 = {**every, "opacity": torch.cat([(opacity * hidden).flatten(), floor["opacity"]])}
+        side = self.input_size
+        at = (floor["mu"] - frame.centre) / frame.scale @ yaw_matrix(-frame.yaw).to(floor["mu"].dtype).T
+        a_bg = project_and_sample(at[None], scene["attn"][:1].reshape(1, 1, side, side), frame, self.focal_ratio)
+        view0 = {**every, "opacity": torch.cat([(opacity * hidden).flatten(), floor["opacity"] * a_bg[0, :, 0]])}
         fill = bg["fill"][None, :, None, None]
         out = self._splat_views(view0, every, cam2world)
         image = out["rgb"] + (1.0 - out["alpha"]) * fill
@@ -216,7 +216,6 @@ class GSODModel(nn.Module):
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
             "attn": scene["attn"],  # (K, s*s)
-            "draw": draw,  # (K-1,)
             "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
 
@@ -230,7 +229,6 @@ class GSODModel(nn.Module):
         scene = {
             "objects": self.decode_objects(slots, attn, colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
-            "draw": draw_factor(attn[1:]),
             "attn": attn,
             "slots": slots,
             "frame": frame,
