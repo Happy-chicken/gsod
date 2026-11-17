@@ -4,8 +4,9 @@
             + attn * MSE of the 2D attention reconstruction (view 0, tokens)
 
 With proxy > 0 the render is image + proxy * (B - B.detach()), B = the slots'
-long-tailed blobs: the same value, but every pixel's error pulls the box
-centres. The adversarial term (loss.gan) is added in train.py.
+long-tailed blobs (where no other slot draws) x the residual (detached): the
+same value, but each box centre is pulled to large residuals no other slot
+explains. The adversarial term (loss.gan) is added in train.py.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ class GSODLoss(nn.Module):
         cfg = self.cfg
         rendered = outputs["rgb"]
         if cfg.proxy > 0:
-            blobs = outputs["proxy_rgb"]
+            blobs = outputs["proxy"] * (images - rendered).detach()
             rendered = rendered + cfg.proxy * (blobs - blobs.detach())
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
