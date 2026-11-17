@@ -4,7 +4,7 @@
 
 With proxy > 0 the losses see proxy_image: the same image, but each box
 centre is pulled to large residuals no other slot explains. Its weight is
-cosine-annealed to 0 by proxy_end (finding objects, not refining them).
+cosine-annealed to 0 by PROXY_END (finding objects, not refining them).
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ from torch import nn
 
 from gsod.configs.base import LossConfig
 from gsod.utils.schedule import cosine
+
+# The proxy weight reaches 0 at this fraction of training.
+PROXY_END = 0.5
 
 
 def _gaussian_window(
@@ -72,7 +75,7 @@ class GSODLoss(nn.Module):
         """progress: fraction of training done -> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
-        weight = cosine(progress / cfg.proxy_end, cfg.proxy, 0.0)
+        weight = cosine(progress / PROXY_END, cfg.proxy, 0.0)
         if weight > 0:
             rendered = proxy_image(rendered, images, outputs["blobs"], outputs["slot_alpha"], weight)
         terms = {
