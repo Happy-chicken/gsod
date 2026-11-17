@@ -35,14 +35,18 @@ from gsod.utils.splatter import GsplatSplatter
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
-# Draw factor: owned area mean(attn^2) (fraction of tokens) ramp.
+# Draw factor: area won (fraction of tokens where a slot's attention is the
+# largest) ramp; a slot sharing an object with a stronger one is not drawn.
 AREA_EMPTY = 0.001
 AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor) -> torch.Tensor:
-    """attn (K, N) -> (K,): 0 below AREA_EMPTY owned area, 1 from AREA_FULL."""
-    return ((attn.pow(2).mean(-1) - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
+    """attn (K, N), row 0 background -> (K-1,): 0 below AREA_EMPTY area won,
+    1 from AREA_FULL (no gradient)."""
+    won = attn == attn.amax(0, keepdim=True)
+    area = won[1:].float().mean(-1)
+    return ((area - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
 
 
 def _token_rays(
@@ -248,7 +252,7 @@ class GSODModel(nn.Module):
             "objects": self.decode_objects(slots, attn, colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
             "attn": attn,
-            "draw": draw_factor(attn[1:]),
+            "draw": draw_factor(attn),
             "slots": slots,
             "frame": frame,
         }
