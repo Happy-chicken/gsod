@@ -63,9 +63,10 @@ class GSODLoss(nn.Module):
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),
-            "attn": F.mse_loss(2.0 * outputs["attn_rgb"] - 1.0, 2.0 * outputs["attn_target"] - 1.0),
         }
         weights = {"recon": cfg.recon, "ssim": cfg.ssim, "attn": cfg.attn}
+        if cfg.attn > 0:
+            terms["attn"] = F.mse_loss(2.0 * outputs["attn_rgb"] - 1.0, 2.0 * outputs["attn_target"] - 1.0)
 
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}
