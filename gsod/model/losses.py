@@ -3,7 +3,9 @@
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
             + attn * MSE of the 2D attention reconstruction (view 0, tokens)
 
-The adversarial term (loss.gan) is added in train.py.
+With proxy > 0 the render is image + proxy * (B - B.detach()), B = the slots'
+long-tailed blobs: the same value, but every pixel's error pulls the box
+centres. The adversarial term (loss.gan) is added in train.py.
 """
 
 from __future__ import annotations
@@ -55,6 +57,9 @@ class GSODLoss(nn.Module):
         """-> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
+        if cfg.proxy > 0:
+            blobs = outputs["proxy_rgb"]
+            rendered = rendered + cfg.proxy * (blobs - blobs.detach())
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),

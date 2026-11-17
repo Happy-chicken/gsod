@@ -325,6 +325,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
     parser.add_argument("--gan", type=float, default=None, help="adversarial loss weight (0 = off)")
+    parser.add_argument("--attn", type=float, default=None, help="2D attention reconstruction weight")
+    parser.add_argument("--proxy", type=float, default=None, help="proxy gradient weight (0 = off)")
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
 
@@ -364,8 +366,9 @@ def main() -> None:
     }
     if args.data is not None:
         values["data_root"] = args.data
-    if args.gan is not None:
-        values["loss"] = replace(cfg.loss, gan=args.gan)
+    loss = {name: getattr(args, name) for name in ("gan", "attn", "proxy") if getattr(args, name) is not None}
+    if loss:
+        values["loss"] = replace(cfg.loss, **loss)
     if args.out is not None:
         values["out_dir"] = args.out
     cfg = replace(cfg, **values)

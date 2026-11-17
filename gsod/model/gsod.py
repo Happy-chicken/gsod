@@ -5,7 +5,8 @@
                               Gaussians in it
     decode_background         background slot -> floor discs + fill colour
     render                    all Gaussians blended together (object opacity x
-                              draw factor); masks from the same blending
+                              draw factor); masks from the same blending;
+                              proxy_rgb: long-tailed blob per slot (losses.py)
     attn_decoder              global 2D mixture of view 0 by the attention
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
@@ -26,6 +27,7 @@ from gsod.utils.geometry import (
     SceneFrame,
     camera_directions,
     scene_frame,
+    yaw_matrix,
     to_world,
 )
 from gsod.utils.splatter import GsplatSplatter
@@ -77,6 +79,33 @@ def attention_anchors(
     attention points and the colour there (K, 3)."""
     p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=1)
     return p @ points, p @ colours
+
+
+def proxy_blobs(
+    centre: torch.Tensor,
+    radius: torch.Tensor,
+    colour: torch.Tensor,
+    cam2world: torch.Tensor,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+    near: float,
+) -> torch.Tensor:
+    """World box centres (K, 3), radii (K,), colours (K, 3) -> (N, 3, H, W):
+    sum of Cauchy blobs 1 / (1 + d^2 / s^2), s = the projected radius, so far
+    pixels still reach the centres (pinhole as in gsplat)."""
+    h, w = image_size
+    world2cam = torch.linalg.inv(cam2world)
+    cam = torch.einsum("nij,kj->nki", world2cam[:, :3, :3], centre) + world2cam[:, None, :3, 3]
+    z = cam[..., 2].clamp_min(near)
+    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
+    u = fx * cam[..., 0] / z + 0.5 * w  # (N, K)
+    v = fy * cam[..., 1] / z + 0.5 * h
+    s = (fx * radius / z).clamp_min(1.0)
+    xs = torch.arange(w, device=centre.device, dtype=centre.dtype) + 0.5
+    ys = torch.arange(h, device=centre.device, dtype=centre.dtype) + 0.5
+    d2 = (xs - u[..., None, None]) ** 2 + (ys[:, None] - v[..., None, None]) ** 2
+    blob = (cam[..., 2] > near)[..., None, None] / (1.0 + d2 / s[..., None, None] ** 2)
+    return torch.einsum("nkhw,kc->nchw", blob, colour)
 
 
 class GSODModel(nn.Module):
@@ -137,8 +166,14 @@ class GSODModel(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        gaussians, extent = self.obj_decoder(slots, anchor, ray, colour)
-        return {"gaussians": to_world(gaussians, frame), "extent": extent}
+        gaussians, centre, extent = self.obj_decoder(slots, anchor, ray, colour)
+        centre = centre @ yaw_matrix(frame.yaw).to(centre.dtype).T * frame.scale + frame.centre
+        return {
+            "gaussians": to_world(gaussians, frame),
+            "centre": centre,  # world
+            "radius": extent[:, :2].mean(-1) * frame.scale,  # world
+            "extent": extent,
+        }
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -165,6 +200,12 @@ class GSODModel(nn.Module):
         fill = bg["fill"][None, :, None, None]
         out = self.splat(every, *cams)
         image = out["rgb"] + (1.0 - out["alpha"]) * fill
+        # Proxy: pulls box centres only (radius and colour detached), every slot.
+        colour = (obj["opacity"][..., None] * obj["rgb"]).sum(1) / obj["opacity"].sum(1)[:, None].clamp_min(1e-6)
+        o = scene["objects"]
+        proxy = proxy_blobs(
+            o["centre"], o["radius"].detach(), colour.detach(), cam2world, self.image_size, self.focal_ratio, self.near
+        )
 
         # Decomposition from the same blending (no gradient): per-slot weights
         # (0 = floor + fill) and per-object colour contributions.
@@ -185,6 +226,7 @@ class GSODModel(nn.Module):
 
         return {
             "rgb": image,  # (N, 3, H, W)
+            "proxy_rgb": proxy,  # (N, 3, H, W)
             "fg_rgb": slot_rgb.sum(1),
             "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W)
             "bg_rgb": bg_rgb,  # the floor alone

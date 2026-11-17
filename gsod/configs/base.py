@@ -15,6 +15,7 @@ class LossConfig:
     ssim: float = 0.2  # 1 - SSIM
     attn: float = 0.2  # 2D attention reconstruction
     gan: float = 0.0  # adversarial (non-saturating), 0 = off
+    proxy: float = 0.0  # long-tailed proxy gradient on box centres, 0 = off
 
 
 @dataclass
