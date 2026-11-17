@@ -1,7 +1,6 @@
 """Reconstruction loss (no masks), every view:
 
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
-            + attn * MSE of the 2D attention reconstruction (view 0, tokens)
 
 With proxy > 0 the losses see proxy_image: the same image, but each box
 centre is pulled to large residuals no other slot explains. The adversarial
@@ -78,10 +77,7 @@ class GSODLoss(nn.Module):
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),
         }
-        weights = {"recon": cfg.recon, "ssim": cfg.ssim, "attn": cfg.attn}
-        if cfg.attn > 0:
-            terms["attn"] = F.mse_loss(2.0 * outputs["attn_rgb"] - 1.0, 2.0 * outputs["attn_target"] - 1.0)
-
+        weights = {"recon": cfg.recon, "ssim": cfg.ssim}
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: float(value.detach()) for name, value in terms.items()}
         logged["total"] = float(total.detach())

@@ -7,7 +7,6 @@
     render                    all Gaussians blended together (object opacity x
                               draw factor); masks from the same blending;
                               blobs: long-tailed blob per slot (losses.py)
-    attn_decoder              global 2D mixture of view 0 by the attention
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
 background.
@@ -19,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gsod.model.decoders import AttnDecoder, BackgroundDecoder, ObjectDecoder
+from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
@@ -132,7 +131,6 @@ class GSODModel(nn.Module):
         )
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
-        self.attn_decoder = AttnDecoder(z_dim)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -141,7 +139,6 @@ class GSODModel(nn.Module):
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
-            "AttnDecoder": self.attn_decoder,
         }
 
     # -- stages ---------------------------------------------------------------
@@ -244,11 +241,4 @@ class GSODModel(nn.Module):
             "slots": slots,
             "frame": frame,
         }
-        if not render:
-            return scene
-        out = self.render(scene, cam2world)
-        # Global 2D mixture of view 0 (competition among slots).
-        bg = F.interpolate(out["bg_rgb"][0:1], size=self.input_size, mode="area")[0].flatten(1).T
-        out["attn_rgb"] = self.attn_decoder(slots, attn, bg)
-        out["attn_target"] = colours
-        return out
+        return self.render(scene, cam2world) if render else scene

@@ -13,7 +13,6 @@ class LossConfig:
 
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
-    attn: float = 0.0  # 2D attention reconstruction, 0 = off
     gan: float = 0.0  # adversarial (non-saturating), 0 = off
     proxy: float = 0.0  # long-tailed proxy gradient on box centres, 0 = off
 
