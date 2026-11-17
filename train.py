@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -35,6 +34,7 @@ from gsod.model.evaluate import (
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
+from gsod.utils.schedule import cosine
 from gsod.utils.visualize import wandb_images, wandb_slot_table
 
 WANDB_PROJECT = "gsod"
@@ -104,7 +104,7 @@ class GSODTraining(L.LightningModule):
         step = self.start_epoch * self.steps_per_epoch + self.global_step
         self.model.slot_attention.anneal(step)
         outputs = self.model(images, cams)
-        loss, terms = self.criterion(outputs, images)
+        loss, terms = self.criterion(outputs, images, step / (self.steps_per_epoch * self.cfg.epochs))
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
         return loss
@@ -164,8 +164,7 @@ def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
     warm = max(cfg.lr_warmup * cfg.epochs, 1e-8)
     if epoch < warm:
         return epoch / warm
-    t = min(1.0, (epoch - warm) / max(cfg.epochs - warm, 1e-8))
-    return cfg.lr_final + (1.0 - cfg.lr_final) * 0.5 * (1.0 + math.cos(math.pi * t))
+    return cosine((epoch - warm) / max(cfg.epochs - warm, 1e-8), 1.0, cfg.lr_final)
 
 
 def _first(dataset, n: int | None):

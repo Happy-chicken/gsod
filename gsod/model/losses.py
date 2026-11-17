@@ -3,7 +3,8 @@
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
 
 With proxy > 0 the losses see proxy_image: the same image, but each box
-centre is pulled to large residuals no other slot explains.
+centre is pulled to large residuals no other slot explains. Its weight is
+cosine-annealed to 0 by proxy_end (finding objects, not refining them).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs.base import LossConfig
+from gsod.utils.schedule import cosine
 
 
 def _gaussian_window(
@@ -65,13 +67,14 @@ class GSODLoss(nn.Module):
         self.cfg = cfg
 
     def forward(
-        self, outputs: dict[str, torch.Tensor], images: torch.Tensor
+        self, outputs: dict[str, torch.Tensor], images: torch.Tensor, progress: float
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """-> (total, per-term values for logging)."""
+        """progress: fraction of training done -> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
-        if cfg.proxy > 0:
-            rendered = proxy_image(rendered, images, outputs["blobs"], outputs["slot_alpha"], cfg.proxy)
+        weight = cosine(progress / cfg.proxy_end, cfg.proxy, 0.0)
+        if weight > 0:
+            rendered = proxy_image(rendered, images, outputs["blobs"], outputs["slot_alpha"], weight)
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),

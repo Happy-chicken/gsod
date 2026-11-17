@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 from torch.nn import init
+
+from gsod.utils.schedule import cosine
 
 # Query noise schedule.
 SIGMA_START = 1.0
@@ -64,9 +64,7 @@ class SlotAttention(nn.Module):
 
     def anneal(self, step: int) -> None:
         """Cosine-anneal the noise sigma."""
-        progress = min(step / SIGMA_STEPS, 1.0)
-        a, b = 0.5 * (SIGMA_START - SIGMA_FINAL), 0.5 * (SIGMA_START + SIGMA_FINAL)
-        self.sigma = a * math.cos(math.pi * progress) + b
+        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
 
     def forward(self, feat: torch.Tensor):
         b, D = feat.shape[0], self.slot_dim

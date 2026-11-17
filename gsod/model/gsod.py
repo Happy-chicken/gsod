@@ -90,16 +90,16 @@ def proxy_blobs(
     focal_ratio: tuple[float, float],
     near: float,
 ) -> torch.Tensor:
-    """World box centres (K, 3), radii (K,) -> Cauchy blobs (N, K, H, W),
-    1 / (1 + d^2 / s^2), s = the projected radius: far pixels still reach the
-    centres. Gradient to the centres only."""
+    """World box centres (K, 3), radii (K,) -> long-tailed blobs (N, K, H, W),
+    (1 + d^2 / s^2)^(-1/2), s = the projected radius: the gradient to a centre
+    falls only as 1 / d^2. Gradient to the centres only."""
     h, w = image_size
     uv, z = project(centre, cam2world, image_size, focal_ratio)
     s = (focal_ratio[0] * w * radius.detach() / z.clamp_min(near)).clamp_min(1.0)
     xs = torch.arange(w, device=centre.device, dtype=centre.dtype)
     ys = torch.arange(h, device=centre.device, dtype=centre.dtype)
     d2 = (xs - uv[..., 0, None, None]) ** 2 + (ys[:, None] - uv[..., 1, None, None]) ** 2
-    return (z > near)[..., None, None] / (1.0 + d2 / s[..., None, None] ** 2)
+    return (z > near)[..., None, None] * torch.rsqrt(1.0 + d2 / s[..., None, None] ** 2)
 
 
 class GSODModel(nn.Module):
