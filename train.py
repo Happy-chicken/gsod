@@ -6,8 +6,6 @@
         --monitor-scenes 20 --epochs 20 --eval-every 2   # quick run
 
 val/psnr picks "best"; monitor (test scenes with GT) gives seg/*, diag/*.
-With loss.gan > 0 a discriminator (renders vs inputs, every view) is trained
-alongside, as in uORF.
 """
 
 from __future__ import annotations
@@ -28,16 +26,6 @@ from torch.utils.data import DataLoader, Subset
 from gsod.configs import DATASETS, BaseConfig, config_for
 from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
 from gsod.model import build_model
-from gsod.model.discriminator import (
-    D_BETAS,
-    D_LR,
-    R1_EVERY,
-    R1_WEIGHT,
-    Discriminator,
-    d_loss,
-    g_loss,
-    r1_penalty,
-)
 from gsod.model.evaluate import (
     DIAGNOSTIC_KEYS,
     RECONSTRUCTION_KEYS,
@@ -72,8 +60,6 @@ class GSODTraining(L.LightningModule):
         self.model = model
         self.cfg = cfg
         self.criterion = GSODLoss(cfg.loss)
-        self.discriminator = Discriminator().requires_grad_(False)  # trained in _train_discriminator
-        self.d_opt = None
         self.val_set = val_set
         self.monitor_set = monitor_set
         self.steps_per_epoch = steps_per_epoch
@@ -90,8 +76,6 @@ class GSODTraining(L.LightningModule):
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
-        # Stepped by hand, so global_step and clipping concern the model only.
-        self.d_opt = torch.optim.Adam(self.discriminator.parameters(), lr=D_LR, betas=D_BETAS)
         start = self.start_epoch * self.steps_per_epoch
         schedule = torch.optim.lr_scheduler.LambdaLR(
             opt,
@@ -105,11 +89,7 @@ class GSODTraining(L.LightningModule):
     def on_fit_start(self) -> None:
         if self.resume is not None:
             load_networks(
-                str(self.out),
-                self.resume,
-                {"Discriminator": self.discriminator},
-                [*self.trainer.optimizers, self.d_opt],
-                device=self.device,
+                str(self.out), self.resume, {}, self.trainer.optimizers, device=self.device
             )
 
     def on_train_start(self) -> None:
@@ -125,32 +105,9 @@ class GSODTraining(L.LightningModule):
         self.model.slot_attention.anneal(step)
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
-        progress = step / (self.steps_per_epoch * self.cfg.epochs)
-        if self.cfg.loss.gan > 0:
-            real, fake = 2.0 * images - 1.0, 2.0 * outputs["rgb"] - 1.0
-            if progress >= self.cfg.d_start:
-                terms.update(self._train_discriminator(real, fake.detach(), step))
-            if progress >= self.cfg.gan_start:
-                gan = g_loss(self.discriminator(fake))
-                loss = loss + self.cfg.loss.gan * gan
-                terms["gan"], terms["total"] = float(gan.detach()), float(loss.detach())
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
         return loss
-
-    def _train_discriminator(self, real: torch.Tensor, fake: torch.Tensor, step: int) -> dict[str, float]:
-        """One discriminator step (logistic, lazy R1); frozen again afterwards."""
-        disc = self.discriminator.requires_grad_(True)
-        loss_real, loss_fake = d_loss(disc(real), disc(fake))
-        loss = loss_real + loss_fake
-        if step % R1_EVERY == 0:
-            real = real.detach().requires_grad_(True)
-            loss = loss + R1_WEIGHT * r1_penalty(real, disc(real))
-        self.d_opt.zero_grad(set_to_none=True)
-        loss.backward()
-        self.d_opt.step()
-        disc.requires_grad_(False)
-        return {"d_real": float(loss_real.detach()), "d_fake": float(loss_fake.detach())}
 
     def on_before_optimizer_step(self, optimizer) -> None:
         # Before clipping.
@@ -196,12 +153,7 @@ class GSODTraining(L.LightningModule):
 
     def _save(self, suffix: str, epoch: int) -> None:
         """epoch: epochs done (where --resume starts)."""
-        save_networks(
-            str(self.out),
-            suffix,
-            {**self.model.networks(), "Discriminator": self.discriminator},
-            [*self.trainer.optimizers, self.d_opt],
-        )
+        save_networks(str(self.out), suffix, self.model.networks(), self.trainer.optimizers)
         (self.out / f"{suffix}_state.json").write_text(
             json.dumps({"epoch": epoch, "best_psnr": self.best_psnr})
         )
@@ -324,7 +276,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
-    parser.add_argument("--gan", type=float, default=None, help="adversarial loss weight (0 = off)")
     parser.add_argument("--proxy", type=float, default=None, help="proxy gradient weight (0 = off)")
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
@@ -365,9 +316,8 @@ def main() -> None:
     }
     if args.data is not None:
         values["data_root"] = args.data
-    loss = {name: getattr(args, name) for name in ("gan", "proxy") if getattr(args, name) is not None}
-    if loss:
-        values["loss"] = replace(cfg.loss, **loss)
+    if args.proxy is not None:
+        values["loss"] = replace(cfg.loss, proxy=args.proxy)
     if args.out is not None:
         values["out_dir"] = args.out
     cfg = replace(cfg, **values)

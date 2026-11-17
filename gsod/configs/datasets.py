@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
-from gsod.configs.base import BaseConfig, LossConfig
+from gsod.configs.base import BaseConfig
 from gsod.utils.io import default_out_dir
 
 
@@ -51,7 +51,6 @@ class RoomDiverseConfig(BaseConfig):
     epochs: int = 40
     eval_every: int = 2
     save_every: int = 5
-    loss: LossConfig = field(default_factory=lambda: LossConfig(gan=0.01))
     out_dir: str = field(default_factory=lambda: default_out_dir("room_diverse"))
 
 

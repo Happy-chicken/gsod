@@ -13,7 +13,6 @@ class LossConfig:
 
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
-    gan: float = 0.0  # adversarial (non-saturating), 0 = off
     proxy: float = 0.0  # long-tailed proxy gradient on box centres, 0 = off
 
 
@@ -40,10 +39,6 @@ class BaseConfig:
     save_every: int = 10
     num_workers: int = 4
     loss: LossConfig = field(default_factory=LossConfig)
-    # GAN (fractions of training): the discriminator trains from d_start,
-    # the generator gets its loss from gan_start.
-    d_start: float = 0.08
-    gan_start: float = 0.1
 
     # --- data (image size, focal, views: multi-view datasets only)
     dataset_mode: str = "primordia"

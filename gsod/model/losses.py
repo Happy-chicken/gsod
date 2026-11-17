@@ -3,8 +3,7 @@
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
 
 With proxy > 0 the losses see proxy_image: the same image, but each box
-centre is pulled to large residuals no other slot explains. The adversarial
-term (loss.gan) is added in train.py.
+centre is pulled to large residuals no other slot explains.
 """
 
 from __future__ import annotations
