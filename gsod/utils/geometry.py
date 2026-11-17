@@ -13,7 +13,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 
 # -- cameras and the floor ----------------------------------------------------
@@ -141,16 +140,19 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
-def project_and_sample(points: torch.Tensor, maps: torch.Tensor, frame: SceneFrame, focal_ratio) -> torch.Tensor:
-    """Scene-frame points (B, P, 3) projected into view 0 -> maps (B, C, h, w)
-    sampled bilinearly there (B, P, C); 0 behind the camera or off the image."""
-    cam = (points - frame.origin) @ frame.rot
-    front = cam[..., 2] > 1e-3
-    z = torch.where(front, cam[..., 2], torch.ones_like(cam[..., 2]))
-    # grid_sample coordinates (align_corners=False): pixel centres at integers.
-    grid = torch.stack([2.0 * focal_ratio[0] * cam[..., 0] / z, 2.0 * focal_ratio[1] * cam[..., 1] / z], -1)
-    out = F.grid_sample(maps, grid[:, None], mode="bilinear", align_corners=False)[:, :, 0]
-    return out.transpose(1, 2) * front[..., None]
+def project(
+    points: torch.Tensor, cam2world: torch.Tensor, image_size: tuple[int, int], focal_ratio
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """World points (P, 3) into cameras (N, 4, 4) -> pixel coordinates (N, P, 2)
+    (centres at integers, as camera_directions) and depth (N, P)."""
+    h, w = image_size
+    world2cam = torch.linalg.inv(cam2world)
+    cam = torch.einsum("nij,pj->npi", world2cam[:, :3, :3], points) + world2cam[:, None, :3, 3]
+    z = cam[..., 2]
+    zs = z.clamp_min(1e-6)
+    u = focal_ratio[0] * w * cam[..., 0] / zs + (w - 1) / 2
+    v = focal_ratio[1] * h * cam[..., 1] / zs + (h - 1) / 2
+    return torch.stack([u, v], -1), z
 
 
 def yaw_matrix(angle: torch.Tensor) -> torch.Tensor:
@@ -205,16 +207,21 @@ def rotate_gaussians(
     return out
 
 
+def points_to_world(points: torch.Tensor, frame: SceneFrame, rotate: bool = True) -> torch.Tensor:
+    """Scene-frame points (..., 3) -> world."""
+    if rotate:
+        points = points @ yaw_matrix(frame.yaw).to(points.dtype).T
+    return points * frame.scale.to(points.dtype) + frame.centre.to(points.dtype)
+
+
 def to_world(
     gaussians: dict[str, torch.Tensor], frame: SceneFrame, rotate: bool = True
 ) -> dict[str, torch.Tensor]:
     """Gaussians, scene frame -> world."""
-    if rotate:
-        gaussians = rotate_gaussians(gaussians, yaw_matrix(frame.yaw), yaw_quat(frame.yaw))
-    mu = gaussians["mu"]
+    out = rotate_gaussians(gaussians, yaw_matrix(frame.yaw), yaw_quat(frame.yaw)) if rotate else gaussians
     return {
-        **gaussians,
-        "mu": mu * frame.scale.to(mu.dtype) + frame.centre.to(mu.dtype),
+        **out,
+        "mu": points_to_world(gaussians["mu"], frame, rotate),
         "scale": gaussians["scale"] * frame.scale.to(gaussians["scale"].dtype),
     }
 

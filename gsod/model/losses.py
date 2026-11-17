@@ -3,10 +3,9 @@
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
             + attn * MSE of the 2D attention reconstruction (view 0, tokens)
 
-With proxy > 0 the render is image + proxy * (B - B.detach()), B = the slots'
-long-tailed blobs (where no other slot draws) x the residual (detached): the
-same value, but each box centre is pulled to large residuals no other slot
-explains. The adversarial term (loss.gan) is added in train.py.
+With proxy > 0 the losses see proxy_image: the same image, but each box
+centre is pulled to large residuals no other slot explains. The adversarial
+term (loss.gan) is added in train.py.
 """
 
 from __future__ import annotations
@@ -47,6 +46,21 @@ def ssim(
     return (num / den).mean()
 
 
+def proxy_image(
+    rendered: torch.Tensor,
+    images: torch.Tensor,
+    blobs: torch.Tensor,
+    slot_alpha: torch.Tensor,
+    weight: float,
+) -> torch.Tensor:
+    """rendered + weight * (B - B.detach()), B = sum over slots of blob x where
+    no other slot draws, x the residual (all but the blobs detached)."""
+    obj = slot_alpha[:, 1:]
+    free = (1.0 - (obj.sum(1, keepdim=True) - obj)).clamp(0.0, 1.0)
+    pull = (blobs * free).sum(1, keepdim=True) * (images - rendered).detach()
+    return rendered + weight * (pull - pull.detach())
+
+
 class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
@@ -59,8 +73,7 @@ class GSODLoss(nn.Module):
         cfg = self.cfg
         rendered = outputs["rgb"]
         if cfg.proxy > 0:
-            blobs = outputs["proxy"] * (images - rendered).detach()
-            rendered = rendered + cfg.proxy * (blobs - blobs.detach())
+            rendered = proxy_image(rendered, images, outputs["blobs"], outputs["slot_alpha"], cfg.proxy)
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),
