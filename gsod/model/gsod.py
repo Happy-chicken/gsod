@@ -35,16 +35,15 @@ from gsod.utils.splatter import GsplatSplatter
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
-# An object slot is drawn if its attention is the largest on at least this
-# fraction of the tokens.
-MIN_AREA_WON = 0.002
+# Draw factor: attention area (fraction of tokens) ramp.
+AREA_EMPTY = 0.001
+AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor) -> torch.Tensor:
-    """attn (K, N), row 0 background -> (K-1,) 0 / 1: of two slots sharing an
-    object, the weaker is not drawn (no gradient)."""
-    won = attn == attn.amax(0, keepdim=True)
-    return (won[1:].float().mean(-1) >= MIN_AREA_WON).float()
+    """attn (K, N), row 0 background -> (K-1,): 0 below AREA_EMPTY, 1 from
+    AREA_FULL; inside the ramp, reconstruction pushes the attention's amount."""
+    return ((attn[1:].mean(-1) - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
 
 
 def _token_rays(
