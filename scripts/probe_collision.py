@@ -102,9 +102,6 @@ def main() -> None:
                     "attn_cos": float(attn[a] @ attn[b]),
                 })
 
-    init = F.normalize(model.slot_attention.slots_init.weight[1:].float(), dim=-1)
-    init_cos = init @ init.T
-    off = ~torch.eye(len(init), dtype=torch.bool, device=init.device)
     metrics = {
         kind: {
             "slot_cos": summary([p["slot_cos"] for p in pairs if p["kind"] == kind]),
@@ -112,7 +109,6 @@ def main() -> None:
         }
         for kind in ("same", "different", "other")
     }
-    metrics["init_cos"] = summary(init_cos[off].tolist())  # learned object queries
 
     out = Path(checkpoint) / "probe"
     out.mkdir(parents=True, exist_ok=True)
@@ -128,8 +124,6 @@ def main() -> None:
             if s["n"]:
                 print(f"{kind:9s} {score}  n={s['n']:4d}  mean={s['mean']:.3f}  "
                       f"median={s['median']:.3f}  p10={s['p10']:.3f}  p90={s['p90']:.3f}")
-    s = metrics["init_cos"]
-    print(f"init      slot_cos  mean={s['mean']:.3f}  p10={s['p10']:.3f}  p90={s['p90']:.3f}")
     print(f"wrote {out}/collision.json and collision_pairs.csv")
 
 

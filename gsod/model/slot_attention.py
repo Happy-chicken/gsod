@@ -1,17 +1,12 @@
-"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background."""
+"""Slot attention as in uORF (Yu et al., ICLR 2022): the background slot has
+its own initial distribution, query, GRU and residual MLP; slot 0 is the
+background."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 from torch.nn import init
-
-from gsod.utils.schedule import cosine
-
-# Query noise schedule.
-SIGMA_START = 1.0
-SIGMA_FINAL = 0.0
-SIGMA_STEPS = 30000
 
 
 class SlotAttention(nn.Module):
@@ -22,72 +17,65 @@ class SlotAttention(nn.Module):
         num_slots: int,
         in_dim: int = 64,
         slot_dim: int = 64,
-        iters: int = 5,
-        eps: float = 1.0,
+        iters: int = 3,
+        eps: float = 1e-8,
         hidden_dim: int = 128,
     ):
         super().__init__()
         assert num_slots >= 2, "need at least two slots"
+        self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
+        self.scale = slot_dim**-0.5
         self.slot_dim = slot_dim
-        self.sigma = SIGMA_START
 
-        self.slots_init = nn.Embedding(num_slots, slot_dim)
-        init.xavier_uniform_(self.slots_init.weight)
-        self.pos_proj = nn.Linear(4, in_dim)
-        self.feat_mlp = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, slot_dim),
-        )
-        self.norm_feature = nn.LayerNorm(slot_dim)
-        self.project_k = nn.Linear(slot_dim, slot_dim, bias=False)
-        self.project_v = nn.Linear(slot_dim, slot_dim, bias=False)
-        self.norm_slots = nn.LayerNorm(slot_dim)
-        self.project_q = nn.Linear(slot_dim, slot_dim, bias=False)
+        self.slots_mu = nn.Parameter(torch.randn(1, 1, slot_dim))
+        self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, slot_dim))
+        init.xavier_uniform_(self.slots_logsigma)
+        self.slots_mu_bg = nn.Parameter(torch.randn(1, 1, slot_dim))
+        self.slots_logsigma_bg = nn.Parameter(torch.zeros(1, 1, slot_dim))
+        init.xavier_uniform_(self.slots_logsigma_bg)
+
+        self.norm_feat = nn.LayerNorm(in_dim)
+        self.to_k = nn.Linear(in_dim, slot_dim, bias=False)
+        self.to_v = nn.Linear(in_dim, slot_dim, bias=False)
+        self.to_q = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
+        self.to_q_bg = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.gru = nn.GRUCell(slot_dim, slot_dim)
-        self.norm_mlp = nn.LayerNorm(slot_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
+        hidden_dim = max(slot_dim, hidden_dim)
+        self.to_res = nn.Sequential(
+            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        )
+        self.to_res_bg = nn.Sequential(
+            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
         )
 
-    @staticmethod
-    def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
-        """(1, N, 4) [x, y, 1-x, 1-y] of a square token grid."""
-        side = int(round(n_tokens**0.5))
-        assert side * side == n_tokens, "tokens must form a square grid"
-        lin = torch.linspace(0.0, 1.0, side, device=device)
-        y, x = torch.meshgrid(lin, lin, indexing="ij")
-        return torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1).reshape(1, n_tokens, 4)
-
-    def anneal(self, step: int) -> None:
-        """Cosine-anneal the noise sigma."""
-        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
+    def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
+        b, k, d = prev.shape
+        slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, k, d)
+        return slots + res(slots)
 
     def forward(self, feat: torch.Tensor):
-        b, D = feat.shape[0], self.slot_dim
-        feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
-        feat = self.norm_feature(feat)
-        k, v = self.project_k(feat), self.project_v(feat)
+        b = feat.shape[0]
+        k_fg = self.num_slots - 1
+        mu = self.slots_mu.expand(b, k_fg, -1)
+        slot_fg = mu + self.slots_logsigma.exp().expand(b, k_fg, -1) * torch.randn_like(mu)
+        mu_bg = self.slots_mu_bg.expand(b, 1, -1)
+        slot_bg = mu_bg + self.slots_logsigma_bg.exp().expand(b, 1, -1) * torch.randn_like(mu_bg)
 
-        mu = self.slots_init.weight.expand(b, -1, -1)
-        slots_init = mu
-        if self.training and self.sigma > 0:
-            slots_init = mu + torch.randn_like(mu) * self.sigma * mu.detach()
-        slots = slots_init
+        feat = self.norm_feat(feat)
+        k, v = self.to_k(feat), self.to_v(feat)
 
         attn = None
-        for i in range(self.iters):
-            if i == self.iters - 1:  # bi-level
-                slots = slots.detach() + slots_init - slots_init.detach()
-            prev = slots
-            q = self.project_q(self.norm_slots(slots))
-            attn = torch.einsum("bkd,bnd->bkn", q, k).mul(D**-0.5).softmax(dim=1)
-            attn_wm = attn / (attn.sum(dim=-1, keepdim=True) + self.eps)
-            updates = torch.einsum("bkn,bnd->bkd", attn_wm, v)
-            slots = self.gru(updates.reshape(-1, D), prev.reshape(-1, D)).reshape(b, -1, D)
-            slots = slots + self.mlp(self.norm_mlp(slots))
+        for _ in range(self.iters):
+            dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
+            dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
+            attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1) + self.eps  # (b, K, N)
+            attn_bg, attn_fg = attn[:, :1], attn[:, 1:]
+            updates_bg = torch.einsum("bjd,bij->bid", v, attn_bg / attn_bg.sum(-1, keepdim=True))
+            updates_fg = torch.einsum("bjd,bij->bid", v, attn_fg / attn_fg.sum(-1, keepdim=True))
+            slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
+            slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
 
-        return slots[:, 0], slots[:, 1:], attn
+        return slot_bg[:, 0], slot_fg, attn
