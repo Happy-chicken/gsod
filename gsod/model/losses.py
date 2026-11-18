@@ -1,10 +1,6 @@
 """Reconstruction loss (no masks), every view:
 
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
-
-With proxy > 0 the losses see proxy_image: the same image, but each box
-centre is pulled to large residuals no other slot explains. Its weight is
-cosine-annealed to 0 by PROXY_END (finding objects, not refining them).
 """
 
 from __future__ import annotations
@@ -14,10 +10,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs.base import LossConfig
-from gsod.utils.schedule import cosine
-
-# The proxy weight reaches 0 at this fraction of training.
-PROXY_END = 0.5
 
 
 def _gaussian_window(
@@ -49,35 +41,17 @@ def ssim(
     return (num / den).mean()
 
 
-def proxy_image(
-    rendered: torch.Tensor,
-    images: torch.Tensor,
-    blobs: torch.Tensor,
-    slot_alpha: torch.Tensor,
-    weight: float,
-) -> torch.Tensor:
-    """rendered + weight * (B - B.detach()), B = sum over slots of blob x where
-    no other slot draws, x the residual (all but the blobs detached)."""
-    obj = slot_alpha[:, 1:]
-    free = (1.0 - (obj.sum(1, keepdim=True) - obj)).clamp(0.0, 1.0)
-    pull = (blobs * free).sum(1, keepdim=True) * (images - rendered).detach()
-    return rendered + weight * (pull - pull.detach())
-
-
 class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
 
     def forward(
-        self, outputs: dict[str, torch.Tensor], images: torch.Tensor, progress: float
+        self, outputs: dict[str, torch.Tensor], images: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """progress: fraction of training done -> (total, per-term values for logging)."""
+        """-> (total, per-term values for logging)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
-        weight = cosine(progress / PROXY_END, cfg.proxy, 0.0)
-        if weight > 0:
-            rendered = proxy_image(rendered, images, outputs["blobs"], outputs["slot_alpha"], weight)
         terms = {
             "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
             "ssim": 1.0 - ssim(rendered, images),

@@ -140,21 +140,6 @@ def scene_frame(
     return SceneFrame(yaw, centre, scale, to_frame @ (o - centre) / scale, to_frame @ rot)
 
 
-def project(
-    points: torch.Tensor, cam2world: torch.Tensor, image_size: tuple[int, int], focal_ratio
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """World points (P, 3) into cameras (N, 4, 4) -> pixel coordinates (N, P, 2)
-    (centres at integers, as camera_directions) and depth (N, P)."""
-    h, w = image_size
-    world2cam = torch.linalg.inv(cam2world)
-    cam = torch.einsum("nij,pj->npi", world2cam[:, :3, :3], points) + world2cam[:, None, :3, 3]
-    z = cam[..., 2]
-    zs = z.clamp_min(1e-6)
-    u = focal_ratio[0] * w * cam[..., 0] / zs + (w - 1) / 2
-    v = focal_ratio[1] * h * cam[..., 1] / zs + (h - 1) / 2
-    return torch.stack([u, v], -1), z
-
-
 def yaw_matrix(angle: torch.Tensor) -> torch.Tensor:
     """(3, 3) rotation by angle about +z."""
     c, s = torch.cos(angle), torch.sin(angle)

@@ -161,9 +161,8 @@ class ObjectDecoder(nn.Module):
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians (K, G, ...), box
-        centres, half sizes."""
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians (K, G, ...), half sizes."""
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
@@ -171,4 +170,4 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        return self.head(q, centre, extent, colour), centre, extent
+        return self.head(q, centre, extent, colour), extent

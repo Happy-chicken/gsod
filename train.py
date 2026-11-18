@@ -104,7 +104,7 @@ class GSODTraining(L.LightningModule):
         step = self.start_epoch * self.steps_per_epoch + self.global_step
         self.model.slot_attention.anneal(step)
         outputs = self.model(images, cams)
-        loss, terms = self.criterion(outputs, images, step / (self.steps_per_epoch * self.cfg.epochs))
+        loss, terms = self.criterion(outputs, images)
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
         return loss
@@ -275,7 +275,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
-    parser.add_argument("--proxy", type=float, default=None, help="proxy gradient weight (0 = off)")
     parser.add_argument("--resume", default=None, help="checkpoint suffix, e.g. latest")
     return parser.parse_args()
 
@@ -315,8 +314,6 @@ def main() -> None:
     }
     if args.data is not None:
         values["data_root"] = args.data
-    if args.proxy is not None:
-        values["loss"] = replace(cfg.loss, proxy=args.proxy)
     if args.out is not None:
         values["out_dir"] = args.out
     cfg = replace(cfg, **values)

@@ -5,14 +5,15 @@
                               Gaussians in it
     decode_background         background slot -> floor discs + fill colour
     render                    all Gaussians blended together (object opacity x
-                              draw factor); masks from the same blending;
-                              blobs: long-tailed blob per slot (losses.py)
+                              draw factor); masks from the same blending
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
 background.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -25,8 +26,6 @@ from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import (
     SceneFrame,
     camera_directions,
-    points_to_world,
-    project,
     scene_frame,
     to_world,
 )
@@ -35,15 +34,14 @@ from gsod.utils.splatter import GsplatSplatter
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
-# Draw factor: attention area (fraction of tokens) ramp.
-AREA_EMPTY = 0.001
+# Draw factor: attention area (fraction of tokens) / AREA_FULL, at most 1.
 AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor) -> torch.Tensor:
-    """attn (K, N), row 0 background -> (K-1,): 0 below AREA_EMPTY, 1 from
-    AREA_FULL; inside the ramp, reconstruction pushes the attention's amount."""
-    return ((attn[1:].mean(-1) - AREA_EMPTY) / (AREA_FULL - AREA_EMPTY)).clamp(0.0, 1.0)
+    """attn (K, N), row 0 background -> (K-1,): never 0, so a slot squeezed
+    out stays visible to the gradient (fainter as its area shrinks)."""
+    return (attn[1:].mean(-1) / AREA_FULL).clamp(max=1.0)
 
 
 def _token_rays(
@@ -77,29 +75,24 @@ def attention_anchors(
     attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """attn (K, N), token points and colours (N, 3) -> where each slot's
-    attention points and the colour there (K, 3)."""
-    p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=1)
+    attention points and the colour there (K, 3): weighted over the connected
+    region (attn >= 0.5) holding the slot's peak, so a slot spread over two
+    objects anchors on one (whole attention if it holds no majority)."""
+    k, n = attn.shape
+    side = math.isqrt(n)
+    with torch.no_grad():
+        grid = attn.view(k, 1, side, side)
+        region = grid >= 0.5
+        peak = (grid == grid.amax((2, 3), keepdim=True)) & region
+        while True:
+            grown = (F.max_pool2d(peak.float(), 3, 1, 1) > 0) & region
+            if torch.equal(grown, peak):
+                break
+            peak = grown
+        keep = peak.view(k, n) | ~region.view(k, n).any(1, keepdim=True)
+    logits = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).masked_fill(~keep, float("-inf"))
+    p = logits.softmax(dim=1)
     return p @ points, p @ colours
-
-
-def proxy_blobs(
-    centre: torch.Tensor,
-    radius: torch.Tensor,
-    cam2world: torch.Tensor,
-    image_size: tuple[int, int],
-    focal_ratio: tuple[float, float],
-    near: float,
-) -> torch.Tensor:
-    """World box centres (K, 3), radii (K,) -> long-tailed blobs (N, K, H, W),
-    (1 + d^2 / s^2)^(-1/2), s = the projected radius: the gradient to a centre
-    falls only as 1 / d^2. Gradient to the centres only."""
-    h, w = image_size
-    uv, z = project(centre, cam2world, image_size, focal_ratio)
-    s = (focal_ratio[0] * w * radius.detach() / z.clamp_min(near)).clamp_min(1.0)
-    xs = torch.arange(w, device=centre.device, dtype=centre.dtype)
-    ys = torch.arange(h, device=centre.device, dtype=centre.dtype)
-    d2 = (xs - uv[..., 0, None, None]) ** 2 + (ys[:, None] - uv[..., 1, None, None]) ** 2
-    return (z > near)[..., None, None] * torch.rsqrt(1.0 + d2 / s[..., None, None] ** 2)
 
 
 class GSODModel(nn.Module):
@@ -158,13 +151,8 @@ class GSODModel(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn[1:], points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
-        gaussians, centre, extent = self.obj_decoder(slots, anchor, ray, colour)
-        return {
-            "gaussians": to_world(gaussians, frame),
-            "centre": points_to_world(centre, frame),
-            "radius": extent[:, :2].mean(-1) * frame.scale,  # world
-            "extent": extent,
-        }
+        gaussians, extent = self.obj_decoder(slots, anchor, ray, colour)
+        return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -209,12 +197,8 @@ class GSODModel(nn.Module):
             floor_only = self.splat({name: value.detach() for name, value in floor.items()}, *cams)
             bg_rgb = floor_only["rgb"] + (1.0 - floor_only["alpha"]) * fill.detach()
 
-        o = scene["objects"]
-        blobs = proxy_blobs(o["centre"], o["radius"], cam2world, self.image_size, self.focal_ratio, self.near)
-
         return {
             "rgb": image,  # (N, 3, H, W)
-            "blobs": blobs,  # (N, K-1, H, W)
             "fg_rgb": slot_rgb.sum(1),
             "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W)
             "bg_rgb": bg_rgb,  # the floor alone

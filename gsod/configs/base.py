@@ -13,7 +13,6 @@ class LossConfig:
 
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
-    proxy: float = 0.05  # long-tailed proxy gradient on box centres, 0 = off
 
 
 @dataclass
