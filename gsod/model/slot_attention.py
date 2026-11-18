@@ -1,6 +1,7 @@
-"""Slot attention as in uORF (Yu et al., ICLR 2022): the background slot has
-its own initial distribution, query, GRU and residual MLP; slot 0 is the
-background."""
+"""Slot attention: background as in uORF (own query, GRU, residual MLP),
+initialisation and optimisation as in BO-QSA (learned per-slot queries with
+annealed noise, bi-level: only the last iteration is differentiated, straight
+through to the queries). Slot 0 is the background."""
 
 from __future__ import annotations
 
@@ -8,6 +9,12 @@ import torch
 from torch import nn
 from torch.nn import init
 
+from gsod.utils.schedule import cosine
+
+# Query noise schedule.
+SIGMA_START = 1.0
+SIGMA_FINAL = 0.0
+SIGMA_STEPS = 30000
 
 class SlotAttention(nn.Module):
     """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
@@ -28,13 +35,10 @@ class SlotAttention(nn.Module):
         self.eps = eps
         self.scale = slot_dim**-0.5
         self.slot_dim = slot_dim
+        self.sigma = SIGMA_START
 
-        self.slots_mu = nn.Parameter(torch.randn(1, 1, slot_dim))
-        self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, slot_dim))
-        init.xavier_uniform_(self.slots_logsigma)
-        self.slots_mu_bg = nn.Parameter(torch.randn(1, 1, slot_dim))
-        self.slots_logsigma_bg = nn.Parameter(torch.zeros(1, 1, slot_dim))
-        init.xavier_uniform_(self.slots_logsigma_bg)
+        self.slots_init = nn.Embedding(num_slots, slot_dim)
+        init.xavier_uniform_(self.slots_init.weight)
 
         self.norm_feat = nn.LayerNorm(in_dim)
         self.to_k = nn.Linear(in_dim, slot_dim, bias=False)
@@ -56,19 +60,25 @@ class SlotAttention(nn.Module):
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, k, d)
         return slots + res(slots)
 
+    def anneal(self, step: int) -> None:
+        """Cosine-anneal the noise sigma."""
+        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
+
     def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
-        k_fg = self.num_slots - 1
-        mu = self.slots_mu.expand(b, k_fg, -1)
-        slot_fg = mu + self.slots_logsigma.exp().expand(b, k_fg, -1) * torch.randn_like(mu)
-        mu_bg = self.slots_mu_bg.expand(b, 1, -1)
-        slot_bg = mu_bg + self.slots_logsigma_bg.exp().expand(b, 1, -1) * torch.randn_like(mu_bg)
+        start = self.slots_init.weight.expand(b, -1, -1)
+        if self.training and self.sigma > 0:
+            start = start + torch.randn_like(start) * self.sigma * start.detach()
+        slot_bg, slot_fg = start[:, :1], start[:, 1:]
 
         feat = self.norm_feat(feat)
         k, v = self.to_k(feat), self.to_v(feat)
 
         attn = None
-        for _ in range(self.iters):
+        for i in range(self.iters):
+            if i == self.iters - 1:  # bi-level
+                slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
+                slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
             dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
             dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
             attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1) + self.eps  # (b, K, N)
