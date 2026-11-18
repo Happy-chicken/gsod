@@ -13,8 +13,6 @@ background.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -75,23 +73,8 @@ def attention_anchors(
     attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """attn (K, N), token points and colours (N, 3) -> where each slot's
-    attention points and the colour there (K, 3): weighted over the connected
-    region (attn >= 0.5) holding the slot's peak, so a slot spread over two
-    objects anchors on one (whole attention if it holds no majority)."""
-    k, n = attn.shape
-    side = math.isqrt(n)
-    with torch.no_grad():
-        grid = attn.view(k, 1, side, side)
-        region = grid >= 0.5
-        peak = (grid == grid.amax((2, 3), keepdim=True)) & region
-        while True:
-            grown = (F.max_pool2d(peak.float(), 3, 1, 1) > 0) & region
-            if torch.equal(grown, peak):
-                break
-            peak = grown
-        keep = peak.view(k, n) | ~region.view(k, n).any(1, keepdim=True)
-    logits = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).masked_fill(~keep, float("-inf"))
-    p = logits.softmax(dim=1)
+    attention points and the colour there (K, 3)."""
+    p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=1)
     return p @ points, p @ colours
 
 
