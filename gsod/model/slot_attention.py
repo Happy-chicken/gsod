@@ -1,10 +1,16 @@
-"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background."""
+"""Slot attention (BO-QSA, Jia et al., ICLR 2023); slot 0 is the background.
+
+Slots are updated by an invertible residual step z <- z + h * c * f(z, u)
+(u: the attention-weighted values, f spectrally normalised, c < 1), so two
+different slots cannot be mapped onto the same state (no slot collision).
+"""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 from torch.nn import init
+from torch.nn.utils.parametrizations import spectral_norm
 
 from gsod.utils.schedule import cosine
 
@@ -47,11 +53,15 @@ class SlotAttention(nn.Module):
         self.project_v = nn.Linear(slot_dim, slot_dim, bias=False)
         self.norm_slots = nn.LayerNorm(slot_dim)
         self.project_q = nn.Linear(slot_dim, slot_dim, bias=False)
-        self.gru = nn.GRUCell(slot_dim, slot_dim)
-        self.norm_mlp = nn.LayerNorm(slot_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        # Update field f([z, u]): 1-Lipschitz (spectral norm, ReLU), scaled by c in (0, 1).
+        self.field = nn.Sequential(
+            spectral_norm(nn.Linear(2 * slot_dim, hidden_dim)),
+            nn.ReLU(),
+            spectral_norm(nn.Linear(hidden_dim, hidden_dim)),
+            nn.ReLU(),
+            spectral_norm(nn.Linear(hidden_dim, slot_dim)),
         )
+        self.field_scale = nn.Parameter(torch.zeros(()))
 
     @staticmethod
     def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
@@ -79,6 +89,7 @@ class SlotAttention(nn.Module):
         slots = slots_init
 
         attn = None
+        step = torch.sigmoid(self.field_scale) / self.iters  # h * c
         for i in range(self.iters):
             if i == self.iters - 1:  # bi-level
                 slots = slots.detach() + slots_init - slots_init.detach()
@@ -87,7 +98,6 @@ class SlotAttention(nn.Module):
             attn = torch.einsum("bkd,bnd->bkn", q, k).mul(D**-0.5).softmax(dim=1)
             attn_wm = attn / (attn.sum(dim=-1, keepdim=True) + self.eps)
             updates = torch.einsum("bkn,bnd->bkd", attn_wm, v)
-            slots = self.gru(updates.reshape(-1, D), prev.reshape(-1, D)).reshape(b, -1, D)
-            slots = slots + self.mlp(self.norm_mlp(slots))
+            slots = prev + step * self.field(torch.cat([prev, updates], -1))
 
         return slots[:, 0], slots[:, 1:], attn
