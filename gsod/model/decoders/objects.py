@@ -14,12 +14,11 @@ from torch import nn
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
-# Initial box half sizes x, y, z (units of r_max); no upper limit.
-EXTENT_INIT = (1.375, 1.375, 1.2)
+# Initial box half sizes x, y, z (only an initial value; no bounds).
+EXTENT_INIT = (0.275, 0.275, 0.24)
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
-# Gaussian scale range and initial scale (units of r_max).
-SCALE_RANGE = (1.0 / 40.0, 1.0)
+# Initial Gaussian scale, as a fraction of its box's half sizes.
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
@@ -27,10 +26,6 @@ QUERY_STD = 2.0
 
 def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
-
-
-def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
-    return torch.exp(math.log(lo) + (math.log(hi) - math.log(lo)) * torch.sigmoid(raw))
 
 
 def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
@@ -42,19 +37,18 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
 
 class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes
-    r_min + r_max softplus(.) (no upper limit)."""
+    softplus(.) (no bounds)."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
-        r_min, r_max = OBJECT_RADIUS
+        r_max = OBJECT_RADIUS[1]
         self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
         self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
-        self.r_min, self.r_max = r_min, r_max
         with torch.no_grad():
             self.mlp[-1].weight.zero_()
             self.mlp[-1].bias.zero_()
             for i, size in enumerate(EXTENT_INIT):
-                self.mlp[-1].bias[2 + i] = math.log(math.expm1(size - r_min / r_max))
+                self.mlp[-1].bias[2 + i] = math.log(math.expm1(size))
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
@@ -65,25 +59,23 @@ class RegionHead(nn.Module):
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
         t = self.shift_bound * torch.tanh(raw[:, :2])
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        extent = self.r_min + self.r_max * F.softplus(raw[:, 2:])
+        extent = F.softplus(raw[:, 2:])
         return torch.cat([xy, anchor[:, 2:]], -1), extent
 
 
 class ObjectHead(nn.Module):
-    """Gaussian feature -> one Gaussian."""
+    """Gaussian feature -> one Gaussian; its scale is a fraction of its box's
+    half sizes."""
 
     def __init__(self, d_model: int):
         super().__init__()
-        r_max = OBJECT_RADIUS[1]
-        self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
         self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
-        lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
             out = self.project[-1]
             out.weight[3:].mul_(0.1)
             out.weight[14:].zero_()  # view-independent at first
             out.bias.zero_()
-            out.bias[3:6] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
+            out.bias[3:6] = _logit(SCALE_INIT)
             out.bias[6] = 1.0  # identity quaternion (wxyz)
 
     def forward(
@@ -106,7 +98,7 @@ class ObjectHead(nn.Module):
         opacity = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6)
         return {
             "mu": mu,
-            "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
+            "scale": extent[:, None] * torch.sigmoid(raw[..., 3:6]),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": opacity,
             "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
