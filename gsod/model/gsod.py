@@ -85,7 +85,7 @@ class GSODModel(nn.Module):
         input_size: int = 64,
         z_dim: int = 64,
         num_slots: int = 6,
-        attn_iter: int = 3,
+        attn_iter: int = 5,
         gaussians_per_slot: int = 512,
         decoder_hidden_dim: int = 128,
         focal_ratio: tuple[float, float] = (1.0, 1.0),

@@ -22,7 +22,7 @@ class SlotAttention(nn.Module):
         num_slots: int,
         in_dim: int = 64,
         slot_dim: int = 64,
-        iters: int = 3,
+        iters: int = 5,
         eps: float = 1.0,
         hidden_dim: int = 128,
     ):
