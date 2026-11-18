@@ -101,6 +101,7 @@ class GSODTraining(L.LightningModule):
         ref = self.rng.randrange(images.shape[0])
         order = [ref] + [i for i in range(images.shape[0]) if i != ref]
         images, cams = images[order], cams[order]
+        self.model.slot_attention.anneal(self.start_epoch * self.steps_per_epoch + self.global_step)
         outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images)
         for name, value in terms.items():

@@ -1,82 +1,30 @@
-"""Slot attention as SlotODE; slot 0 is the background.
-
-Input as in BO-QSA (tokens + position embedding through a feature MLP). Slots
-start from the tokens aggregated along fixed orthogonal directions (SlotODE)
-and follow a learned vector field (scaled spectral norm, DyT, tanh, time
-embedding), integrated by RK4 and differentiated through the solver. The
-background has its own query and vector field (uORF).
-"""
+"""Slot attention: background as in uORF (own query, GRU, residual MLP); the
+rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
+per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
+the residual MLP, bi-level (only the last iteration is differentiated, straight
+through to the queries). Slot 0 is the background."""
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
-from torch.nn.utils.parametrizations import spectral_norm
+from torch.nn import init
 
-# Spectral scale rho of the vector field's linear layers (SlotODE uses 3).
-SPECTRAL_SCALE = 3.0
+from gsod.utils.schedule import cosine
 
-
-class ScaledSNLinear(nn.Module):
-    """Linear layer with W = rho * W / sigma(W)."""
-
-    def __init__(self, d_in: int, d_out: int, rho: float = SPECTRAL_SCALE):
-        super().__init__()
-        self.linear = spectral_norm(nn.Linear(d_in, d_out, bias=False))
-        self.bias = nn.Parameter(torch.zeros(d_out))
-        self.rho = rho
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.rho * self.linear(x) + self.bias
+# Query noise schedule.
+SIGMA_START = 1.0
+SIGMA_FINAL = 0.0
+SIGMA_STEPS = 30000
+DROP_PATH = 0.2
 
 
-class DyT(nn.Module):
-    """Dynamic tanh, gamma * tanh(alpha * x) + beta, with alpha in (0, 1) and
-    |gamma| < 1 (so 1-Lipschitz)."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.zeros(()))
-        self.gamma = nn.Parameter(torch.ones(dim))
-        self.beta = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.gamma) * torch.tanh(torch.sigmoid(self.alpha) * x) + self.beta
-
-
-class VectorField(nn.Module):
-    """[slot; evidence; time] (3D) -> ds/dt (D), each coordinate in (-1, 1)."""
-
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            ScaledSNLinear(3 * dim, hidden_dim),
-            DyT(hidden_dim),
-            ScaledSNLinear(hidden_dim, hidden_dim),
-            DyT(hidden_dim),
-            ScaledSNLinear(hidden_dim, dim),
-            nn.Tanh(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-def _sinusoidal(t: float, dim: int, device: torch.device) -> torch.Tensor:
-    """Sinusoidal embedding (dim,) of a time t in [0, 1] (scaled to [0, 1000])."""
-    half = dim // 2
-    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=device) / half)
-    angles = 1000.0 * t * freqs
-    return torch.cat([angles.sin(), angles.cos()])
-
-
-def _orthogonal(k: int, d: int) -> torch.Tensor:
-    """(k, d) fixed orthonormal rows (seeded QR)."""
-    assert d >= k, "slot_dim must be at least num_slots"
-    m = torch.randn(d, k, generator=torch.Generator().manual_seed(0))
-    return torch.linalg.qr(m)[0].T.contiguous()
+def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
+    """Drop the whole residual of a sample with probability DROP_PATH."""
+    if not training:
+        return x
+    keep = (torch.rand(x.shape[0], 1, 1, device=x.device) >= DROP_PATH).to(x.dtype)
+    return x * keep / (1.0 - DROP_PATH)
 
 
 class SlotAttention(nn.Module):
@@ -93,13 +41,17 @@ class SlotAttention(nn.Module):
     ):
         super().__init__()
         assert num_slots >= 2, "need at least two slots"
+        self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
         self.scale = slot_dim**-0.5
         self.slot_dim = slot_dim
-        hidden_dim = max(slot_dim, hidden_dim)
+        self.sigma = SIGMA_START
 
-        self.register_buffer("directions", _orthogonal(num_slots, slot_dim))
+        self.slots_init = nn.Embedding(num_slots, slot_dim)
+        init.xavier_uniform_(self.slots_init.weight)
+
+        hidden_dim = max(slot_dim, hidden_dim)
         self.pos_proj = nn.Linear(4, in_dim)
         self.feat_mlp = nn.Sequential(
             nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
@@ -109,9 +61,19 @@ class SlotAttention(nn.Module):
         self.to_v = nn.Linear(slot_dim, slot_dim, bias=False)
         self.to_q = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.to_q_bg = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
-        self.time_mlp = nn.Sequential(nn.Linear(slot_dim, slot_dim), nn.GELU(), nn.Linear(slot_dim, slot_dim))
-        self.field = VectorField(slot_dim, hidden_dim)
-        self.field_bg = VectorField(slot_dim, hidden_dim)
+        self.gru = nn.GRUCell(slot_dim, slot_dim)
+        self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
+        self.to_res = nn.Sequential(
+            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        )
+        self.to_res_bg = nn.Sequential(
+            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        )
+
+    def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
+        b, k, d = prev.shape
+        slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, k, d)
+        return slots + _drop_path(res(slots), self.training)
 
     @staticmethod
     def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
@@ -122,33 +84,33 @@ class SlotAttention(nn.Module):
         y, x = torch.meshgrid(lin, lin, indexing="ij")
         return torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1).reshape(1, n_tokens, 4)
 
-    def _velocity(self, s: torch.Tensor, t: float, k: torch.Tensor, v: torch.Tensor):
-        """ds/dt of the slots s (b, K, D) at time t, and the attention there."""
-        b, n_slots, d = s.shape
-        q = torch.cat([self.to_q_bg(s[:, :1]), self.to_q(s[:, 1:])], 1)
-        attn = torch.einsum("bkd,bnd->bkn", q, k).mul(self.scale).softmax(dim=1)
-        u = torch.einsum("bkn,bnd->bkd", attn / (attn.sum(-1, keepdim=True) + self.eps), v)
-        phi = self.time_mlp(_sinusoidal(t, d, s.device)).expand(b, n_slots, d)
-        x = torch.cat([s, u, phi], -1)
-        return torch.cat([self.field_bg(x[:, :1]), self.field(x[:, 1:])], 1), attn
+    def anneal(self, step: int) -> None:
+        """Cosine-anneal the noise sigma."""
+        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
 
     def forward(self, feat: torch.Tensor):
+        b = feat.shape[0]
+        start = self.slots_init.weight.expand(b, -1, -1)
+        if self.training and self.sigma > 0:
+            start = start + torch.randn_like(start) * self.sigma * start.detach()
+        slot_bg, slot_fg = start[:, :1], start[:, 1:]
+
         feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
         feat = self.norm_feat(feat)
         k, v = self.to_k(feat), self.to_v(feat)
 
-        # Initial slots: tokens aggregated along fixed orthogonal directions.
-        a = torch.einsum("kd,bnd->bkn", self.directions, feat).softmax(dim=1)
-        s = torch.einsum("bkn,bnd->bkd", a, feat) / a.sum(-1, keepdim=True)
-
-        h = 1.0 / self.iters
         attn = None
-        for i in range(self.iters):  # RK4 on [0, 1]
-            t = i * h
-            k1, attn = self._velocity(s, t, k, v)
-            k2, _ = self._velocity(s + 0.5 * h * k1, t + 0.5 * h, k, v)
-            k3, _ = self._velocity(s + 0.5 * h * k2, t + 0.5 * h, k, v)
-            k4, _ = self._velocity(s + h * k3, t + h, k, v)
-            s = s + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        for i in range(self.iters):
+            if i == self.iters - 1:  # bi-level
+                slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
+                slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
+            dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
+            dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
+            attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)  # (b, K, N)
+            attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
+            updates = torch.einsum("bij,bjd->bid", attn_wm, v)
+            updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
+            slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
+            slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
 
-        return s[:, 0], s[:, 1:], attn
+        return slot_bg[:, 0], slot_fg, attn
