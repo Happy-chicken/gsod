@@ -37,9 +37,9 @@ AREA_FULL = 0.004
 
 
 def draw_factor(attn: torch.Tensor) -> torch.Tensor:
-    """attn (K, N), row 0 background -> (K-1,): never 0, so a slot squeezed
-    out stays visible to the gradient (fainter as its area shrinks)."""
-    return (attn[1:].mean(-1) / AREA_FULL).clamp(max=1.0)
+    """Object attention (K-1, N) -> (K-1,): never 0, so a slot squeezed out
+    stays visible to the gradient (fainter as its area shrinks)."""
+    return (attn.mean(-1) / AREA_FULL).clamp(max=1.0)
 
 
 def _token_rays(
@@ -129,10 +129,10 @@ class GSODModel(nn.Module):
         colours: torch.Tensor,
         frame: SceneFrame,
     ) -> dict[str, torch.Tensor]:
-        """slots (K-1, C), attn (K, s*s), token colours (s*s, 3) -> Gaussians, extent."""
+        """slots (K-1, C), their attention (K-1, s*s), token colours (s*s, 3) -> Gaussians, extent."""
         side = self.input_size
         points = token_points(frame, side, self.image_size, self.focal_ratio)
-        anchor, colour = attention_anchors(attn[1:], points, colours)
+        anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
         gaussians, extent = self.obj_decoder(slots, anchor, ray, colour)
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
@@ -200,10 +200,10 @@ class GSODModel(nn.Module):
         bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
-            "objects": self.decode_objects(slots, attn, colours, frame),
+            "objects": self.decode_objects(slots, attn[1:], colours, frame),
             "background": self.decode_background(bg_slot, attn[0], colours, frame),
+            "draw": draw_factor(attn[1:]),
             "attn": attn,
-            "draw": draw_factor(attn),
             "slots": slots,
             "frame": frame,
         }
