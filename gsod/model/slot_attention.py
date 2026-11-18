@@ -1,6 +1,7 @@
-"""Slot attention: background as in uORF (own query, GRU, residual MLP),
-initialisation and optimisation as in BO-QSA (learned per-slot queries with
-annealed noise, bi-level: only the last iteration is differentiated, straight
+"""Slot attention: background as in uORF (own query, GRU, residual MLP); the
+rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
+per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
+the residual MLP, bi-level (only the last iteration is differentiated, straight
 through to the queries). Slot 0 is the background."""
 
 from __future__ import annotations
@@ -15,6 +16,16 @@ from gsod.utils.schedule import cosine
 SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
+DROP_PATH = 0.2
+
+
+def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
+    """Drop the whole residual of a sample with probability DROP_PATH."""
+    if not training:
+        return x
+    keep = (torch.rand(x.shape[0], 1, 1, device=x.device) >= DROP_PATH).to(x.dtype)
+    return x * keep / (1.0 - DROP_PATH)
+
 
 class SlotAttention(nn.Module):
     """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
@@ -25,7 +36,7 @@ class SlotAttention(nn.Module):
         in_dim: int = 64,
         slot_dim: int = 64,
         iters: int = 3,
-        eps: float = 1e-8,
+        eps: float = 1.0,
         hidden_dim: int = 128,
     ):
         super().__init__()
@@ -40,14 +51,18 @@ class SlotAttention(nn.Module):
         self.slots_init = nn.Embedding(num_slots, slot_dim)
         init.xavier_uniform_(self.slots_init.weight)
 
-        self.norm_feat = nn.LayerNorm(in_dim)
-        self.to_k = nn.Linear(in_dim, slot_dim, bias=False)
-        self.to_v = nn.Linear(in_dim, slot_dim, bias=False)
+        hidden_dim = max(slot_dim, hidden_dim)
+        self.pos_proj = nn.Linear(4, in_dim)
+        self.feat_mlp = nn.Sequential(
+            nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
+        )
+        self.norm_feat = nn.LayerNorm(slot_dim)
+        self.to_k = nn.Linear(slot_dim, slot_dim, bias=False)
+        self.to_v = nn.Linear(slot_dim, slot_dim, bias=False)
         self.to_q = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.to_q_bg = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.gru = nn.GRUCell(slot_dim, slot_dim)
         self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
-        hidden_dim = max(slot_dim, hidden_dim)
         self.to_res = nn.Sequential(
             nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
         )
@@ -58,7 +73,16 @@ class SlotAttention(nn.Module):
     def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, k, d)
-        return slots + res(slots)
+        return slots + _drop_path(res(slots), self.training)
+
+    @staticmethod
+    def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
+        """(1, N, 4) [x, y, 1-x, 1-y] of a square token grid."""
+        side = int(round(n_tokens**0.5))
+        assert side * side == n_tokens, "tokens must form a square grid"
+        lin = torch.linspace(0.0, 1.0, side, device=device)
+        y, x = torch.meshgrid(lin, lin, indexing="ij")
+        return torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1).reshape(1, n_tokens, 4)
 
     def anneal(self, step: int) -> None:
         """Cosine-anneal the noise sigma."""
@@ -71,6 +95,7 @@ class SlotAttention(nn.Module):
             start = start + torch.randn_like(start) * self.sigma * start.detach()
         slot_bg, slot_fg = start[:, :1], start[:, 1:]
 
+        feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
         feat = self.norm_feat(feat)
         k, v = self.to_k(feat), self.to_v(feat)
 
@@ -81,10 +106,10 @@ class SlotAttention(nn.Module):
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
             dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
             dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
-            attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1) + self.eps  # (b, K, N)
-            attn_bg, attn_fg = attn[:, :1], attn[:, 1:]
-            updates_bg = torch.einsum("bjd,bij->bid", v, attn_bg / attn_bg.sum(-1, keepdim=True))
-            updates_fg = torch.einsum("bjd,bij->bid", v, attn_fg / attn_fg.sum(-1, keepdim=True))
+            attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)  # (b, K, N)
+            attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
+            updates = torch.einsum("bij,bjd->bid", attn_wm, v)
+            updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
             slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
             slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
 
