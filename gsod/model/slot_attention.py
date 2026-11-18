@@ -3,9 +3,8 @@
 Input as in BO-QSA (tokens + position embedding through a feature MLP). Slots
 start from the tokens aggregated along fixed orthogonal directions (SlotODE)
 and follow a learned vector field (scaled spectral norm, DyT, tanh, time
-embedding), integrated by explicit Euler with unit steps (one evaluation per
-step, as cheap as the usual iterations; a step moves each coordinate by up to
-1, like a GRU step) and differentiated through the solver. The background
+embedding), integrated by explicit Euler (one evaluation per step, as cheap as
+the usual iterations) and differentiated through the solver. The background
 has its own query and vector field (uORF).
 """
 
@@ -36,16 +35,17 @@ class ScaledSNLinear(nn.Module):
 
 
 class DyT(nn.Module):
-    """Dynamic tanh (Zhu et al., 2025): gamma * tanh(alpha * x) + beta."""
+    """Dynamic tanh, gamma * tanh(alpha * x) + beta, with alpha in (0, 1) and
+    |gamma| < 1 (so 1-Lipschitz)."""
 
     def __init__(self, dim: int):
         super().__init__()
-        self.alpha = nn.Parameter(torch.full((), 0.5))
+        self.alpha = nn.Parameter(torch.zeros(()))
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.gamma * torch.tanh(self.alpha * x) + self.beta
+        return torch.tanh(self.gamma) * torch.tanh(torch.sigmoid(self.alpha) * x) + self.beta
 
 
 class VectorField(nn.Module):
@@ -143,12 +143,12 @@ class SlotAttention(nn.Module):
         a = torch.einsum("kd,bnd->bkn", self.directions, feat).softmax(dim=1)
         s = torch.einsum("bkn,bnd->bkd", a, feat) / a.sum(-1, keepdim=True)
 
-        h = 1.0  # unit steps: time runs over [0, iters]
-        times = torch.stack([_sinusoidal(i / self.iters, self.slot_dim, feat.device) for i in range(self.iters)])
+        h = 1.0 / self.iters
+        times = torch.stack([_sinusoidal(i * h, self.slot_dim, feat.device) for i in range(self.iters)])
         phis = self.time_mlp(times)  # (iters, D)
         attn = None
         with parametrize.cached():  # spectral norms once per forward
-            for phi in phis:  # explicit Euler
+            for phi in phis:  # explicit Euler on [0, 1]
                 ds, attn = self._velocity(s, phi, k, v)
                 s = s + h * ds
 
