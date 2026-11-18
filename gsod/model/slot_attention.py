@@ -3,9 +3,8 @@
 Input as in BO-QSA (tokens + position embedding through a feature MLP). Slots
 start from the tokens aggregated along fixed orthogonal directions (SlotODE)
 and follow a learned vector field (scaled spectral norm, DyT, tanh, time
-embedding), integrated by explicit Euler (one evaluation per step, as cheap as
-the usual iterations) and differentiated through the solver. The background
-has its own query and vector field (uORF).
+embedding), integrated by RK4 and differentiated through the solver. The
+background has its own query and vector field (uORF).
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import math
 
 import torch
 from torch import nn
-from torch.nn.utils import parametrize
 from torch.nn.utils.parametrizations import spectral_norm
 
 # Spectral scale rho of the vector field's linear layers (SlotODE uses 3).
@@ -124,14 +122,14 @@ class SlotAttention(nn.Module):
         y, x = torch.meshgrid(lin, lin, indexing="ij")
         return torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1).reshape(1, n_tokens, 4)
 
-    def _velocity(self, s: torch.Tensor, phi: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        """ds/dt of the slots s (b, K, D) at the time embedded as phi (D,), and
-        the attention there."""
+    def _velocity(self, s: torch.Tensor, t: float, k: torch.Tensor, v: torch.Tensor):
+        """ds/dt of the slots s (b, K, D) at time t, and the attention there."""
         b, n_slots, d = s.shape
         q = torch.cat([self.to_q_bg(s[:, :1]), self.to_q(s[:, 1:])], 1)
         attn = torch.einsum("bkd,bnd->bkn", q, k).mul(self.scale).softmax(dim=1)
         u = torch.einsum("bkn,bnd->bkd", attn / (attn.sum(-1, keepdim=True) + self.eps), v)
-        x = torch.cat([s, u, phi.expand(b, n_slots, d)], -1)
+        phi = self.time_mlp(_sinusoidal(t, d, s.device)).expand(b, n_slots, d)
+        x = torch.cat([s, u, phi], -1)
         return torch.cat([self.field_bg(x[:, :1]), self.field(x[:, 1:])], 1), attn
 
     def forward(self, feat: torch.Tensor):
@@ -144,12 +142,13 @@ class SlotAttention(nn.Module):
         s = torch.einsum("bkn,bnd->bkd", a, feat) / a.sum(-1, keepdim=True)
 
         h = 1.0 / self.iters
-        times = torch.stack([_sinusoidal(i * h, self.slot_dim, feat.device) for i in range(self.iters)])
-        phis = self.time_mlp(times)  # (iters, D)
         attn = None
-        with parametrize.cached():  # spectral norms once per forward
-            for phi in phis:  # explicit Euler on [0, 1]
-                ds, attn = self._velocity(s, phi, k, v)
-                s = s + h * ds
+        for i in range(self.iters):  # RK4 on [0, 1]
+            t = i * h
+            k1, attn = self._velocity(s, t, k, v)
+            k2, _ = self._velocity(s + 0.5 * h * k1, t + 0.5 * h, k, v)
+            k3, _ = self._velocity(s + 0.5 * h * k2, t + 0.5 * h, k, v)
+            k4, _ = self._velocity(s + h * k3, t + h, k, v)
+            s = s + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
         return s[:, 0], s[:, 1:], attn
