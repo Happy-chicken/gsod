@@ -74,9 +74,7 @@ def main() -> None:
                 g = rotate_gaussians(g, _Y_UP, _Y_UP_QUAT)
             path = write_ply(out / (f"{name}_{part}.ply" if part else f"{name}.ply"), g)
             if not part:
-                fill = ", ".join(f"{float(c):.3f}" for c in scene["background"]["fill"])
-                print(f"{path}: {g['mu'].shape[0]} Gaussians"
-                      + f"; fill colour ({fill}) where the floor does not cover the view; "
+                print(f"{path}: {g['mu'].shape[0]} Gaussians; "
                       + f"scene frame c ({c[0]:.2f}, {c[1]:.2f}), R {float(frame.scale):.2f}")
     print(f"wrote {out}")
 

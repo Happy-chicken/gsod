@@ -1,8 +1,11 @@
-"""Background decoder: background slot -> floor discs + fill colour.
+"""Background decoder: background slot -> flat Gaussians on the floor.
 
-Disc colour = the background's mean view-0 colour + MLP(PE(x), latent,
-view-0 azimuth) residual. Nothing is read per pixel, so the background
-cannot copy an object onto the floor. World-aligned.
+A 10 x 10 grid of anchors over [-_HALF, _HALF]^2, each with GAUSSIANS_PER_ANCHOR
+flat Gaussians (z = 0). An anchor's base colour is view 0's colour around it,
+weighted by background attention over a window as wide as the largest object
+(an object covered by the background is smeared, not copied); MLP(PE(anchor),
+latent, view-0 azimuth) adds per-Gaussian offsets, sizes, opacity and colour
+residuals. World-aligned.
 """
 
 from __future__ import annotations
@@ -10,107 +13,92 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
+from gsod.model.decoders.objects import OBJECT_RADIUS, positional_encoding
 
-_INNER_SIDE = 101  # grid over the object region (fine enough for texture)
-_OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
+ANCHOR_SIDE = 10
+GAUSSIANS_PER_ANCHOR = 32
 _HALF = 3.0  # past view 0's camera
+_SPACING = 2.0 * _HALF / ANCHOR_SIDE
 _PE_BANDS = 8
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
+# Per Gaussian: offset (2), log size (2), opacity, rgb residual (3), sh1 (9).
+_N_OUT = 17
 
 
-def _mlp(d_in: int, hidden: int) -> nn.Sequential:
-    """Two ReLU layers; BackgroundHead holds the output layers."""
-    return nn.Sequential(
-        nn.Linear(d_in, hidden), nn.ReLU(True), nn.Linear(hidden, hidden), nn.ReLU(True)
-    )
+def _anchors() -> torch.Tensor:
+    """(A, 3) anchor centres on the floor."""
+    lin = torch.linspace(-_HALF + 0.5 * _SPACING, _HALF - 0.5 * _SPACING, ANCHOR_SIDE)
+    y, x = torch.meshgrid(lin, lin, indexing="ij")
+    return torch.stack([x.flatten(), y.flatten(), torch.zeros(x.numel())], -1)
 
 
-class BackgroundHead(nn.Module):
-    """BackgroundDecoder's output layers."""
-
-    def __init__(self, d_model: int, d_scene: int):
-        super().__init__()
-        self.opacity_out = nn.Linear(d_model, 1)
-        self.colour_out = nn.Linear(d_model, 3)
-        self.sh_out = nn.Linear(d_model, 9)
-        self.fill_out = nn.Linear(d_scene, 3)
-        with torch.no_grad():
-            self.opacity_out.weight.mul_(0.1)
-            self.opacity_out.bias.fill_(math.log(FLOOR_OPACITY_INIT / (1.0 - FLOOR_OPACITY_INIT)))
-            self.colour_out.weight.mul_(0.1)
-            self.colour_out.bias.zero_()
-            self.sh_out.weight.zero_()  # view-independent at first
-            self.sh_out.bias.zero_()
-            self.fill_out.weight.zero_()  # the mean colour at first
-            self.fill_out.bias.zero_()
-
-    def opacity(self, feat: torch.Tensor) -> torch.Tensor:
-        """feat (N, d) -> opacity (N,)."""
-        return torch.sigmoid(self.opacity_out(feat)[:, 0])
-
-    def fill(self, scene: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
-        """scene (d_scene,) -> fill colour (3,)."""
-        return torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + self.fill_out(scene))
-
-    def colour(self, feat: torch.Tensor, mean: torch.Tensor) -> dict[str, torch.Tensor]:
-        """feat (N, d) -> rgb (residual on a base colour, (3,) or (N, 3)), sh1 (N, 3, 3)."""
-        residual = self.colour_out(feat)
-        return {
-            "rgb": torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + residual),
-            "sh1": self.sh_out(feat).unflatten(-1, (3, 3)),
-        }
-
-
-def floor_grid() -> tuple[torch.Tensor, torch.Tensor]:
-    """Disc centres (N, 3) and spacing (N,): fine inside the object region."""
-    def grid(half: float, side: int):
-        lin = torch.linspace(-half, half, side)
-        y, x = torch.meshgrid(lin, lin, indexing="ij")
-        return torch.stack([x.flatten(), y.flatten()], -1), 2.0 * half / (side - 1)
-
-    inner, s_in = grid(OBJECT_REGION, _INNER_SIDE)
-    outer, s_out = grid(_HALF, _OUTER_SIDE)
-    outer = outer[outer.abs().amax(-1) > OBJECT_REGION + 0.5 * s_in]
-    xy = torch.cat([inner, outer])
-    mu = torch.cat([xy, torch.zeros_like(xy[:, :1])], -1)
-    spacing = torch.cat([torch.full((len(inner),), s_in), torch.full((len(outer),), s_out)])
-    return mu, spacing
+def _cell_pattern() -> torch.Tensor:
+    """(G, 2) initial offsets: a sunflower pattern filling one cell."""
+    i = torch.arange(GAUSSIANS_PER_ANCHOR, dtype=torch.float32) + 0.5
+    r = 0.5 * _SPACING * (i / GAUSSIANS_PER_ANCHOR).sqrt()
+    angle = i * math.pi * (3.0 - math.sqrt(5.0))
+    return torch.stack([r * angle.cos(), r * angle.sin()], -1)
 
 
 class BackgroundDecoder(nn.Module):
-    """Background slot -> floor discs and a fill colour."""
+    """Background slot -> flat floor Gaussians."""
 
     def __init__(self, z_dim: int, hidden_dim: int):
         super().__init__()
-        # Inputs: PE(x), latent, azimuth.
-        self.appearance = _mlp(3 + 6 * _PE_BANDS + z_dim + 2, hidden_dim)
-        self.head = BackgroundHead(hidden_dim, z_dim + 2)
-        mu, spacing = floor_grid()
-        self.register_buffer("floor_mu", mu, persistent=False)
-        scale = torch.stack([spacing, spacing, torch.full_like(spacing, BACKGROUND_THICKNESS)], -1)
-        self.register_buffer("floor_scale", scale, persistent=False)
+        d_in = 3 + 6 * _PE_BANDS + z_dim + 2  # PE(anchor), latent, azimuth
+        self.mlp = nn.Sequential(
+            nn.Linear(d_in, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, hidden_dim), nn.ReLU(True)
+        )
+        self.out = nn.Linear(hidden_dim, GAUSSIANS_PER_ANCHOR * _N_OUT)
+        with torch.no_grad():
+            self.out.weight.mul_(0.1)
+            bias = self.out.bias.view(GAUSSIANS_PER_ANCHOR, _N_OUT)
+            bias.zero_()
+            bias[:, 4] = math.log(FLOOR_OPACITY_INIT / (1.0 - FLOOR_OPACITY_INIT))
+            self.out.weight.view(GAUSSIANS_PER_ANCHOR, _N_OUT, -1)[:, 8:].zero_()  # sh1: view-independent at first
+        self.register_buffer("anchors", _anchors(), persistent=False)
+        self.register_buffer("pattern", _cell_pattern(), persistent=False)
+
+    def base_colour(
+        self, attn: torch.Tensor, colours: torch.Tensor, rays: torch.Tensor, origin: torch.Tensor
+    ) -> torch.Tensor:
+        """Background attention (N,), token colours and view-0 ray directions
+        (N, 3), view 0's camera -> (A, 3): attention-weighted colour seen around
+        each anchor; the mean colour counts as one extra token (anchors view 0
+        does not see get the mean)."""
+        mean = (attn[:, None] * colours).sum(0) / attn.sum().clamp_min(1e-6)
+        theta = OBJECT_RADIUS[1] / origin.norm()  # largest object's angle at the centre
+        d_anchor = F.normalize(self.anchors - origin, dim=-1)
+        w = torch.exp(-torch.cdist(d_anchor, F.normalize(rays, dim=-1)).square() / (2 * theta**2))
+        w = w * attn  # (A, N)
+        return (w @ colours + mean) / (w.sum(-1, keepdim=True) + 1.0)
 
     def forward(
-        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame
+        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, rays: torch.Tensor, frame
     ) -> dict[str, torch.Tensor]:
-        """latent (C,), attn (s, s) background attention, colours (3, s, s),
-        view 0's SceneFrame -> Gaussians and "fill" (3,)."""
-        mean = (attn * colours).sum((1, 2)) / attn.sum().clamp_min(1e-6)
+        """latent (C,), background attention (N,), token colours and view-0 ray
+        directions (N, 3), view 0's SceneFrame -> Gaussians."""
+        base = self.base_colour(attn, colours, rays, frame.origin)  # (A, 3)
         yaw = frame.yaw
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
-        scene = torch.cat([latent, azimuth])  # (C + 2,)
-        n = self.floor_mu.shape[0]
-        pe = positional_encoding(self.floor_mu / _HALF, _PE_BANDS)
-        feat = self.appearance(torch.cat([pe, scene.expand(n, -1)], -1))
+        n_anchor = self.anchors.shape[0]
+        pe = positional_encoding(self.anchors / _HALF, _PE_BANDS)
+        feat = self.mlp(torch.cat([pe, torch.cat([latent, azimuth]).expand(n_anchor, -1)], -1))
+        raw = self.out(feat).view(n_anchor, GAUSSIANS_PER_ANCHOR, _N_OUT)
+
+        xy = self.anchors[:, None, :2] + self.pattern + 0.5 * _SPACING * torch.tanh(raw[..., :2])
+        size = _SPACING / math.sqrt(GAUSSIANS_PER_ANCHOR) * torch.exp(2.0 * torch.tanh(raw[..., 2:4]))
+        rgb = torch.sigmoid(torch.logit(base.clamp(0.02, 0.98))[:, None] + raw[..., 5:8])
+        n = n_anchor * GAUSSIANS_PER_ANCHOR
         return {
-            "mu": self.floor_mu,
-            "scale": self.floor_scale,
-            "quat": self.floor_mu.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(n, -1),
-            "opacity": self.head.opacity(feat),
-            **self.head.colour(feat, mean),
-            "fill": self.head.fill(scene, mean),
+            "mu": torch.cat([xy, torch.zeros_like(xy[..., :1])], -1).reshape(n, 3),
+            "scale": torch.cat([size, torch.full_like(size[..., :1], BACKGROUND_THICKNESS)], -1).reshape(n, 3),
+            "quat": xy.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(n, -1),
+            "opacity": torch.sigmoid(raw[..., 4]).reshape(n),
+            "rgb": rgb.reshape(n, 3),
+            "sh1": raw[..., 8:].reshape(n, 3, 3),
         }

@@ -3,7 +3,7 @@
     encode / slot attention   view 0 -> background slot + K-1 object slots
     decode_objects            object slot -> box at its attention anchor ->
                               Gaussians in it
-    decode_background         background slot -> floor discs + fill colour
+    decode_background         background slot -> flat Gaussians on the floor
     render                    all Gaussians blended together (object opacity x
                               draw factor); masks from the same blending
 
@@ -133,13 +133,10 @@ class GSODModel(nn.Module):
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
         """Background slot (C,), attention (s*s,), token colours (s*s, 3) ->
-        world floor discs (N, ...) and "fill" (3,)."""
-        side = self.input_size
-        gaussians = self.bg_decoder(
-            bg_slot, attn.reshape(side, side), colours.T.reshape(3, side, side), frame
-        )
-        fill = gaussians.pop("fill")
-        return {"fill": fill, "gaussians": to_world(gaussians, frame, rotate=False)}
+        world floor Gaussians (N, ...)."""
+        rays = _token_rays(frame, self.input_size, self.image_size, self.focal_ratio)
+        gaussians = self.bg_decoder(bg_slot, attn, colours, rays, frame)
+        return {"gaussians": to_world(gaussians, frame, rotate=False)}
 
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
         """A scene (forward(render=False)) rendered into cam2world (N, 4, 4):
@@ -151,12 +148,11 @@ class GSODModel(nn.Module):
         objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
-        fill = bg["fill"][None, :, None, None]
         out = self.splat(every, *cams)
-        image = out["rgb"] + (1.0 - out["alpha"]) * fill
+        image = out["rgb"]
 
         # Decomposition from the same blending (no gradient): per-slot weights
-        # (0 = floor + fill) and per-object colour contributions.
+        # (0 = floor and uncovered) and per-object colour contributions.
         with torch.no_grad():
             every = {name: value.detach() for name, value in every.items()}
             ids = torch.cat([
@@ -169,8 +165,7 @@ class GSODModel(nn.Module):
             weights = parts[:, : n_obj + 1].clone()
             weights[:, 0] += (1.0 - out["alpha"][:, 0]).detach()
             slot_rgb = parts[:, n_obj + 1 :].unflatten(1, (n_obj, 3))
-            floor_only = self.splat({name: value.detach() for name, value in floor.items()}, *cams)
-            bg_rgb = floor_only["rgb"] + (1.0 - floor_only["alpha"]) * fill.detach()
+            bg_rgb = self.splat({name: value.detach() for name, value in floor.items()}, *cams)["rgb"]
 
         return {
             "rgb": image,  # (N, 3, H, W)
