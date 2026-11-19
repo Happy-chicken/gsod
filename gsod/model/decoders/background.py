@@ -12,10 +12,9 @@ import math
 import torch
 from torch import nn
 
-from gsod.model.decoders.objects import positional_encoding
+from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
 
-FINE_HALF = 1.3  # fine grid: view 0's visible floor disc (R = 1) plus a margin
-_INNER_SIDE = 101  # grid over [-FINE_HALF, FINE_HALF]^2 (fine enough for texture)
+_INNER_SIDE = 101  # grid over the object region (fine enough for texture)
 _OUTER_SIDE = 61  # grid over [-FLOOR_HALF, FLOOR_HALF]^2, outside the region
 FLOOR_HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
@@ -67,15 +66,15 @@ class BackgroundHead(nn.Module):
 
 
 def floor_grid() -> tuple[torch.Tensor, torch.Tensor]:
-    """Disc centres (N, 3) and spacing (N,): fine near view 0's visible disc."""
+    """Disc centres (N, 3) and spacing (N,): fine inside the object region."""
     def grid(half: float, side: int):
         lin = torch.linspace(-half, half, side)
         y, x = torch.meshgrid(lin, lin, indexing="ij")
         return torch.stack([x.flatten(), y.flatten()], -1), 2.0 * half / (side - 1)
 
-    inner, s_in = grid(FINE_HALF, _INNER_SIDE)
+    inner, s_in = grid(OBJECT_REGION, _INNER_SIDE)
     outer, s_out = grid(FLOOR_HALF, _OUTER_SIDE)
-    outer = outer[outer.abs().amax(-1) > FINE_HALF + 0.5 * s_in]
+    outer = outer[outer.abs().amax(-1) > OBJECT_REGION + 0.5 * s_in]
     xy = torch.cat([inner, outer])
     mu = torch.cat([xy, torch.zeros_like(xy[:, :1])], -1)
     spacing = torch.cat([torch.full((len(inner),), s_in), torch.full((len(outer),), s_out)])

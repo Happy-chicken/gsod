@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# Object radius range (units of R), shared by every dataset.
+OBJECT_RADIUS = (0.05, 0.2)
+# Half side of the area objects can be in.
+OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
 # Initial box half sizes x, y, z (only an initial value; no bounds). Boxes
 # rest on the floor: height [0, 2 * e_z].
 EXTENT_INIT = (0.275, 0.275, 0.18)
