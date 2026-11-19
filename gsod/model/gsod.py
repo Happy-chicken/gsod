@@ -9,8 +9,6 @@
     render                    all Gaussians blended together (object opacity x
                               draw factor); masks from the same blending
 
-The first BG_WARMUP_EPOCHS train the background alone (draw factor 0).
-
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
 background.
 """
@@ -38,7 +36,6 @@ _ANCHOR_SHARPNESS = 2.0
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
 # Draw factor: attention area (fraction of tokens) / AREA_FULL, at most 1.
 AREA_FULL = 0.004
-BG_WARMUP_EPOCHS = 3
 
 
 def draw_factor(attn: torch.Tensor) -> torch.Tensor:
@@ -111,7 +108,6 @@ class GSODModel(nn.Module):
         )
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
-        self.objects_on = True
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -121,11 +117,6 @@ class GSODModel(nn.Module):
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
         }
-
-    def anneal(self, step: int, epoch: int) -> None:
-        """Query noise by step; objects off for the first BG_WARMUP_EPOCHS."""
-        self.slot_attention.anneal(step)
-        self.objects_on = epoch >= BG_WARMUP_EPOCHS
 
     # -- stages ---------------------------------------------------------------
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -161,7 +152,7 @@ class GSODModel(nn.Module):
         return {
             "objects": self.decode_objects(slots, attn[1:], colours, frame),
             "background": background,
-            "draw": draw_factor(attn[1:]) * float(self.objects_on),
+            "draw": draw_factor(attn[1:]),
             "attn": attn,
             "slots": slots,
             "frame": frame,
