@@ -5,12 +5,14 @@ the residual MLP, bi-level (only the last iteration is differentiated, straight
 through to the queries). Slot 0 is the background.
 
 From the second iteration, an object slot's keys also get a term of the token
-position relative to that slot's attention peak in the previous iteration
-(after Invariant Slot Attention, translation only, peak rather than mean), so
-a slot can prefer tokens near its own peak and a second peak is suppressed.
-The term starts at 0."""
+position relative to its previous soft peak (after Invariant Slot Attention,
+translation only), gated by its draw factor: a slot that holds an object stays
+local (a second peak is suppressed), an idle slot stays global. The term
+starts at 0."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch import nn
@@ -23,6 +25,16 @@ SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
 DROP_PATH = 0.2
+# Draw factor: attention area (fraction of tokens) / AREA_FULL, at most 1.
+AREA_FULL = 0.004
+# Initial sharpness of the soft peak (learned).
+PEAK_BETA = 8.0
+
+
+def draw_factor(attn: torch.Tensor) -> torch.Tensor:
+    """Object attention (..., K-1, N) -> (..., K-1): never 0, so a slot squeezed
+    out stays visible to the gradient (fainter as its area shrinks)."""
+    return (attn.mean(-1) / AREA_FULL).clamp(max=1.0)
 
 
 def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
@@ -77,6 +89,7 @@ class SlotAttention(nn.Module):
         self.rel_mlp = nn.Sequential(nn.Linear(2, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim))
         nn.init.zeros_(self.rel_mlp[-1].weight)
         nn.init.zeros_(self.rel_mlp[-1].bias)
+        self.log_beta = nn.Parameter(torch.tensor(math.log(PEAK_BETA)))
 
     def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
@@ -109,16 +122,19 @@ class SlotAttention(nn.Module):
         feat = self.norm_feat(feat)
         k, v = self.to_k(feat), self.to_v(feat)
 
-        attn, peak = None, None
+        attn = None
         for i in range(self.iters):
             if i == self.iters - 1:  # bi-level
                 slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
             dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
-            if peak is None:
+            if attn is None:
                 dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
-            else:  # keys relative to each slot's previous peak
-                k_fg = k[:, None] + self.rel_mlp(xy - peak[:, :, None])  # (b, K-1, N, D)
+            else:  # keys relative to each slot's previous soft peak, gated by its area
+                prev = attn[:, 1:]
+                peak = (self.log_beta.exp() * prev.clamp_min(1e-8).log()).softmax(-1) @ xy  # (b, K-1, 2)
+                rel = self.rel_mlp(xy - peak[:, :, None]) * draw_factor(prev)[..., None, None]
+                k_fg = k[:, None] + rel  # (b, K-1, N, D)
                 dots_fg = torch.einsum("bkd,bknd->bkn", self.to_q(slot_fg), k_fg) * self.scale
             attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)  # (b, K, N)
             attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
@@ -126,6 +142,5 @@ class SlotAttention(nn.Module):
             updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
             slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
             slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
-            peak = xy[attn[:, 1:].argmax(-1)]  # (b, K-1, 2), no gradient
 
         return slot_bg[:, 0], slot_fg, attn

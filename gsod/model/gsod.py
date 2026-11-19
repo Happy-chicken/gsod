@@ -20,7 +20,7 @@ from torch import nn
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
-from gsod.model.slot_attention import SlotAttention
+from gsod.model.slot_attention import SlotAttention, draw_factor
 from gsod.utils.geometry import (
     SceneFrame,
     camera_directions,
@@ -32,14 +32,6 @@ from gsod.utils.splatter import GsplatSplatter
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 _ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
-# Draw factor: attention area (fraction of tokens) / AREA_FULL, at most 1.
-AREA_FULL = 0.004
-
-
-def draw_factor(attn: torch.Tensor) -> torch.Tensor:
-    """Object attention (K-1, N) -> (K-1,): never 0, so a slot squeezed out
-    stays visible to the gradient (fainter as its area shrinks)."""
-    return (attn.mean(-1) / AREA_FULL).clamp(max=1.0)
 
 
 def _token_rays(
