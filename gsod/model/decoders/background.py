@@ -19,7 +19,7 @@ from torch import nn
 from gsod.model.decoders.objects import OBJECT_RADIUS, positional_encoding
 
 ANCHOR_SIDE = 10
-GAUSSIANS_PER_ANCHOR = 32
+GAUSSIANS_PER_ANCHOR = 64
 _HALF = 3.0  # past view 0's camera
 _SPACING = 2.0 * _HALF / ANCHOR_SIDE
 _PE_BANDS = 8
