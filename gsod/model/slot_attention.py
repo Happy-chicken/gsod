@@ -2,7 +2,13 @@
 rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
 per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
 the residual MLP, bi-level (only the last iteration is differentiated, straight
-through to the queries). Slot 0 is the background."""
+through to the queries). Slot 0 is the background.
+
+From the second iteration, an object slot's keys also get a term of the token
+position relative to that slot's attention peak in the previous iteration
+(after Invariant Slot Attention, translation only, peak rather than mean), so
+a slot can prefer tokens near its own peak and a second peak is suppressed.
+The term starts at 0."""
 
 from __future__ import annotations
 
@@ -68,6 +74,9 @@ class SlotAttention(nn.Module):
         self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
         self.to_res = _mlp(slot_dim, hidden_dim, slot_dim)
         self.to_res_bg = _mlp(slot_dim, hidden_dim, slot_dim)
+        self.rel_mlp = nn.Sequential(nn.Linear(2, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim))
+        nn.init.zeros_(self.rel_mlp[-1].weight)
+        nn.init.zeros_(self.rel_mlp[-1].bias)
 
     def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
@@ -94,22 +103,29 @@ class SlotAttention(nn.Module):
             start = start + torch.randn_like(start) * self.sigma * start.detach()
         slot_bg, slot_fg = start[:, :1], start[:, 1:]
 
-        feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
+        grid = self._grid(feat.shape[1], feat.device)
+        xy = grid[0, :, :2]  # (N, 2)
+        feat = self.feat_mlp(feat + self.pos_proj(grid))
         feat = self.norm_feat(feat)
         k, v = self.to_k(feat), self.to_v(feat)
 
-        attn = None
+        attn, peak = None, None
         for i in range(self.iters):
             if i == self.iters - 1:  # bi-level
                 slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
             dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
-            dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
+            if peak is None:
+                dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
+            else:  # keys relative to each slot's previous peak
+                k_fg = k[:, None] + self.rel_mlp(xy - peak[:, :, None])  # (b, K-1, N, D)
+                dots_fg = torch.einsum("bkd,bknd->bkn", self.to_q(slot_fg), k_fg) * self.scale
             attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)  # (b, K, N)
             attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
             updates = torch.einsum("bij,bjd->bid", attn_wm, v)
             updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
             slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
             slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
+            peak = xy[attn[:, 1:].argmax(-1)]  # (b, K-1, 2), no gradient
 
         return slot_bg[:, 0], slot_fg, attn
