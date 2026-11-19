@@ -14,13 +14,8 @@ from torch import nn
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
 OBJECT_REGION = 1.0 + 1.5 * OBJECT_RADIUS[1]
-# Initial box half sizes x, y, z (only an initial value; no bounds). Boxes
-# rest on the floor: height [0, 2 * e_z].
-EXTENT_INIT = (0.275, 0.275, 0.18)
-# Initial height of the plane the anchors' rays are cut at (learned).
-ANCHOR_HEIGHT_INIT = 0.1
-# Box shift along view 0's ray: at most this fraction of the camera distance.
-ALONG_RAY = 0.5
+# Initial box half sizes x, y, z (only an initial value; no bounds).
+EXTENT_INIT = (0.275, 0.275, 0.24)
 # Height of boxes and Gaussians above the floor.
 MIN_HEIGHT = 0.01
 # Initial Gaussian scale, as a fraction of its box's half sizes.
@@ -41,13 +36,14 @@ def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
 
 
 class RegionHead(nn.Module):
-    """Slot latent -> box half sizes softplus(.) (no bounds) and a shift of the
-    anchor along view 0's ray (up to ALONG_RAY of the camera distance) and
-    across it (up to the box's half size); the box rests on the floor."""
+    """Slot latent -> box shift (along / across view 0's ray) and half sizes
+    softplus(.) (no bounds)."""
 
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
+        r_max = OBJECT_RADIUS[1]
         self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
+        self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
         with torch.no_grad():
             self.mlp[-1].weight.zero_()
             self.mlp[-1].bias.zero_()
@@ -55,17 +51,16 @@ class RegionHead(nn.Module):
                 self.mlp[-1].bias[2 + i] = math.log(math.expm1(size))
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, view: torch.Tensor
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, view = anchor - camera (K, 3) -> centre, half sizes (K, 3)."""
+        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
         raw = self.mlp(slots)
-        extent = F.softplus(raw[:, 2:])
-        ray_xy = F.normalize(view[:, :2], dim=-1)
+        ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
-        along = ALONG_RAY * view[:, :2].norm(dim=-1, keepdim=True) * torch.tanh(raw[:, :1])
-        side = extent[:, :2].mean(-1, keepdim=True) * torch.tanh(raw[:, 1:2])
-        xy = anchor[:, :2] + along * ray_xy + side * across
-        return torch.cat([xy, extent[:, 2:]], -1), extent
+        t = self.shift_bound * torch.tanh(raw[:, :2])
+        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
+        extent = F.softplus(raw[:, 2:])
+        return torch.cat([xy, anchor[:, 2:]], -1), extent
 
 
 class ObjectHead(nn.Module):
@@ -155,18 +150,13 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
-        self.anchor_height_raw = nn.Parameter(torch.tensor(math.log(math.expm1(ANCHOR_HEIGHT_INIT))))
-
-    def anchor_height(self) -> torch.Tensor:
-        """Height (> 0) of the plane the anchors' token rays are cut at."""
-        return F.softplus(self.anchor_height_raw)
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, view: torch.Tensor, colour: torch.Tensor
+        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """slots (K, C); anchor, view = anchor - camera, colour (K, 3) -> Gaussians (K, G, ...), half sizes."""
+        """slots (K, C); anchor, ray, colour (K, 3) -> Gaussians (K, G, ...), half sizes."""
         K = slots.shape[0]
-        centre, extent = self.region(slots, anchor, view)
+        centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
         v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))

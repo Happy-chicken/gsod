@@ -15,8 +15,8 @@ from torch import nn
 from gsod.model.decoders.objects import OBJECT_REGION, positional_encoding
 
 _INNER_SIDE = 101  # grid over the object region (fine enough for texture)
-_OUTER_SIDE = 61  # grid over [-FLOOR_HALF, FLOOR_HALF]^2, outside the region
-FLOOR_HALF = 3.0  # past view 0's camera
+_OUTER_SIDE = 61  # grid over [-_HALF, _HALF]^2, outside the region
+_HALF = 3.0  # past view 0's camera
 _PE_BANDS = 8
 BACKGROUND_THICKNESS = 0.005
 FLOOR_OPACITY_INIT = 0.95
@@ -73,7 +73,7 @@ def floor_grid() -> tuple[torch.Tensor, torch.Tensor]:
         return torch.stack([x.flatten(), y.flatten()], -1), 2.0 * half / (side - 1)
 
     inner, s_in = grid(OBJECT_REGION, _INNER_SIDE)
-    outer, s_out = grid(FLOOR_HALF, _OUTER_SIDE)
+    outer, s_out = grid(_HALF, _OUTER_SIDE)
     outer = outer[outer.abs().amax(-1) > OBJECT_REGION + 0.5 * s_in]
     xy = torch.cat([inner, outer])
     mu = torch.cat([xy, torch.zeros_like(xy[:, :1])], -1)
@@ -104,7 +104,7 @@ class BackgroundDecoder(nn.Module):
         azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
         scene = torch.cat([latent, azimuth])  # (C + 2,)
         n = self.floor_mu.shape[0]
-        pe = positional_encoding(self.floor_mu / FLOOR_HALF, _PE_BANDS)
+        pe = positional_encoding(self.floor_mu / _HALF, _PE_BANDS)
         feat = self.appearance(torch.cat([pe, scene.expand(n, -1)], -1))
         return {
             "mu": self.floor_mu,

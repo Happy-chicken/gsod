@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
-from gsod.model.decoders.background import FLOOR_HALF
+from gsod.model.decoders.objects import OBJECT_RADIUS, OBJECT_REGION
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import (
@@ -31,6 +31,7 @@ from gsod.utils.splatter import GsplatSplatter
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
+_ANCHOR_HEIGHT = 0.5 * (OBJECT_RADIUS[0] + OBJECT_RADIUS[1])
 # Draw factor: attention area (fraction of tokens) / AREA_FULL, at most 1.
 AREA_FULL = 0.004
 
@@ -53,24 +54,19 @@ def _token_rays(
     return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.T
 
 
-def _at_height(frame: SceneFrame, directions: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
     """Where the rays reach height z (N, 2); rays not going down stay at the camera."""
     t = ((z - frame.origin[2]) / directions[:, 2].clamp(max=-1e-6)).clamp(min=0.0)
     return frame.origin[:2] + t[:, None] * directions[:, :2]
 
 
 def token_points(
-    frame: SceneFrame,
-    side: int,
-    image_size: tuple[int, int],
-    focal_ratio: tuple[float, float],
-    height: torch.Tensor,
+    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
-    """(side*side, 3): each token's view-0 ray at the (learned) anchor height,
-    kept on the floor area."""
-    xy = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), height)
-    xy = xy.clamp(-FLOOR_HALF, FLOOR_HALF)
-    return torch.cat([xy, height.expand(xy.shape[0], 1)], -1)
+    """(side*side, 3): each token's view-0 ray at mid object height."""
+    xy = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), _ANCHOR_HEIGHT)
+    xy = xy.clamp(-OBJECT_REGION, OBJECT_REGION)
+    return torch.cat([xy, torch.full_like(xy[:, :1], _ANCHOR_HEIGHT)], -1)
 
 
 def attention_anchors(
@@ -135,10 +131,10 @@ class GSODModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """slots (K-1, C), their attention (K-1, s*s), token colours (s*s, 3) -> Gaussians, extent."""
         side = self.input_size
-        height = self.obj_decoder.anchor_height()
-        points = token_points(frame, side, self.image_size, self.focal_ratio, height)
+        points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
-        gaussians, extent = self.obj_decoder(slots, anchor, anchor - frame.origin, colour)
+        ray = F.normalize(anchor - frame.origin, dim=-1)
+        gaussians, extent = self.obj_decoder(slots, anchor, ray, colour)
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
