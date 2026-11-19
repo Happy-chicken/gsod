@@ -1,11 +1,10 @@
 """Background decoder: background slot -> flat Gaussians on the floor.
 
 A 10 x 10 grid of anchors over [-_HALF, _HALF]^2, each with GAUSSIANS_PER_ANCHOR
-flat Gaussians (z = 0). An anchor's base colour is view 0's colour around it,
-weighted by the shape of background attention (a / mean a) over a window as wide
-as the largest object (an object covered by the background is smeared, not
-copied). This is the only scene-specific colour: MLP(PE(anchor), view-0 azimuth)
-adds per-Gaussian offsets, sizes, opacity and colour residuals. World-aligned.
+flat Gaussians (z = 0); walls are drawn on the far floor. Colour = the
+background's mean view-0 colour + MLP(PE(anchor), latent, view-0 azimuth)
+residual, which also gives per-Gaussian offsets, sizes and opacity. Nothing is
+read per pixel, so the background cannot copy an object. World-aligned.
 """
 
 from __future__ import annotations
@@ -13,10 +12,9 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from gsod.model.decoders.objects import OBJECT_RADIUS, positional_encoding
+from gsod.model.decoders.objects import positional_encoding
 
 ANCHOR_SIDE = 10
 GAUSSIANS_PER_ANCHOR = 64
@@ -47,9 +45,9 @@ def _cell_pattern() -> torch.Tensor:
 class BackgroundDecoder(nn.Module):
     """Background slot -> flat floor Gaussians."""
 
-    def __init__(self, hidden_dim: int):
+    def __init__(self, z_dim: int, hidden_dim: int):
         super().__init__()
-        d_in = 3 + 6 * _PE_BANDS + 2  # PE(anchor), azimuth
+        d_in = 3 + 6 * _PE_BANDS + z_dim + 2  # PE(anchor), latent, azimuth
         self.mlp = nn.Sequential(
             nn.Linear(d_in, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, hidden_dim), nn.ReLU(True)
         )
@@ -63,37 +61,22 @@ class BackgroundDecoder(nn.Module):
         self.register_buffer("anchors", _anchors(), persistent=False)
         self.register_buffer("pattern", _cell_pattern(), persistent=False)
 
-    def base_colour(
-        self, attn: torch.Tensor, colours: torch.Tensor, rays: torch.Tensor, origin: torch.Tensor
-    ) -> torch.Tensor:
-        """Background attention (N,), token colours and view-0 ray directions
-        (N, 3), view 0's camera -> (A, 3): attention-weighted colour seen around
-        each anchor; the mean colour counts as one extra token (anchors view 0
-        does not see get the mean). Only the attention's shape matters."""
-        attn = attn / attn.mean().clamp_min(1e-12)
-        mean = (attn[:, None] * colours).sum(0) / attn.sum()
-        theta = OBJECT_RADIUS[1] / origin.norm()  # largest object's angle at the centre
-        d_anchor = F.normalize(self.anchors - origin, dim=-1)
-        w = torch.exp(-torch.cdist(d_anchor, F.normalize(rays, dim=-1)).square() / (2 * theta**2))
-        w = w * attn  # (A, N)
-        return (w @ colours + mean) / (w.sum(-1, keepdim=True) + 1.0)
-
     def forward(
-        self, attn: torch.Tensor, colours: torch.Tensor, rays: torch.Tensor, frame
+        self, latent: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame
     ) -> dict[str, torch.Tensor]:
-        """Background attention (N,), token colours and view-0 ray directions
-        (N, 3), view 0's SceneFrame -> Gaussians."""
-        base = self.base_colour(attn, colours, rays, frame.origin)  # (A, 3)
+        """latent (C,), background attention (N,), token colours (N, 3), view 0's
+        SceneFrame -> Gaussians."""
+        mean = (attn[:, None] * colours).sum(0) / attn.sum().clamp_min(1e-6)
         yaw = frame.yaw
-        azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(base.dtype)
+        azimuth = torch.stack([torch.cos(yaw), torch.sin(yaw)]).to(latent.dtype)
         n_anchor = self.anchors.shape[0]
         pe = positional_encoding(self.anchors / _HALF, _PE_BANDS)
-        feat = self.mlp(torch.cat([pe, azimuth.expand(n_anchor, -1)], -1))
+        feat = self.mlp(torch.cat([pe, torch.cat([latent, azimuth]).expand(n_anchor, -1)], -1))
         raw = self.out(feat).view(n_anchor, GAUSSIANS_PER_ANCHOR, _N_OUT)
 
         xy = self.anchors[:, None, :2] + self.pattern + 0.5 * _SPACING * torch.tanh(raw[..., :2])
         size = _SPACING / math.sqrt(GAUSSIANS_PER_ANCHOR) * torch.exp(2.0 * torch.tanh(raw[..., 2:4]))
-        rgb = torch.sigmoid(torch.logit(base.clamp(0.02, 0.98))[:, None] + raw[..., 5:8])
+        rgb = torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + raw[..., 5:8])
         n = n_anchor * GAUSSIANS_PER_ANCHOR
         return {
             "mu": torch.cat([xy, torch.zeros_like(xy[..., :1])], -1).reshape(n, 3),
