@@ -3,7 +3,7 @@
     encode / slot attention   view 0 -> background slot + K-1 object slots
     decode_objects            object slot -> box at its attention anchor ->
                               Gaussians in it
-    decode_background         background slot -> flat Gaussians on the floor
+    decode_background         background attention -> flat Gaussians on the floor
     render                    all Gaussians blended together (object opacity x
                               draw factor); masks from the same blending
 
@@ -105,7 +105,7 @@ class GSODModel(nn.Module):
             num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
         )
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
-        self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
+        self.bg_decoder = BackgroundDecoder(decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -138,12 +138,12 @@ class GSODModel(nn.Module):
         return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
-        self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
-        """Background slot (C,), attention (s*s,), token colours (s*s, 3) ->
-        world floor Gaussians (N, ...)."""
+        """Background attention (s*s,), token colours (s*s, 3) -> world floor
+        Gaussians (N, ...)."""
         rays = _token_rays(frame, self.input_size, self.image_size, self.focal_ratio)
-        gaussians = self.bg_decoder(bg_slot, attn, colours, rays, frame)
+        gaussians = self.bg_decoder(attn, colours, rays, frame)
         return {"gaussians": to_world(gaussians, frame, rotate=False)}
 
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -192,11 +192,11 @@ class GSODModel(nn.Module):
         outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
-        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
+        _, slots, attn = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         scene = {
             "objects": self.decode_objects(slots, attn[1:], colours, frame),
-            "background": self.decode_background(bg_slot, attn[0], colours, frame),
+            "background": self.decode_background(attn[0], colours, frame),
             "draw": draw_factor(attn[1:]),
             "attn": attn,
             "slots": slots,
