@@ -35,6 +35,11 @@ def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
     return x * keep / (1.0 - DROP_PATH)
 
 
+def _mlp(d_in: int, hidden: int, d_out: int) -> nn.Sequential:
+    """Pre-LayerNorm two-layer MLP: LayerNorm -> Linear -> ReLU -> Linear."""
+    return nn.Sequential(nn.LayerNorm(d_in), nn.Linear(d_in, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, d_out))
+
+
 class SlotAttention(nn.Module):
     """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
 
@@ -66,26 +71,18 @@ class SlotAttention(nn.Module):
         self.pos_init = nn.Parameter(grid.clone())
 
         hidden_dim = max(slot_dim, hidden_dim)
-        self.feat_mlp = nn.Sequential(
-            nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
-        )
+        self.feat_mlp = _mlp(in_dim, hidden_dim, slot_dim)
         self.norm_feat = nn.LayerNorm(slot_dim)
         self.to_k = nn.Linear(slot_dim, slot_dim, bias=False)
         self.to_v = nn.Linear(slot_dim, slot_dim, bias=False)
         self.grid_proj = nn.Linear(2, slot_dim)
-        self.grid_enc = nn.Sequential(
-            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
-        )
+        self.grid_enc = _mlp(slot_dim, hidden_dim, slot_dim)
         self.to_q = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.to_q_bg = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.gru = nn.GRUCell(slot_dim, slot_dim)
         self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
-        self.to_res = nn.Sequential(
-            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
-        )
-        self.to_res_bg = nn.Sequential(
-            nn.LayerNorm(slot_dim), nn.Linear(slot_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
-        )
+        self.to_res = _mlp(slot_dim, hidden_dim, slot_dim)
+        self.to_res_bg = _mlp(slot_dim, hidden_dim, slot_dim)
 
     def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
