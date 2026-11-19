@@ -2,11 +2,19 @@
 rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
 per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
 the residual MLP, bi-level (only the last iteration is differentiated, straight
-through to the queries). Slot 0 is the background."""
+through to the initial state). Slot 0 is the background.
+
+Object slots carry a position mu and scale sigma (attention mean / std, as in
+Invariant Slot Attention) and see token positions relative to them,
+(x - mu) / sigma, so a slot prefers tokens near its own centre; the background
+sees absolute positions."""
 
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
 
@@ -50,9 +58,17 @@ class SlotAttention(nn.Module):
 
         self.slots_init = nn.Embedding(num_slots, slot_dim)
         init.xavier_uniform_(self.slots_init.weight)
+        # Object slots' initial positions (spread on a grid) and scales (0.5).
+        n_obj = num_slots - 1
+        side = math.ceil(math.sqrt(n_obj))
+        lin = (torch.arange(side) + 0.5) / side
+        grid = torch.stack(torch.meshgrid(lin, lin, indexing="xy"), -1).reshape(-1, 2)[:n_obj]
+        self.pos_init = nn.Parameter(grid.clone())
+        self.scale_init = nn.Parameter(torch.full((n_obj, 2), math.log(math.expm1(0.5))))
 
         hidden_dim = max(slot_dim, hidden_dim)
         self.pos_proj = nn.Linear(4, in_dim)
+        self.pos_proj_rel = nn.Linear(2, in_dim)
         self.feat_mlp = nn.Sequential(
             nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True), nn.Linear(hidden_dim, slot_dim)
         )
@@ -88,29 +104,47 @@ class SlotAttention(nn.Module):
         """Cosine-anneal the noise sigma."""
         self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
 
+    def _tokens(self, feat: torch.Tensor, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokens (..., N, C) with a position embedding (..., N, C) -> keys, values."""
+        x = self.norm_feat(self.feat_mlp(feat + pos))
+        return self.to_k(x), self.to_v(x)
+
     def forward(self, feat: torch.Tensor):
-        b = feat.shape[0]
+        b, n = feat.shape[:2]
         start = self.slots_init.weight.expand(b, -1, -1)
         if self.training and self.sigma > 0:
             start = start + torch.randn_like(start) * self.sigma * start.detach()
         slot_bg, slot_fg = start[:, :1], start[:, 1:]
+        mu0 = self.pos_init.expand(b, -1, -1)  # (b, K-1, 2)
+        sigma0 = F.softplus(self.scale_init).expand(b, -1, -1)
+        mu, sigma = mu0, sigma0
 
-        feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
-        feat = self.norm_feat(feat)
-        k, v = self.to_k(feat), self.to_v(feat)
+        grid = self._grid(n, feat.device)
+        xy = grid[0, :, :2]  # (N, 2)
+        k_bg, v_bg = self._tokens(feat, self.pos_proj(grid))  # absolute
+        floor = 1.0 / math.isqrt(n)  # one token
 
         attn = None
         for i in range(self.iters):
             if i == self.iters - 1:  # bi-level
                 slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
-            dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
-            dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k) * self.scale
+                mu = mu.detach() + mu0 - mu0.detach()
+                sigma = sigma.detach() + sigma0 - sigma0.detach()
+            rel = (xy - mu[:, :, None]) / sigma[:, :, None]  # (b, K-1, N, 2)
+            k_fg, v_fg = self._tokens(feat[:, None], self.pos_proj_rel(rel))  # (b, K-1, N, D)
+            dots_bg = torch.einsum("bkd,bnd->bkn", self.to_q_bg(slot_bg), k_bg) * self.scale
+            dots_fg = torch.einsum("bkd,bknd->bkn", self.to_q(slot_fg), k_fg) * self.scale
             attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)  # (b, K, N)
             attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
-            updates = torch.einsum("bij,bjd->bid", attn_wm, v)
-            updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
+            updates_bg = torch.einsum("bkn,bnd->bkd", attn_wm[:, :1], v_bg)
+            updates_fg = torch.einsum("bkn,bknd->bkd", attn_wm[:, 1:], v_fg)
             slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
             slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
+            # Positions and scales: the object attention's mean and std.
+            w = attn[:, 1:] / attn[:, 1:].sum(-1, keepdim=True)
+            mu = torch.einsum("bkn,nc->bkc", w, xy)
+            var = torch.einsum("bkn,bknc->bkc", w, (xy - mu[:, :, None]) ** 2)
+            sigma = var.clamp_min(0.0).sqrt() + floor
 
         return slot_bg[:, 0], slot_fg, attn
