@@ -5,11 +5,7 @@
                               Gaussians in it
     decode_background         background slot -> floor discs + fill colour
     render                    all Gaussians blended together (object opacity x
-                              draw factor); masks from the same blending; in
-                              view 0 an object Gaussian's opacity is formally
-                              x its slot's attention where it projects (value
-                              1, so the render is unchanged): rendering errors
-                              reach the attention token by token
+                              draw factor); masks from the same blending
 
 Decoders work in view 0's scene frame (utils/geometry.py). Slot 0 is the
 background.
@@ -82,23 +78,6 @@ def attention_anchors(
     return p @ points, p @ colours
 
 
-def attention_logit(
-    points: torch.Tensor, attn: torch.Tensor, frame: SceneFrame, focal_ratio: tuple[float, float]
-) -> torch.Tensor:
-    """Scene-frame points (K, G, 3), attention (K, s*s) -> log of each slot's
-    attention where its points project in view 0 (K, G); 0 behind the camera."""
-    k, n = attn.shape
-    side = int(round(n**0.5))
-    cam = (points - frame.origin) @ frame.rot
-    front = cam[..., 2] > 1e-3
-    z = torch.where(front, cam[..., 2], torch.ones_like(cam[..., 2]))
-    # grid_sample coordinates (align_corners=False): pixel centres at integers.
-    grid = torch.stack([2.0 * focal_ratio[0] * cam[..., 0] / z, 2.0 * focal_ratio[1] * cam[..., 1] / z], -1)
-    maps = attn.clamp_min(1e-8).log().reshape(k, 1, side, side)
-    logit = F.grid_sample(maps, grid[:, :, None], mode="bilinear", padding_mode="border", align_corners=False)
-    return torch.where(front, logit[:, 0, :, 0], torch.zeros_like(z))
-
-
 class GSODModel(nn.Module):
     def __init__(
         self,
@@ -156,11 +135,7 @@ class GSODModel(nn.Module):
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin, dim=-1)
         gaussians, extent = self.obj_decoder(slots, anchor, ray, colour)
-        return {
-            "gaussians": to_world(gaussians, frame),
-            "attn_logit": attention_logit(gaussians["mu"], attn, frame, self.focal_ratio),  # (K-1, G)
-            "extent": extent,
-        }
+        return {"gaussians": to_world(gaussians, frame), "extent": extent}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -185,13 +160,7 @@ class GSODModel(nn.Module):
         every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         fill = bg["fill"][None, :, None, None]
-        # View 0: opacity x exp(l - l.detach()) (= 1): gradient to the attention per token.
-        logit = scene["objects"]["attn_logit"].flatten()
-        own = torch.cat([objects["opacity"] * torch.exp(logit - logit.detach()), floor["opacity"]])
-        out = self.splat({**every, "opacity": own}, cam2world[:1], *cams[1:])
-        if cam2world.shape[0] > 1:
-            rest = self.splat(every, cam2world[1:], *cams[1:])
-            out = {name: torch.cat([out[name], rest[name]]) for name in out}
+        out = self.splat(every, *cams)
         image = out["rgb"] + (1.0 - out["alpha"]) * fill
 
         # Decomposition from the same blending (no gradient): per-slot weights
