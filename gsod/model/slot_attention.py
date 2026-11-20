@@ -4,9 +4,9 @@ per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
 the residual MLP, bi-level (only the last iteration is differentiated, straight
 through to the queries). Slot 0 is the background.
 
-Then one more object-slot update, whose attention is returned: the anchors and
-draw factor use it, so their gradient reaches the last slot update (bi-level
-alone would stop it). Its object keys get a learned bias b."""
+refine(): one more object-slot update whose keys also see a per-token residual
+(what the current slots leave unexplained), so an idle slot can be drawn to a
+missed object (after MONet / IODINE). Starts as a plain iteration."""
 
 from __future__ import annotations
 
@@ -72,7 +72,9 @@ class SlotAttention(nn.Module):
         self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
         self.to_res = _mlp(slot_dim, hidden_dim, slot_dim)
         self.to_res_bg = _mlp(slot_dim, hidden_dim, slot_dim)
-        self.fg_bias = nn.Parameter(torch.zeros(slot_dim))
+        self.res_proj = nn.Linear(1, slot_dim)
+        nn.init.zeros_(self.res_proj.weight)
+        nn.init.zeros_(self.res_proj.bias)
 
     def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
@@ -106,6 +108,13 @@ class SlotAttention(nn.Module):
         attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
         return attn, torch.einsum("bij,bjd->bid", attn_wm, v)
 
+    def refine(self, feat, slot_bg, slot_fg, residual):
+        """Tokens (b, N, C), slots from forward, residual (b, N) -> object
+        slots and attention after one residual-aware update."""
+        k, v = self._keys_values(feat)
+        attn, updates = self._attend(slot_bg[:, None], slot_fg, k, v, k + self.res_proj(residual[..., None]))
+        return self._update(self.gru, self.to_res, updates[:, 1:], slot_fg), attn
+
     def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
         start = self.slots_init.weight.expand(b, -1, -1)
@@ -115,16 +124,14 @@ class SlotAttention(nn.Module):
 
         k, v = self._keys_values(feat)
 
+        attn = None
         for i in range(self.iters):
             if i == self.iters - 1:  # bi-level
                 slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
-            _, updates = self._attend(slot_bg, slot_fg, k, v, k)
+            attn, updates = self._attend(slot_bg, slot_fg, k, v, k)  # (b, K, N)
             updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
             slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
             slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
 
-        # One more object-slot update (object keys + b); its attention is returned.
-        attn, updates = self._attend(slot_bg, slot_fg, k, v, k + self.fg_bias)  # (b, K, N)
-        slot_fg = self._update(self.gru, self.to_res, updates[:, 1:], slot_fg)
         return slot_bg[:, 0], slot_fg, attn
