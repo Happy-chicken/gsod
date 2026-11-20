@@ -116,17 +116,14 @@ class SlotAttention(nn.Module):
 
         k, v = self._keys_values(feat)
 
-        # Attention path: every iteration differentiated.
-        for _ in range(self.iters - 1):
-            _, updates = self._attend(slot_bg, slot_fg, k, v)
-            slot_bg = self._update(self.gru_bg, self.to_res_bg, updates[:, :1], slot_bg)
-            slot_fg = self._update(self.gru, self.to_res, updates[:, 1:], slot_fg)
-        attn, _ = self._attend(slot_bg, slot_fg, k, v)  # (b, K, N)
+        for i in range(self.iters):
+            attn, updates = self._attend(slot_bg, slot_fg, k, v)  # (b, K, N), every iteration differentiated
+            if i == self.iters - 1:  # bi-level for the slots: the last update only
+                slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
+                slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
+                _, updates = self._attend(slot_bg, slot_fg, k, v)
+            updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
+            slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
+            slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
 
-        # Slot path: bi-level, the last update only (same values).
-        slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
-        slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
-        _, updates = self._attend(slot_bg, slot_fg, k, v)
-        slot_bg = self._update(self.gru_bg, self.to_res_bg, updates[:, :1], slot_bg)
-        slot_fg = self._update(self.gru, self.to_res, updates[:, 1:], slot_fg)
         return slot_bg[:, 0], slot_fg, attn
