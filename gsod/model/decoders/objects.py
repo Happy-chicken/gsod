@@ -158,15 +158,6 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
-        # Slot -> where it is in view 0 (u, v in [0, 1]); the image centre at first.
-        self.locate = nn.Sequential(nn.Linear(z_dim, d), nn.ReLU(True), nn.Linear(d, 2))
-        with torch.no_grad():
-            self.locate[-1].weight.mul_(0.1)
-            self.locate[-1].bias.zero_()
-
-    def locate_uv(self, slots: torch.Tensor) -> torch.Tensor:
-        """slots (K, C) -> (K, 2) view-0 position, u, v in [0, 1]."""
-        return torch.sigmoid(self.locate(slots))
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor, colour: torch.Tensor
