@@ -4,8 +4,6 @@
     decode_objects            object slot -> box at its attention anchor ->
                               Gaussians in it
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    view 0 rendered, its per-token residual -> one more
-                              object-slot update, objects decoded again
     render                    all Gaussians blended together (object opacity x
                               draw factor); masks from the same blending
 
@@ -147,31 +145,14 @@ class GSODModel(nn.Module):
         gaussians = self.bg_decoder(bg_slot, attn, colours, frame)
         return {"gaussians": to_world(gaussians, frame, rotate=False)}
 
-    def scene(self, slots, attn, background, colours, frame) -> dict:
-        """Object slots (K-1, C), attention (K, s*s), decoded background -> scene."""
-        return {
-            "objects": self.decode_objects(slots, attn[1:], colours, frame),
-            "background": background,
-            "draw": draw_factor(attn[1:]),
-            "attn": attn,
-            "slots": slots,
-            "frame": frame,
-        }
-
-    @staticmethod
-    def gaussians(scene: dict) -> dict[str, torch.Tensor]:
-        """Every Gaussian of a scene, objects (opacity x draw factor) first."""
-        obj, floor, draw = scene["objects"]["gaussians"], scene["background"]["gaussians"], scene["draw"]
-        objects = {name: value.flatten(0, 1) for name, value in obj.items()}
-        objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
-        return {name: torch.cat([objects[name], floor[name]]) for name in objects}
-
     def render(self, scene: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
         """A scene (forward(render=False)) rendered into cam2world (N, 4, 4):
         every Gaussian, object or floor, sorted and blended together."""
         obj, floor, draw = scene["objects"]["gaussians"], scene["background"]["gaussians"], scene["draw"]
         n_obj, n_gauss = obj["mu"].shape[:2]
-        every = self.gaussians(scene)
+        objects = {name: value.flatten(0, 1) for name, value in obj.items()}
+        objects["opacity"] = (obj["opacity"] * draw[:, None]).flatten()
+        every = {name: torch.cat([objects[name], floor[name]]) for name in objects}
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         out = self.splat(every, *cams)
         image = out["rgb"]
@@ -209,15 +190,14 @@ class GSODModel(nn.Module):
         outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
-        bg_slot, slots, attn = self.slot_attention(tokens)
+        bg_slot, slots, attn = (x[0] for x in self.slot_attention(tokens))
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
-        background = self.decode_background(bg_slot[0], attn[0, 0], colours, frame)
-        scene = self.scene(slots[0], attn[0], background, colours, frame)
-
-        # What view 0 still leaves unexplained, per token (an input, no gradient).
-        view0 = self.splat(self.gaussians(scene), cam2world[:1], self.image_size, self.focal_ratio, self.near)
-        residual = (images[:1] - view0["rgb"]).abs().mean(1, keepdim=True)
-        residual = F.interpolate(residual, size=self.input_size, mode="area").flatten(1).detach()
-        slots, attn = self.slot_attention.refine(tokens, bg_slot, slots, residual)
-        scene = self.scene(slots[0], attn[0], background, colours, frame)
+        scene = {
+            "objects": self.decode_objects(slots, attn[1:], colours, frame),
+            "background": self.decode_background(bg_slot, attn[0], colours, frame),
+            "draw": draw_factor(attn[1:]),
+            "attn": attn,
+            "slots": slots,
+            "frame": frame,
+        }
         return self.render(scene, cam2world) if render else scene
