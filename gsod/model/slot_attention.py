@@ -1,13 +1,12 @@
 """Slot attention: background as in uORF (own query, GRU, residual MLP); the
 rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
 per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
-the residual MLP. Slot 0 is the background; object keys get a learned bias.
+the residual MLP, bi-level (only the last iteration is differentiated, straight
+through to the queries). Slot 0 is the background.
 
-Split truncation: the returned attention (anchors, draw factor) is
-differentiated through every iteration, so the slot updates learn where slots
-go; the returned slots (what the decoders read) are bi-level as in BO-QSA (only
-the last update is differentiated, straight through to the queries). Both have
-the same values."""
+Then one more object-slot update, whose attention is returned: the anchors and
+draw factor use it, so their gradient reaches the last slot update (bi-level
+alone would stop it). Its object keys get a learned bias b."""
 
 from __future__ import annotations
 
@@ -99,10 +98,10 @@ class SlotAttention(nn.Module):
         feat = self.norm_feat(feat)
         return self.to_k(feat), self.to_v(feat)
 
-    def _attend(self, slot_bg, slot_fg, k, v):
+    def _attend(self, slot_bg, slot_fg, k, v, k_fg):
         """-> attention (b, K, N) and the weighted means of v (b, K, D)."""
         dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
-        dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k + self.fg_bias) * self.scale
+        dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k_fg) * self.scale
         attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)
         attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
         return attn, torch.einsum("bij,bjd->bid", attn_wm, v)
@@ -117,13 +116,15 @@ class SlotAttention(nn.Module):
         k, v = self._keys_values(feat)
 
         for i in range(self.iters):
-            attn, updates = self._attend(slot_bg, slot_fg, k, v)  # (b, K, N), every iteration differentiated
-            if i == self.iters - 1:  # bi-level for the slots: the last update only
+            if i == self.iters - 1:  # bi-level
                 slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
-                _, updates = self._attend(slot_bg, slot_fg, k, v)
+            _, updates = self._attend(slot_bg, slot_fg, k, v, k)
             updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
             slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
             slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
 
+        # One more object-slot update (object keys + b); its attention is returned.
+        attn, updates = self._attend(slot_bg, slot_fg, k, v, k + self.fg_bias)  # (b, K, N)
+        slot_fg = self._update(self.gru, self.to_res, updates[:, 1:], slot_fg)
         return slot_bg[:, 0], slot_fg, attn
