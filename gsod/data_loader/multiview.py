@@ -1,5 +1,5 @@
 """Multi-view scenes in a flat directory (uORF format): ``*sc0000*.png``
-with ``_RT.txt`` (cam2world), optional ``_mask.png`` and ``_depth.npy``."""
+with ``_RT.txt`` (cam2world) and optional ``_mask.png``."""
 
 from __future__ import annotations
 
@@ -69,8 +69,8 @@ def _load_mask(path: Path, size: tuple[int, int]) -> torch.Tensor:
 
 
 class MultiViewScenes(Dataset):
-    """Item: scene, images (V, 3, H, W), cam2world (V, 4, 4), depths or None,
-    masks (V, H, W) when load_masks and every view has one."""
+    """Item: scene, images (V, 3, H, W), cam2world (V, 4, 4), masks (V, H, W)
+    when load_masks and every view has one."""
 
     def __init__(
         self,
@@ -83,7 +83,6 @@ class MultiViewScenes(Dataset):
         val_fraction: float = 0.1,
         seed: int = 0,
         load_masks: bool = False,
-        load_depth: bool = False,
     ):
         if split not in {"train", "val", "test"}:
             raise ValueError(f"split must be train/val/test, got {split!r}")
@@ -97,7 +96,6 @@ class MultiViewScenes(Dataset):
         self.focal_ratio = (float(focal_ratio[0]), float(focal_ratio[1]))
         self.n_views = int(n_views)
         self.load_masks = load_masks
-        self.load_depth = load_depth
 
         scenes = scene_files(self.root)
         if not scenes:
@@ -117,17 +115,6 @@ class MultiViewScenes(Dataset):
 
         self.scenes = scenes
         self.scene_ids = chosen
-        self.meta = {
-            "image_size": [self.image_size[0], self.image_size[1]],
-            "focal_ratio": [self.focal_ratio[0], self.focal_ratio[1]],
-            "split": {
-                "train": train_ids,
-                "val": val_ids,
-                "test": all_ids,
-            },
-            "n_scenes": len(all_ids),
-            "n_views": self.n_views,
-        }
 
     @staticmethod
     def _split_ids(
@@ -152,8 +139,7 @@ class MultiViewScenes(Dataset):
         if self.n_views > 0:
             paths = paths[: self.n_views]
 
-        images, cams, depths, masks = [], [], [], []
-        has_depth = self.load_depth
+        images, cams, masks = [], [], []
         has_mask = self.load_masks
         for path in paths:
             images.append(_load_rgb(path, self.image_size))
@@ -162,21 +148,6 @@ class MultiViewScenes(Dataset):
             if not pose_path.is_file():
                 raise FileNotFoundError(f"missing camera pose: {pose_path}")
             cams.append(torch.from_numpy(np.loadtxt(pose_path, dtype=np.float32)))
-
-            if has_depth:
-                depth_path = path.with_name(path.stem + "_depth.npy")
-                if depth_path.is_file():
-                    depth = np.load(depth_path)
-                    depth = np.squeeze(depth)
-                    depth = np.asarray(
-                        Image.fromarray(depth.astype(np.float32), mode="F").resize(
-                            (self.image_size[1], self.image_size[0]), Image.BILINEAR
-                        ),
-                        dtype=np.float32,
-                    )
-                    depths.append(torch.from_numpy(depth.copy()))
-                else:
-                    has_depth = False
 
             if has_mask:
                 mask_path = path.with_name(path.stem + "_mask.png")
@@ -189,7 +160,6 @@ class MultiViewScenes(Dataset):
             "scene": scene,
             "images": torch.stack(images),
             "cam2world": torch.stack(cams),
-            "depths": torch.stack(depths) if has_depth and depths else None,
         }
         if has_mask and masks:
             item["masks"] = torch.stack(masks)

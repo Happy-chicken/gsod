@@ -8,37 +8,17 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from gsod.data_generator.io import (
-    find_scene_frames,
-    load_meta,
-    read_view,
-    scene_dirname,
-)
+from gsod.data_generator.io import find_scene_frames, load_meta, read_view, scene_dirname
 
-__all__ = ["PrimordiaScenes", "hit_distance_to_depth"]
-
-
-def hit_distance_to_depth(depth: np.ndarray, focal_ratio) -> np.ndarray:
-    """Hit distances along unit rays -> camera-space z."""
-    h, w = depth.shape[-2:]
-    fx, fy = focal_ratio[0] * w, focal_ratio[1] * h
-    us = np.arange(w, dtype=np.float64)
-    vs = np.arange(h, dtype=np.float64)
-    uu, vv = np.meshgrid(us, vs)
-    x = (uu - (w - 1) / 2.0) / fx
-    y = (vv - (h - 1) / 2.0) / fy
-    return (depth / np.sqrt(x * x + y * y + 1.0)).astype(np.float32)
+__all__ = ["PrimordiaScenes"]
 
 
 class PrimordiaScenes(Dataset):
-    """Item: scene, images (V, 3, H, W), cam2world (V, 4, 4), depths
-    (camera z) or None."""
+    """Item: scene, images (V, 3, H, W), cam2world (V, 4, 4)."""
 
-    def __init__(self, root, split: str = "train", *, load_depth: bool = False):
+    def __init__(self, root, split: str = "train"):
         self.root = Path(root)
-        self.load_depth = load_depth
         meta = load_meta(self.root)
-        self.meta = meta
         self.image_size = tuple(meta["image_size"])
         self.focal_ratio = tuple(meta["focal_ratio"])
         self.scene_indices = list(meta["split"][split])
@@ -56,22 +36,4 @@ class PrimordiaScenes(Dataset):
         cams = torch.tensor(
             np.stack([v["cam2world"] for v in views]), dtype=torch.float32
         )
-        depths = None
-        if self.load_depth:
-            depths = torch.from_numpy(
-                np.stack(
-                    [
-                        hit_distance_to_depth(
-                            np.load(scene_dir / f"{stem}_depth.npy")[..., 0],
-                            self.focal_ratio,
-                        )
-                        for stem in self.frames[scene]
-                    ]
-                )
-            )
-        return {
-            "scene": scene,
-            "images": images,
-            "cam2world": cams,
-            "depths": depths,
-        }
+        return {"scene": scene, "images": images, "cam2world": cams}

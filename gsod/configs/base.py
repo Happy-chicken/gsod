@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gsod.data_loader.multiview import DEFAULT_FOCAL_RATIO
 from gsod.utils.io import default_out_dir
 
 
@@ -42,7 +43,7 @@ class BaseConfig:
     # --- data (image size, focal, views: multi-view datasets only)
     dataset_mode: str = "primordia"
     dataset_image_size: int = 128
-    dataset_focal_ratio: tuple[float, float] = (350.0 / 320.0, 350.0 / 240.0)
+    dataset_focal_ratio: tuple[float, float] = DEFAULT_FOCAL_RATIO
     n_views: int = 4
     val_fraction: float = 0.1
     train_scenes: int | None = None  # quick runs: first N scenes

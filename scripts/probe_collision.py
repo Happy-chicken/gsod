@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from gsod.configs import DATASETS, config_for, run_config
-from gsod.data_loader import WithGTMasks, dataset_meta, make_dataset
+from gsod.data_loader import dataset_meta, make_dataset
 from gsod.model import build_model
 from gsod.eval.evaluate import collect, slot_table
 from gsod.utils.io import latest_run_dir, load_networks
@@ -79,8 +79,6 @@ def main() -> None:
     load_networks(checkpoint, args.suffix, model.networks(), device=device)
     data = make_dataset(root, args.split, n_views=cfg.n_views, val_fraction=cfg.val_fraction,
                         seed=cfg.seed, load_masks=True, **kwargs)
-    if cfg.dataset_mode == "primordia":
-        data = WithGTMasks(data, root)
 
     pairs = []
     for i in range(min(args.scenes, len(data))):

@@ -10,8 +10,9 @@ import numpy as np
 from gsod.utils.io import save_png
 from gsod.eval.metrics import upsample_labels
 
-# Mask colours: background dark grey, label k PALETTE[(k-1) % 8].
 WANDB_PROJECT = "gsod"
+
+# Mask colours: background dark grey, label k PALETTE[(k-1) % 8].
 MASK_BG = np.array([55, 55, 55], dtype=np.uint8)
 PALETTE = np.array(
     [

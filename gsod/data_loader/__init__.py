@@ -6,17 +6,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from gsod.data_generator.io import load_meta
-from gsod.data_loader.gt_masks import WithGTMasks
 from gsod.data_loader.multiview import DEFAULT_FOCAL_RATIO, MultiViewScenes, scene_files
-from gsod.data_loader.primordia import PrimordiaScenes, hit_distance_to_depth
+from gsod.data_loader.primordia import PrimordiaScenes
 
 __all__ = [
     "DEFAULT_FOCAL_RATIO",
     "MultiViewScenes",
     "PrimordiaScenes",
-    "WithGTMasks",
     "dataset_meta",
-    "hit_distance_to_depth",
     "make_dataset",
     "dataset_kwargs",
     "eval_dataset",
@@ -35,11 +32,10 @@ def make_dataset(
     val_fraction: float = 0.1,
     seed: int = 0,
     load_masks: bool = False,
-    load_depth: bool = False,
 ):
     """The dataset of ``split``."""
     if dataset_mode == "primordia":
-        return PrimordiaScenes(root, split, load_depth=load_depth)
+        return PrimordiaScenes(root, split)
     return MultiViewScenes(
         root,
         split,
@@ -49,7 +45,6 @@ def make_dataset(
         val_fraction=val_fraction,
         seed=seed,
         load_masks=load_masks,
-        load_depth=load_depth,
     )
 
 
@@ -66,9 +61,8 @@ def dataset_kwargs(cfg) -> dict:
 
 
 def eval_dataset(cfg, root: str | Path, split: str):
-    """A split with GT masks, for evaluation."""
-    data = make_dataset(root, split, load_masks=True, **dataset_kwargs(cfg))
-    return WithGTMasks(data, root) if cfg.dataset_mode == "primordia" else data
+    """A split with GT masks (multi-view datasets), for evaluation."""
+    return make_dataset(root, split, load_masks=True, **dataset_kwargs(cfg))
 
 
 def dataset_meta(

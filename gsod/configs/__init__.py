@@ -10,7 +10,6 @@ from gsod.configs.datasets import (
     config_for,
     run_config,
 )
-from gsod.utils.io import default_out_dir, latest_run_dir
 
 __all__ = [
     "BaseConfig",
@@ -22,6 +21,4 @@ __all__ = [
     "RoomDiverseConfig",
     "config_for",
     "run_config",
-    "default_out_dir",
-    "latest_run_dir",
 ]

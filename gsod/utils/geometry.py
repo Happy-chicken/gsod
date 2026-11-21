@@ -26,15 +26,6 @@ def camera_directions(u, v, size: tuple[int, int], focal_ratio):
     return np.stack([x, y, np.ones_like(x)], -1)
 
 
-def floor_hits(origin, directions, floor_z: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Rays meeting z = floor_z -> xy, t, and whether the ray goes down."""
-    origin = np.asarray(origin, dtype=np.float64)
-    dz = directions[..., 2]
-    down = dz < -1e-6
-    t = np.where(down, (floor_z - origin[..., 2]) / np.where(down, dz, -1.0), 0.0)
-    return origin[..., :2] + t[..., None] * directions[..., :2], t, down
-
-
 @dataclass
 class Camera:
     """A pinhole camera."""

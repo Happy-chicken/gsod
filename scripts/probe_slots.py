@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs import DATASETS, config_for, run_config
-from gsod.data_loader import WithGTMasks, dataset_meta, make_dataset
+from gsod.data_loader import dataset_meta, make_dataset
 from gsod.model import build_model
 from gsod.utils.io import latest_run_dir, load_networks, save_png
 
@@ -136,7 +136,7 @@ def main() -> None:
             seed=cfg.seed,
             load_masks=True,
         )
-        return WithGTMasks(data, root) if cfg.dataset_mode == "primordia" else data
+        return data
 
     x_fit, y_fit = collect(model, split(args.fit_split), device, args.size)
     x_eval, y_eval = collect(model, split(args.eval_split), device, args.size)

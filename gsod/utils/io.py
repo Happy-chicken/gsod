@@ -70,7 +70,8 @@ def load_networks(
     schedulers: Sequence = (),
     device: str | torch.device = "cuda",
 ) -> dict[str, object]:
-    """Load weights (strict=False); missing files are skipped."""
+    """Load weights (strict=False, mismatched keys are reported); missing files
+    are skipped. A network none of whose keys match raises."""
     save_dir = Path(save_dir)
     result: dict[str, object] = {}
     for name, net in networks.items():
@@ -78,7 +79,13 @@ def load_networks(
         if not path.is_file():
             print(f"not found: {path}, skip {name}")
             continue
-        result[name] = net.load_state_dict(torch.load(path, map_location=device), strict=False)
+        state = torch.load(path, map_location=device)
+        result[name] = keys = net.load_state_dict(state, strict=False)
+        if keys.missing_keys or keys.unexpected_keys:
+            print(f"{name}: {len(keys.missing_keys)} missing, {len(keys.unexpected_keys)} unexpected keys: "
+                  f"{(keys.missing_keys + keys.unexpected_keys)[:4]}")
+        if len(keys.missing_keys) == len(net.state_dict()) > 0:
+            raise RuntimeError(f"{path}: no key of {name} matches (a checkpoint of an older model?)")
     for i, opt in enumerate(optimizers):
         path = save_dir / f"{suffix}_optimizer_{i}.pth"
         if path.is_file():
@@ -174,14 +181,3 @@ def write_ply(path: str | Path, gaussians: dict[str, torch.Tensor]) -> Path:
         out.write(header.encode("ascii"))
         out.write(data.tobytes())
     return path
-
-
-def read_ply(path: str | Path) -> dict[str, np.ndarray]:
-    """A 3DGS .ply written by write_ply -> {property name: (N,)}."""
-    raw = Path(path).read_bytes()
-    end = raw.index(b"end_header\n") + len(b"end_header\n")
-    lines = raw[:end].decode("ascii").splitlines()
-    names = [line.split()[-1] for line in lines if line.startswith("property")]
-    count = int(next(line for line in lines if line.startswith("element vertex")).split()[-1])
-    data = np.frombuffer(raw[end:], "<f4").reshape(count, len(names))
-    return {name: data[:, i] for i, name in enumerate(names)}
