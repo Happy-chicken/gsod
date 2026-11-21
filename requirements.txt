@@ -1,7 +1,7 @@
 # Python >= 3.10. Install torch / torchvision first from the index matching the
 # cluster's CUDA (e.g. --index-url https://download.pytorch.org/whl/cu124),
 # then: pip install -r requirements.txt
-torch>=2.1
+torch>=2.2  # nn.Module.compile
 torchvision>=0.16
 gsplat>=1.0
 lightning>=2.0

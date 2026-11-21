@@ -44,7 +44,9 @@ class SlotAttention(nn.Module):
         assert num_slots >= 2, "need at least two slots"
         self.iters = iters
         self.scale = dim**-0.5
-        self.sigma = SIGMA_START
+        # A tensor, so torch.compile does not recompile as it changes; noisy: sigma > 0.
+        self.register_buffer("sigma", torch.tensor(SIGMA_START), persistent=False)
+        self.noisy = SIGMA_START > 0
 
         self.slots_init = nn.Embedding(num_slots, dim)
         init.xavier_uniform_(self.slots_init.weight)
@@ -67,7 +69,9 @@ class SlotAttention(nn.Module):
 
     def anneal(self, step: int) -> None:
         """Cosine-anneal the noise sigma."""
-        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
+        sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
+        self.sigma.fill_(sigma)
+        self.noisy = sigma > 0
 
     def keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
@@ -78,7 +82,7 @@ class SlotAttention(nn.Module):
     def forward(self, k: torch.Tensor, v: torch.Tensor):
         b = k.shape[0]
         start = self.slots_init.weight.expand(b, -1, -1)
-        if self.training and self.sigma > 0:
+        if self.training and self.noisy:
             start = start + torch.randn_like(start) * self.sigma * start.detach()
         slot_bg, slot_obj = start[:, :1], start[:, 1:]
 

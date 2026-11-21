@@ -290,6 +290,10 @@ def main() -> None:
 
     torch.manual_seed(cfg.seed)
     model = build_model(cfg)
+    # Fuse the many small ops (parameter names, hence checkpoints, unchanged). Not the
+    # encoder: its replicate-padded convs hit an Inductor bug, and convs gain little.
+    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder):
+        net.compile()
     train(model, cfg, resume=args.resume)
 
 
