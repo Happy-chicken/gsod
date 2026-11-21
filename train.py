@@ -19,7 +19,6 @@ from pathlib import Path
 import lightning as L
 import torch
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.utilities import grad_norm
 from torch.utils.data import DataLoader, Subset
 
 from gsod.configs import DATASETS, BaseConfig, config_for
@@ -109,9 +108,10 @@ class GSODTraining(L.LightningModule):
         return loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        # Before clipping.
-        norms = grad_norm(self.model, norm_type=2)
-        self.log("train/grad_norm", norms["grad_2.0_norm_total"], batch_size=1)
+        # Clip here (one total norm on the GPU, no sync) and log the norm before clipping.
+        max_norm = self.cfg.grad_clip if self.cfg.grad_clip > 0 else float("inf")
+        norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+        self.log("train/grad_norm", norm, batch_size=1)
 
     def on_train_epoch_end(self) -> None:
         epoch = self.epoch + 1  # this epoch is done
@@ -238,7 +238,6 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
         accelerator="gpu",
         devices=1,
         max_epochs=cfg.epochs - start_epoch,
-        gradient_clip_val=cfg.grad_clip if cfg.grad_clip > 0 else None,
         logger=logger,
         log_every_n_steps=cfg.log_every,
         enable_checkpointing=False,

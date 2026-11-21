@@ -48,8 +48,8 @@ class GSODLoss(nn.Module):
 
     def forward(
         self, outputs: dict[str, torch.Tensor], images: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """-> (total, per-term values for logging)."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """-> (total, per-term values for logging; tensors, so no GPU sync)."""
         cfg = self.cfg
         rendered = outputs["rgb"]
         terms = {
@@ -58,6 +58,6 @@ class GSODLoss(nn.Module):
         }
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
         total = sum(weights[name] * value for name, value in terms.items())
-        logged = {name: float(value.detach()) for name, value in terms.items()}
-        logged["total"] = float(total.detach())
+        logged = {name: value.detach() for name, value in terms.items()}
+        logged["total"] = total.detach()
         return total, logged
