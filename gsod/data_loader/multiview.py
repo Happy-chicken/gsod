@@ -12,10 +12,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-__all__ = ["MultiViewScenes", "DEFAULT_FOCAL_RATIO"]
-
-# fx / W, fy / H of the CLEVR-567 / Room-* renders.
-DEFAULT_FOCAL_RATIO = (350.0 / 320.0, 350.0 / 240.0)
+__all__ = ["MultiViewScenes"]
 
 _SCENE_RE = re.compile(r"sc(\d+)")
 _NUM_RE = re.compile(r"(\d+)")
@@ -77,7 +74,7 @@ class MultiViewScenes(Dataset):
         root: str | Path,
         split: str,
         *,
-        image_size: int | tuple[int, int],
+        image_size: int,
         n_views: int,
         val_fraction: float,
         seed: int,
@@ -89,9 +86,7 @@ class MultiViewScenes(Dataset):
         if not self.root.is_dir():
             raise FileNotFoundError(f"dataset root not found: {self.root}")
 
-        if isinstance(image_size, int):
-            image_size = (image_size, image_size)
-        self.image_size = (int(image_size[0]), int(image_size[1]))
+        self.image_size = (int(image_size), int(image_size))
         self.n_views = int(n_views)
         self.load_masks = load_masks
 

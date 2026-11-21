@@ -18,21 +18,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from gsod.model.gsod import GSODModel
-from gsod.model.losses import ssim
 from gsod.eval.metrics import ari, fg_ari, psnr, upsample_labels
 from gsod.eval.visualize import Tiles, scene_images
-
-_LPIPS = {}
-
-
-def _lpips(device: torch.device):
-    """The LPIPS (AlexNet) network on device, loaded once; needs `pip install lpips`."""
-    if device not in _LPIPS:
-        import lpips
-
-        _LPIPS[device] = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
-    return _LPIPS[device]
+from gsod.model.gsod import GSODModel
+from gsod.model.losses import ssim
 
 SEGMENTATION_KEYS = ("ari", "fg_ari", "nv_ari")
 RECONSTRUCTION_KEYS = ("psnr", "ssim", "lpips")
@@ -62,6 +51,16 @@ OBJECT_FOUND = 0.5
 MIN_SLOT_PIXELS = 20
 
 NAN = float("nan")
+_LPIPS = {}
+
+
+def _lpips(device: torch.device):
+    """The LPIPS (AlexNet) network on device, loaded once; needs `pip install lpips`."""
+    if device not in _LPIPS:
+        import lpips
+
+        _LPIPS[device] = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    return _LPIPS[device]
 
 
 @dataclass

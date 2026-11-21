@@ -7,8 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from gsod.utils.io import save_png
 from gsod.eval.metrics import upsample_labels
+from gsod.utils.io import save_png
 
 WANDB_PROJECT = "gsod"
 

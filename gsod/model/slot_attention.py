@@ -35,7 +35,8 @@ def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
 
 
 class SlotAttention(nn.Module):
-    """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
+    """Keys / values of (b, N, C) tokens -> background slot, object slots,
+    attention (b, K, N)."""
 
     def __init__(self, num_slots: int, dim: int, iters: int):
         """dim: token and slot size."""
@@ -68,14 +69,18 @@ class SlotAttention(nn.Module):
         """Cosine-anneal the noise sigma."""
         self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
 
-    def forward(self, feat: torch.Tensor):
-        b = feat.shape[0]
+    def keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
+        feat = self.mlp_feat(feat + self.to_pos(self._grid(feat.shape[1], feat.device)))
+        feat = self.norm_feat(feat)
+        return self.to_k(feat), self.to_v(feat)
+
+    def forward(self, k: torch.Tensor, v: torch.Tensor):
+        b = k.shape[0]
         start = self.slots_init.weight.expand(b, -1, -1)
         if self.training and self.sigma > 0:
             start = start + torch.randn_like(start) * self.sigma * start.detach()
         slot_bg, slot_obj = start[:, :1], start[:, 1:]
-
-        k, v = self._keys_values(feat)
 
         attn = None
         for i in range(self.iters):
@@ -90,19 +95,12 @@ class SlotAttention(nn.Module):
         return slot_bg[:, 0], slot_obj, attn
 
     def refine(
-        self, feat: torch.Tensor, slot_bg: torch.Tensor, slot_obj: torch.Tensor, error: torch.Tensor
+        self, k: torch.Tensor, v: torch.Tensor, slot_bg: torch.Tensor, slot_obj: torch.Tensor, error: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokens (b, N, C), slots from forward, error (b, N) -> object slots
-        and attention after one error-aware update."""
-        k, v = self._keys_values(feat)
+        """Keys / values, slots from forward, error (b, N) -> object slots and
+        attention after one error-aware update."""
         attn, updates = self._attend(slot_bg[:, None], slot_obj, k, v, k + self.to_err(error[..., None]))
         return self._update(self.gru, self.mlp, updates[:, 1:], slot_obj), attn
-
-    def _keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
-        feat = self.mlp_feat(feat + self.to_pos(self._grid(feat.shape[1], feat.device)))
-        feat = self.norm_feat(feat)
-        return self.to_k(feat), self.to_v(feat)
 
     def _attend(
         self, slot_bg: torch.Tensor, slot_obj: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_obj: torch.Tensor

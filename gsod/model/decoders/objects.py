@@ -135,7 +135,7 @@ class ObjectDecoder(nn.Module):
     def __init__(self, z_dim: int, gaussians_per_slot: int, hidden_dim: int):
         super().__init__()
         d = int(hidden_dim)
-        self.M, self.d = N_TOKENS, d
+        self.d = d
         self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
         self.to_k = nn.Linear(z_dim, N_TOKENS * d)
         self.to_v = nn.Linear(z_dim, N_TOKENS * d)
@@ -151,8 +151,8 @@ class ObjectDecoder(nn.Module):
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
-        k = self.norm_kv(self.to_k(slots).view(K, self.M, self.d))
-        v = self.norm_kv(self.to_v(slots).view(K, self.M, self.d))
+        k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
+        v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
         return self.head(q, centre, extent, colour), extent

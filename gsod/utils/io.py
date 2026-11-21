@@ -3,14 +3,13 @@ PNG writer and 3DGS .ply export."""
 
 from __future__ import annotations
 
-import struct
-import zlib
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
 
 from gsod.utils.splatter import SH_C0
@@ -36,10 +35,6 @@ def latest_run_dir(tag: str, root: str | Path = "checkpoints") -> str | None:
         if path.is_dir() and any(path.glob("latest_net_*.pth"))
     ]
     if not candidates:
-        # Backward-compatible non-timestamped directory.
-        legacy = root / tag
-        if legacy.is_dir() and any(legacy.glob("latest_net_*.pth")):
-            return str(legacy)
         return None
     return str(max(candidates, key=lambda path: (path.stat().st_mtime, path.name)))
 
@@ -50,7 +45,6 @@ def save_networks(
     suffix: str,
     networks: Mapping[str, nn.Module],
     optimizers: Sequence[torch.optim.Optimizer] = (),
-    schedulers: Sequence = (),
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -58,8 +52,6 @@ def save_networks(
         torch.save(net.state_dict(), save_dir / f"{suffix}_net_{name}.pth")
     for i, opt in enumerate(optimizers):
         torch.save(opt.state_dict(), save_dir / f"{suffix}_optimizer_{i}.pth")
-    for i, sch in enumerate(schedulers):
-        torch.save(sch.state_dict(), save_dir / f"{suffix}_lr_scheduler_{i}.pth")
 
 
 def load_networks(
@@ -67,7 +59,6 @@ def load_networks(
     suffix: str,
     networks: Mapping[str, nn.Module],
     optimizers: Sequence[torch.optim.Optimizer] = (),
-    schedulers: Sequence = (),
     device: str | torch.device = "cuda",
 ) -> dict[str, object]:
     """Load weights (strict=False, mismatched keys are reported); missing files
@@ -90,47 +81,20 @@ def load_networks(
         path = save_dir / f"{suffix}_optimizer_{i}.pth"
         if path.is_file():
             opt.load_state_dict(torch.load(path, map_location=device))
-    for i, sch in enumerate(schedulers):
-        path = save_dir / f"{suffix}_lr_scheduler_{i}.pth"
-        if path.is_file():
-            sch.load_state_dict(torch.load(path, map_location=device))
     return result
 
 
 # -- PNG ----------------------------------------------------------------------
-def _chunk(tag: bytes, data: bytes) -> bytes:
-    return (
-        struct.pack(">I", len(data))
-        + tag
-        + data
-        + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-    )
-
-
 def save_png(path, array) -> Path:
-    """Write an ``(H, W)`` grayscale or ``(H, W, 3)`` RGB ``uint8`` array."""
+    """Write an ``(H, W)`` grayscale or ``(H, W, 3)`` RGB ``uint8`` array (as RGB)."""
     array = np.asarray(array, dtype=np.uint8)
     if array.ndim == 2:
         array = np.repeat(array[:, :, None], 3, axis=2)
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError(f"expected (H, W, 3) or (H, W), got {array.shape}")
-    height, width, _ = array.shape
-
-    raw = bytearray()
-    for row in array:
-        raw.append(0)  # filter type: none
-        raw.extend(row.tobytes())
-
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + _chunk(b"IHDR", header)
-        + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-        + _chunk(b"IEND", b"")
-    )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(png)
+    Image.fromarray(array, mode="RGB").save(path)
     return path
 
 

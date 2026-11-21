@@ -12,10 +12,9 @@ from gsod.utils.io import load_networks
 def build_model(cfg: BaseConfig) -> GSODModel:
     """Build a GSODModel from a config profile."""
     size = cfg.dataset_image_size
-    height, width = (size, size) if isinstance(size, int) else size
     return GSODModel(
-        image_size=(height, width),
-        input_size=min(cfg.input_size, height, width),
+        image_size=(size, size),
+        input_size=min(cfg.input_size, size),
         z_dim=cfg.z_dim,
         num_slots=cfg.num_slots,
         attn_iter=cfg.attn_iter,

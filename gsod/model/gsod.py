@@ -207,7 +207,8 @@ class GSODModel(nn.Module):
         outputs, or with render=False the decoded scene."""
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
-        bg_slot, slots, attn = self.slot_attention(tokens)
+        k, v = self.slot_attention.keys_values(tokens)
+        bg_slot, slots, attn = self.slot_attention(k, v)
         colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         background = self.decode_background(bg_slot[0], attn[0, 0], colours, frame)
         scene = self.scene(slots[0], attn[0], background, colours, frame)
@@ -216,6 +217,6 @@ class GSODModel(nn.Module):
         view0 = splat(self.gaussians(scene), cam2world[:1], self.image_size, self.focal_ratio, self.near)
         error = (images[:1] - view0["rgb"]).abs().mean(1, keepdim=True)
         error = F.interpolate(error, size=self.input_size, mode="area").flatten(1).detach()
-        slots, attn = self.slot_attention.refine(tokens, bg_slot, slots, error)
+        slots, attn = self.slot_attention.refine(k, v, bg_slot, slots, error)
         scene = self.scene(slots[0], attn[0], background, colours, frame)
         return self.render(scene, cam2world) if render else scene

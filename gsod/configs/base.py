@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from gsod.data_loader.multiview import DEFAULT_FOCAL_RATIO
 from gsod.utils.io import default_out_dir
 
 
@@ -42,8 +41,8 @@ class BaseConfig:
 
     # --- data (dataset_mode, data_root, test_root: set by the dataset profile)
     dataset_mode: str = ""
-    dataset_image_size: int = 128
-    dataset_focal_ratio: tuple[float, float] = DEFAULT_FOCAL_RATIO
+    dataset_image_size: int = 128  # square
+    dataset_focal_ratio: tuple[float, float] = (350.0 / 320.0, 350.0 / 240.0)  # fx / W, fy / H
     n_views: int = 4
     val_fraction: float = 0.1
     train_scenes: int | None = None  # quick runs: first N scenes
@@ -51,4 +50,8 @@ class BaseConfig:
     monitor_scenes: int = 50  # test scenes scored during training
     data_root: str = ""
     test_root: str | None = None
-    out_dir: str = field(default_factory=lambda: default_out_dir("run"))
+    out_dir: str = ""  # default: checkpoints/<dataset_mode>_<time>
+
+    def __post_init__(self) -> None:
+        if not self.out_dir:
+            self.out_dir = default_out_dir(self.dataset_mode)

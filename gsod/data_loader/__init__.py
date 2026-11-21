@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gsod.data_loader.multiview import DEFAULT_FOCAL_RATIO, MultiViewScenes
+from gsod.data_loader.multiview import MultiViewScenes
 
-__all__ = ["DEFAULT_FOCAL_RATIO", "MultiViewScenes", "make_dataset"]
+__all__ = ["MultiViewScenes", "make_dataset"]
 
 
 def make_dataset(cfg, root: str | Path, split: str, load_masks: bool = False) -> MultiViewScenes:
