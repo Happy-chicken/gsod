@@ -175,14 +175,6 @@ class GSODModel(nn.Module):
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         out = self.splat(every, *cams)
         image = out["rgb"]
-        result = {
-            "rgb": image,  # (N, 3, H, W)
-            "attn": scene["attn"],  # (K, s*s)
-            "draw": draw,  # (K-1,)
-            "extent": scene["objects"]["extent"],  # (K-1, 3)
-        }
-        if self.training:  # the loss needs only rgb
-            return result
 
         # Decomposition from the same blending (no gradient): per-slot weights
         # (0 = floor and uncovered) and per-object colour contributions.
@@ -201,12 +193,15 @@ class GSODModel(nn.Module):
             bg_rgb = self.splat({name: value.detach() for name, value in floor.items()}, *cams)["rgb"]
 
         return {
-            **result,
+            "rgb": image,  # (N, 3, H, W)
             "fg_rgb": slot_rgb.sum(1),
             "slot_rgb": slot_rgb,  # (N, K-1, 3, H, W)
             "bg_rgb": bg_rgb,  # the floor alone
             "slot_alpha": weights,  # (N, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=1),  # (N, H, W)
+            "attn": scene["attn"],  # (K, s*s)
+            "draw": draw,  # (K-1,)
+            "extent": scene["objects"]["extent"],  # (K-1, 3)
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
@@ -215,17 +210,14 @@ class GSODModel(nn.Module):
         tokens = self.encode(images[0:1])
         frame = scene_frame(cam2world[0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
-        small = F.interpolate(images[0:1], size=self.input_size, mode="area")  # (1, 3, s, s)
-        colours = small[0].flatten(1).T
+        colours = F.interpolate(images[0:1], size=self.input_size, mode="area")[0].flatten(1).T
         background = self.decode_background(bg_slot[0], attn[0, 0], colours, frame)
         scene = self.scene(slots[0], attn[0], background, colours, frame)
 
-        # What view 0 still leaves unexplained, per token: rendered at token
-        # resolution, an input with no gradient.
-        with torch.no_grad():
-            side = (self.input_size, self.input_size)
-            view0 = self.splat(self.gaussians(scene), cam2world[:1], side, self.focal_ratio, self.near)
-            residual = (small - view0["rgb"]).abs().mean(1).flatten(1)  # (1, s*s)
+        # What view 0 still leaves unexplained, per token (an input, no gradient).
+        view0 = self.splat(self.gaussians(scene), cam2world[:1], self.image_size, self.focal_ratio, self.near)
+        residual = (images[:1] - view0["rgb"]).abs().mean(1, keepdim=True)
+        residual = F.interpolate(residual, size=self.input_size, mode="area").flatten(1).detach()
         slots, attn = self.slot_attention.refine(tokens, bg_slot, slots, residual)
         scene = self.scene(slots[0], attn[0], background, colours, frame)
         return self.render(scene, cam2world) if render else scene
