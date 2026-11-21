@@ -22,7 +22,7 @@ from torch.utils.data import Subset
 from gsod.configs import DATASETS, config_for, run_config
 from gsod.data_loader import eval_dataset
 from gsod.model import load_model
-from gsod.model.evaluate import (
+from gsod.eval.evaluate import (
     DIAGNOSTIC_KEYS,
     RECONSTRUCTION_KEYS,
     SEGMENTATION_KEYS,
@@ -32,7 +32,7 @@ from gsod.model.evaluate import (
     slot_table,
 )
 from gsod.utils.io import latest_run_dir
-from gsod.utils.visualize import WANDB_PROJECT, panels, save_panels, scene_images, wandb_images, wandb_slot_table
+from gsod.eval.visualize import WANDB_PROJECT, panels, save_panels, scene_images, wandb_images, wandb_slot_table
 
 IMAGE_SCENES = 16
 WORST_SCENES = 8

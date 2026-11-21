@@ -20,8 +20,8 @@ import torch
 
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import ssim
-from gsod.utils.metrics import ari, fg_ari, psnr, upsample_labels
-from gsod.utils.visualize import Tiles, scene_images
+from gsod.eval.metrics import ari, fg_ari, psnr, upsample_labels
+from gsod.eval.visualize import Tiles, scene_images
 
 _LPIPS = {}
 

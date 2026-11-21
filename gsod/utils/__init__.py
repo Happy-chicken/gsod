@@ -1,1 +1,1 @@
-"""Helpers: geometry, splatter, metrics, visualize, io."""
+"""Helpers: geometry, splatter, io, schedule."""

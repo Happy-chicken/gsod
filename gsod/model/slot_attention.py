@@ -4,7 +4,7 @@ per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
 the residual MLP, bi-level (only the last iteration is differentiated, straight
 through to the queries). Slot 0 is the background.
 
-refine(): one more object-slot update whose keys also see a per-token residual
+refine(): one more object-slot update whose keys also see a per-token error
 (what the current slots leave unexplained), so an idle slot can be drawn to a
 missed object (after MONet / IODINE). Starts as a plain iteration."""
 
@@ -46,11 +46,9 @@ class SlotAttention(nn.Module):
     ):
         super().__init__()
         assert num_slots >= 2, "need at least two slots"
-        self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
         self.scale = slot_dim**-0.5
-        self.slot_dim = slot_dim
         self.sigma = SIGMA_START
 
         self.slots_init = nn.Embedding(num_slots, slot_dim)
@@ -72,6 +70,56 @@ class SlotAttention(nn.Module):
         nn.init.zeros_(self.to_err.weight)
         nn.init.zeros_(self.to_err.bias)
 
+    def anneal(self, step: int) -> None:
+        """Cosine-anneal the noise sigma."""
+        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
+
+    def forward(self, feat: torch.Tensor):
+        b = feat.shape[0]
+        start = self.slots_init.weight.expand(b, -1, -1)
+        if self.training and self.sigma > 0:
+            start = start + torch.randn_like(start) * self.sigma * start.detach()
+        slot_bg, slot_obj = start[:, :1], start[:, 1:]
+
+        k, v = self._keys_values(feat)
+
+        attn = None
+        for i in range(self.iters):
+            if i == self.iters - 1:  # bi-level
+                slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
+                slot_obj = slot_obj.detach() + start[:, 1:] - start[:, 1:].detach()
+            attn, updates = self._attend(slot_bg, slot_obj, k, v, k)  # (b, K, N)
+            updates_bg, updates_obj = updates[:, :1], updates[:, 1:]
+            slot_bg = self._update(self.gru_bg, self.mlp_bg, updates_bg, slot_bg)
+            slot_obj = self._update(self.gru, self.mlp, updates_obj, slot_obj)
+
+        return slot_bg[:, 0], slot_obj, attn
+
+    def refine(
+        self, feat: torch.Tensor, slot_bg: torch.Tensor, slot_obj: torch.Tensor, error: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokens (b, N, C), slots from forward, error (b, N) -> object slots
+        and attention after one error-aware update."""
+        k, v = self._keys_values(feat)
+        attn, updates = self._attend(slot_bg[:, None], slot_obj, k, v, k + self.to_err(error[..., None]))
+        return self._update(self.gru, self.mlp, updates[:, 1:], slot_obj), attn
+
+    def _keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
+        feat = self.mlp_feat(feat + self.to_pos(self._grid(feat.shape[1], feat.device)))
+        feat = self.norm_feat(feat)
+        return self.to_k(feat), self.to_v(feat)
+
+    def _attend(
+        self, slot_bg: torch.Tensor, slot_obj: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_obj: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> attention (b, K, N) and the weighted means of v (b, K, D)."""
+        dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
+        dots_obj = torch.einsum("bid,bjd->bij", self.to_q(slot_obj), k_obj) * self.scale
+        attn = torch.cat([dots_bg, dots_obj], dim=1).softmax(dim=1)
+        attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
+        return attn, torch.einsum("bij,bjd->bid", attn_wm, v)
+
     def _update(self, gru: nn.GRUCell, mlp: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, k, d)
@@ -85,49 +133,3 @@ class SlotAttention(nn.Module):
         lin = torch.linspace(0.0, 1.0, side, device=device)
         y, x = torch.meshgrid(lin, lin, indexing="ij")
         return torch.stack([x, y, 1.0 - x, 1.0 - y], dim=-1).reshape(1, n_tokens, 4)
-
-    def anneal(self, step: int) -> None:
-        """Cosine-anneal the noise sigma."""
-        self.sigma = cosine(step / SIGMA_STEPS, SIGMA_START, SIGMA_FINAL)
-
-    def _keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
-        feat = self.mlp_feat(feat + self.to_pos(self._grid(feat.shape[1], feat.device)))
-        feat = self.norm_feat(feat)
-        return self.to_k(feat), self.to_v(feat)
-
-    def _attend(self, slot_bg, slot_fg, k, v, k_fg):
-        """-> attention (b, K, N) and the weighted means of v (b, K, D)."""
-        dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
-        dots_fg = torch.einsum("bid,bjd->bij", self.to_q(slot_fg), k_fg) * self.scale
-        attn = torch.cat([dots_bg, dots_fg], dim=1).softmax(dim=1)
-        attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
-        return attn, torch.einsum("bij,bjd->bid", attn_wm, v)
-
-    def refine(self, feat, slot_bg, slot_fg, residual):
-        """Tokens (b, N, C), slots from forward, residual (b, N) -> object
-        slots and attention after one residual-aware update."""
-        k, v = self._keys_values(feat)
-        attn, updates = self._attend(slot_bg[:, None], slot_fg, k, v, k + self.to_err(residual[..., None]))
-        return self._update(self.gru, self.mlp, updates[:, 1:], slot_fg), attn
-
-    def forward(self, feat: torch.Tensor):
-        b = feat.shape[0]
-        start = self.slots_init.weight.expand(b, -1, -1)
-        if self.training and self.sigma > 0:
-            start = start + torch.randn_like(start) * self.sigma * start.detach()
-        slot_bg, slot_fg = start[:, :1], start[:, 1:]
-
-        k, v = self._keys_values(feat)
-
-        attn = None
-        for i in range(self.iters):
-            if i == self.iters - 1:  # bi-level
-                slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
-                slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
-            attn, updates = self._attend(slot_bg, slot_fg, k, v, k)  # (b, K, N)
-            updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
-            slot_bg = self._update(self.gru_bg, self.mlp_bg, updates_bg, slot_bg)
-            slot_fg = self._update(self.gru, self.mlp, updates_fg, slot_fg)
-
-        return slot_bg[:, 0], slot_fg, attn

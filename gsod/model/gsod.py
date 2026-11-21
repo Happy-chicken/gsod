@@ -4,7 +4,7 @@
     decode_objects            object slot -> box at its attention anchor ->
                               Gaussians in it
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    view 0 rendered, its per-token residual -> one more
+    refine                    view 0 rendered, its per-token error -> one more
                               object-slot update, objects decoded again
     render                    all Gaussians blended together (object opacity x
                               draw factor); masks from the same blending
@@ -216,8 +216,8 @@ class GSODModel(nn.Module):
 
         # What view 0 still leaves unexplained, per token (an input, no gradient).
         view0 = self.splat(self.gaussians(scene), cam2world[:1], self.image_size, self.focal_ratio, self.near)
-        residual = (images[:1] - view0["rgb"]).abs().mean(1, keepdim=True)
-        residual = F.interpolate(residual, size=self.input_size, mode="area").flatten(1).detach()
-        slots, attn = self.slot_attention.refine(tokens, bg_slot, slots, residual)
+        error = (images[:1] - view0["rgb"]).abs().mean(1, keepdim=True)
+        error = F.interpolate(error, size=self.input_size, mode="area").flatten(1).detach()
+        slots, attn = self.slot_attention.refine(tokens, bg_slot, slots, error)
         scene = self.scene(slots[0], attn[0], background, colours, frame)
         return self.render(scene, cam2world) if render else scene

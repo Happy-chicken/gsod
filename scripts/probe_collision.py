@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from gsod.configs import DATASETS, config_for, run_config
 from gsod.data_loader import WithGTMasks, dataset_meta, make_dataset
 from gsod.model import build_model
-from gsod.model.evaluate import collect, slot_table
+from gsod.eval.evaluate import collect, slot_table
 from gsod.utils.io import latest_run_dir, load_networks
 
 

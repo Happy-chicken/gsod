@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Subset
 from gsod.configs import DATASETS, BaseConfig, config_for
 from gsod.data_loader import dataset_kwargs, dataset_meta, eval_dataset, make_dataset
 from gsod.model import build_model
-from gsod.model.evaluate import (
+from gsod.eval.evaluate import (
     DIAGNOSTIC_KEYS,
     RECONSTRUCTION_KEYS,
     SEGMENTATION_KEYS,
@@ -34,7 +34,7 @@ from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
 from gsod.utils.schedule import cosine
-from gsod.utils.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
+from gsod.eval.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
 
 IMAGE_SCENES = 4
 
