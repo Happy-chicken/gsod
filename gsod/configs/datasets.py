@@ -11,13 +11,6 @@ from gsod.utils.io import default_out_dir
 
 
 @dataclass
-class PrimordiaConfig(BaseConfig):
-    """Primordia (generated here)."""
-
-    out_dir: str = field(default_factory=lambda: default_out_dir("primordia"))
-
-
-@dataclass
 class Clevr567Config(BaseConfig):
     """CLEVR-567: 5-7 objects + the background."""
 
@@ -55,7 +48,6 @@ class RoomDiverseConfig(BaseConfig):
 
 
 PROFILES: dict[str, type[BaseConfig]] = {
-    "primordia": PrimordiaConfig,
     "clevr567": Clevr567Config,
     "room_chair": RoomChairConfig,
     "room_diverse": RoomDiverseConfig,

@@ -25,6 +25,9 @@ SCALE_RANGE = (1.0 / 40.0, 1.0)
 SCALE_INIT = 1.0 / 8.0
 # Spread of the learned queries (how far apart Gaussians start).
 QUERY_STD = 2.0
+# Transformer: heads, slot tokens, layers; RegionHead MLP width.
+N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
+REGION_HIDDEN = 64
 
 
 def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
@@ -35,10 +38,10 @@ class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes
     r_min + r_max softplus(.) (no upper limit)."""
 
-    def __init__(self, z_dim: int, hidden_dim: int = 64):
+    def __init__(self, z_dim: int):
         super().__init__()
         r_min, r_max = OBJECT_RADIUS
-        self.mlp = mlp(z_dim, hidden_dim, 5)
+        self.mlp = mlp(z_dim, REGION_HIDDEN, 5)
         self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
         self.r_min, self.r_max = r_min, r_max
         with torch.no_grad():
@@ -129,24 +132,15 @@ class DecoderLayer(nn.Module):
 class ObjectDecoder(nn.Module):
     """Object slots -> Gaussians, scene frame."""
 
-    def __init__(
-        self,
-        z_dim: int,
-        gaussians_per_slot: int,
-        hidden_dim: int,
-        *,
-        n_heads: int = 4,
-        n_tokens: int = 8,
-        n_layers: int = 2,
-    ):
+    def __init__(self, z_dim: int, gaussians_per_slot: int, hidden_dim: int):
         super().__init__()
         d = int(hidden_dim)
-        self.M, self.d = int(n_tokens), d
+        self.M, self.d = N_TOKENS, d
         self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
-        self.to_k = nn.Linear(z_dim, n_tokens * d)
-        self.to_v = nn.Linear(z_dim, n_tokens * d)
+        self.to_k = nn.Linear(z_dim, N_TOKENS * d)
+        self.to_v = nn.Linear(z_dim, N_TOKENS * d)
         self.norm_kv = nn.LayerNorm(d)
-        self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
+        self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
 

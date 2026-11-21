@@ -11,9 +11,9 @@ from gsod.model.layers import conv_block
 class Encoder(nn.Module):
     """Bx3xHxW image -> BxCxHxW feature map (C = z_dim)."""
 
-    def __init__(self, input_nc: int = 3, z_dim: int = 64):
+    def __init__(self, z_dim: int):
         super().__init__()
-        self.down_1 = conv_block(input_nc, z_dim)
+        self.down_1 = conv_block(3, z_dim)
         self.down_2 = conv_block(z_dim, z_dim, stride=2)
         self.down_3 = conv_block(z_dim, z_dim, stride=2)
         self.up_3 = conv_block(z_dim, z_dim, up=True)

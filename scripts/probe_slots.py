@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.configs import DATASETS, config_for, run_config
-from gsod.data_loader import dataset_meta, make_dataset
+from gsod.data_loader import make_dataset
 from gsod.model import build_model
 from gsod.utils.io import latest_run_dir, load_networks, save_png
 
@@ -118,28 +118,11 @@ def main() -> None:
     cfg = run_config(cfg, Path(checkpoint))
     root = args.data or cfg.test_root or cfg.data_root
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    meta = dataset_meta(
-        root, dataset_mode=cfg.dataset_mode, image_size=cfg.dataset_image_size, focal_ratio=cfg.dataset_focal_ratio
-    )
-    model = build_model(cfg, meta).to(device).eval()
+    model = build_model(cfg).to(device).eval()
     load_networks(checkpoint, args.suffix, model.networks(), device=device)
 
-    def split(name):
-        data = make_dataset(
-            root,
-            name,
-            dataset_mode=cfg.dataset_mode,
-            image_size=cfg.dataset_image_size,
-            focal_ratio=cfg.dataset_focal_ratio,
-            n_views=cfg.n_views,
-            val_fraction=cfg.val_fraction,
-            seed=cfg.seed,
-            load_masks=True,
-        )
-        return data
-
-    x_fit, y_fit = collect(model, split(args.fit_split), device, args.size)
-    x_eval, y_eval = collect(model, split(args.eval_split), device, args.size)
+    x_fit, y_fit = collect(model, make_dataset(cfg, root, args.fit_split, load_masks=True), device, args.size)
+    x_eval, y_eval = collect(model, make_dataset(cfg, root, args.eval_split, load_masks=True), device, args.size)
     probe = fit(x_fit, y_fit, args.epochs, cfg.seed)
     mean = y_fit.mean(0, keepdim=True)
     with torch.no_grad():

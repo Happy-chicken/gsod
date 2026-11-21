@@ -40,8 +40,8 @@ class BaseConfig:
     num_workers: int = 4
     loss: LossConfig = field(default_factory=LossConfig)
 
-    # --- data (image size, focal, views: multi-view datasets only)
-    dataset_mode: str = "primordia"
+    # --- data (dataset_mode, data_root, test_root: set by the dataset profile)
+    dataset_mode: str = ""
     dataset_image_size: int = 128
     dataset_focal_ratio: tuple[float, float] = DEFAULT_FOCAL_RATIO
     n_views: int = 4
@@ -49,6 +49,6 @@ class BaseConfig:
     train_scenes: int | None = None  # quick runs: first N scenes
     val_scenes: int | None = None
     monitor_scenes: int = 50  # test scenes scored during training
-    data_root: str = "data/primordia"
+    data_root: str = ""
     test_root: str | None = None
     out_dir: str = field(default_factory=lambda: default_out_dir("run"))

@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-__all__ = ["MultiViewScenes", "DEFAULT_FOCAL_RATIO", "scene_files"]
+__all__ = ["MultiViewScenes", "DEFAULT_FOCAL_RATIO"]
 
 # fx / W, fy / H of the CLEVR-567 / Room-* renders.
 DEFAULT_FOCAL_RATIO = (350.0 / 320.0, 350.0 / 240.0)
@@ -75,14 +75,13 @@ class MultiViewScenes(Dataset):
     def __init__(
         self,
         root: str | Path,
-        split: str = "train",
+        split: str,
         *,
-        image_size: int | tuple[int, int] = 128,
-        focal_ratio: tuple[float, float] = DEFAULT_FOCAL_RATIO,
-        n_views: int = 4,
-        val_fraction: float = 0.1,
-        seed: int = 0,
-        load_masks: bool = False,
+        image_size: int | tuple[int, int],
+        n_views: int,
+        val_fraction: float,
+        seed: int,
+        load_masks: bool,
     ):
         if split not in {"train", "val", "test"}:
             raise ValueError(f"split must be train/val/test, got {split!r}")
@@ -93,7 +92,6 @@ class MultiViewScenes(Dataset):
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
         self.image_size = (int(image_size[0]), int(image_size[1]))
-        self.focal_ratio = (float(focal_ratio[0]), float(focal_ratio[1]))
         self.n_views = int(n_views)
         self.load_masks = load_masks
 

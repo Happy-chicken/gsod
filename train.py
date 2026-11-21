@@ -22,7 +22,7 @@ from lightning.pytorch.loggers import WandbLogger
 from torch.utils.data import DataLoader, Subset
 
 from gsod.configs import DATASETS, BaseConfig, config_for
-from gsod.data_loader import dataset_kwargs, dataset_meta, eval_dataset, make_dataset
+from gsod.data_loader import make_dataset
 from gsod.model import build_model
 from gsod.eval.evaluate import (
     DIAGNOSTIC_KEYS,
@@ -179,11 +179,11 @@ def _has_masks(dataset) -> bool:
 def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> None:
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    train_set = _first(make_dataset(cfg.data_root, "train", **dataset_kwargs(cfg)), cfg.train_scenes)
-    val_set = _first(eval_dataset(cfg, cfg.data_root, "val"), cfg.val_scenes)
+    train_set = _first(make_dataset(cfg, cfg.data_root, "train"), cfg.train_scenes)
+    val_set = _first(make_dataset(cfg, cfg.data_root, "val", load_masks=True), cfg.val_scenes)
     monitor_set, monitor_root = val_set, f"{cfg.data_root} (val)"
     if cfg.test_root:
-        monitor_set = _first(eval_dataset(cfg, cfg.test_root, "test"), cfg.monitor_scenes)
+        monitor_set = _first(make_dataset(cfg, cfg.test_root, "test", load_masks=True), cfg.monitor_scenes)
         monitor_root = f"{cfg.test_root} (test, first {len(monitor_set)})"
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
     print(f"train: {cfg.data_root} ({len(train_set)} scenes)")
@@ -241,7 +241,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--dataset", choices=list(DATASETS), default="primordia"
+        "--dataset", choices=list(DATASETS), required=True
     )
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--out", default=None, help="checkpoint directory")
@@ -288,14 +288,8 @@ def main() -> None:
             "CUDA training requested but torch.cuda.is_available() is False"
         )
 
-    meta = dataset_meta(
-        cfg.data_root,
-        dataset_mode=cfg.dataset_mode,
-        image_size=cfg.dataset_image_size,
-        focal_ratio=cfg.dataset_focal_ratio,
-    )
     torch.manual_seed(cfg.seed)
-    model = build_model(cfg, meta)
+    model = build_model(cfg)
     train(model, cfg, resume=args.resume)
 
 

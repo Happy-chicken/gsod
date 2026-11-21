@@ -1,4 +1,4 @@
-"""Cameras, the floor and the scene frame.
+"""Camera rays, the scene frame and moving Gaussians between frames.
 
 World: +z up, floor at z = 0; cameras OpenCV, cam2world 4x4; pixel centres
 at integers. Scene frame (like uORF's nss2cam0): world turned so view 0
@@ -8,89 +8,18 @@ looks along +x, centred where its optical axis meets the floor, scaled by
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import NamedTuple
 
-import numpy as np
 import torch
 
 
-# -- cameras and the floor ----------------------------------------------------
-def camera_directions(u, v, size: tuple[int, int], focal_ratio):
-    """Camera-frame ray directions (..., 3), z = 1 (numpy or torch)."""
+# -- cameras ------------------------------------------------------------------
+def camera_directions(u: torch.Tensor, v: torch.Tensor, size: tuple[int, int], focal_ratio) -> torch.Tensor:
+    """Camera-frame ray directions (..., 3), z = 1."""
     h, w = size
     x = (u - (w - 1) / 2) / (focal_ratio[0] * w)
     y = (v - (h - 1) / 2) / (focal_ratio[1] * h)
-    if torch.is_tensor(x):
-        return torch.stack([x, y, torch.ones_like(x)], -1)
-    return np.stack([x, y, np.ones_like(x)], -1)
-
-
-@dataclass
-class Camera:
-    """A pinhole camera."""
-
-    cam2world: np.ndarray
-    image_size: tuple[int, int]
-    focal_ratio: tuple[float, float] = (1.0, 1.0)
-
-    def __post_init__(self) -> None:
-        self.cam2world = np.asarray(self.cam2world, dtype=np.float64).reshape(4, 4)
-        self.image_size = (int(self.image_size[0]), int(self.image_size[1]))
-        self.focal_ratio = (float(self.focal_ratio[0]), float(self.focal_ratio[1]))
-
-    def rays(self) -> tuple[np.ndarray, np.ndarray]:
-        """World origins and unit directions, (H*W, 3) each, row-major."""
-        h, w = self.image_size
-        v, u = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-        d = camera_directions(u, v, self.image_size, self.focal_ratio).reshape(-1, 3)
-        d = d @ self.cam2world[:3, :3].T
-        d /= np.linalg.norm(d, axis=-1, keepdims=True)
-        return np.broadcast_to(self.cam2world[:3, 3], d.shape).copy(), d
-
-
-def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
-    """cam2world (4x4) looking from eye at target; up sets the roll."""
-    eye = np.asarray(eye, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    up = np.asarray(up, dtype=np.float64)
-
-    forward = target - eye
-    forward = forward / np.linalg.norm(forward)
-    right = np.cross(forward, up)
-    norm = np.linalg.norm(right)
-    if norm < 1e-8:
-        raise ValueError("look_at: view direction is parallel to `up`")
-    right = right / norm
-    down = np.cross(forward, right)
-
-    cam2world = np.eye(4)
-    cam2world[:3, 0] = right
-    cam2world[:3, 1] = down
-    cam2world[:3, 2] = forward
-    cam2world[:3, 3] = eye
-    return cam2world
-
-
-def orbit(
-    center,
-    radius: float,
-    elevation_deg: float,
-    azimuth_deg: float,
-    up=(0.0, 0.0, 1.0),
-) -> np.ndarray:
-    """cam2world on a sphere around center (azimuth from +x, CCW)."""
-    elevation = np.deg2rad(elevation_deg)
-    azimuth = np.deg2rad(azimuth_deg)
-    offset = radius * np.array(
-        [
-            np.cos(elevation) * np.cos(azimuth),
-            np.cos(elevation) * np.sin(azimuth),
-            np.sin(elevation),
-        ]
-    )
-    eye = np.asarray(center, dtype=np.float64) + offset
-    return look_at(eye, center, up)
+    return torch.stack([x, y, torch.ones_like(x)], -1)
 
 
 # -- the scene frame ----------------------------------------------------------

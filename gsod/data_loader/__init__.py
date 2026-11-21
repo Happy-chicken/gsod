@@ -1,84 +1,24 @@
-"""Datasets, one item per scene: Primordia (meta.json) or flat multi-view
-directories (CLEVR-567, Room-*)."""
+"""Datasets: multi-view scenes in flat directories (uORF format: CLEVR-567,
+Room-*), one item per scene."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from gsod.data_generator.io import load_meta
-from gsod.data_loader.multiview import DEFAULT_FOCAL_RATIO, MultiViewScenes, scene_files
-from gsod.data_loader.primordia import PrimordiaScenes
+from gsod.data_loader.multiview import DEFAULT_FOCAL_RATIO, MultiViewScenes
 
-__all__ = [
-    "DEFAULT_FOCAL_RATIO",
-    "MultiViewScenes",
-    "PrimordiaScenes",
-    "dataset_meta",
-    "make_dataset",
-    "dataset_kwargs",
-    "eval_dataset",
-    "scene_files",
-]
+__all__ = ["DEFAULT_FOCAL_RATIO", "MultiViewScenes", "make_dataset"]
 
 
-def make_dataset(
-    root: str | Path,
-    split: str,
-    *,
-    dataset_mode: str = "primordia",
-    image_size: int | tuple[int, int] = 128,
-    focal_ratio: tuple[float, float] = DEFAULT_FOCAL_RATIO,
-    n_views: int = 4,
-    val_fraction: float = 0.1,
-    seed: int = 0,
-    load_masks: bool = False,
-):
-    """The dataset of ``split``."""
-    if dataset_mode == "primordia":
-        return PrimordiaScenes(root, split)
+def make_dataset(cfg, root: str | Path, split: str, load_masks: bool = False) -> MultiViewScenes:
+    """The split of the dataset at root, as the config profile describes it;
+    load_masks: GT masks, for evaluation."""
     return MultiViewScenes(
         root,
         split,
-        image_size=image_size,
-        focal_ratio=focal_ratio,
-        n_views=n_views,
-        val_fraction=val_fraction,
-        seed=seed,
-        load_masks=load_masks,
-    )
-
-
-def dataset_kwargs(cfg) -> dict:
-    """make_dataset keyword arguments from a config profile."""
-    return dict(
-        dataset_mode=cfg.dataset_mode,
         image_size=cfg.dataset_image_size,
-        focal_ratio=cfg.dataset_focal_ratio,
         n_views=cfg.n_views,
         val_fraction=cfg.val_fraction,
         seed=cfg.seed,
+        load_masks=load_masks,
     )
-
-
-def eval_dataset(cfg, root: str | Path, split: str):
-    """A split with GT masks (multi-view datasets), for evaluation."""
-    return make_dataset(root, split, load_masks=True, **dataset_kwargs(cfg))
-
-
-def dataset_meta(
-    root: str | Path,
-    *,
-    dataset_mode: str = "primordia",
-    image_size: int | tuple[int, int] = 128,
-    focal_ratio: tuple[float, float] = DEFAULT_FOCAL_RATIO,
-) -> dict:
-    """The metadata ``build_model`` needs, without loading images."""
-    if dataset_mode == "primordia":
-        return load_meta(root)
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-    return {
-        "dataset": dataset_mode,
-        "image_size": [int(image_size[0]), int(image_size[1])],
-        "focal_ratio": [float(focal_ratio[0]), float(focal_ratio[1])],
-    }

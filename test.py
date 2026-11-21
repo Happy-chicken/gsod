@@ -20,7 +20,7 @@ import wandb
 from torch.utils.data import Subset
 
 from gsod.configs import DATASETS, config_for, run_config
-from gsod.data_loader import eval_dataset
+from gsod.data_loader import make_dataset
 from gsod.model import load_model
 from gsod.eval.evaluate import (
     DIAGNOSTIC_KEYS,
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--dataset", choices=list(DATASETS), default="primordia"
+        "--dataset", choices=list(DATASETS), required=True
     )
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--checkpoint", default=None, help="checkpoint directory")
@@ -73,8 +73,8 @@ def main() -> None:
     device = torch.device("cuda")
 
     cfg = run_config(cfg, Path(checkpoint))
-    model = load_model(cfg, data_root, checkpoint, args.suffix, device)
-    dataset = eval_dataset(cfg, data_root, args.split)
+    model = load_model(cfg, checkpoint, args.suffix, device)
+    dataset = make_dataset(cfg, data_root, args.split, load_masks=True)
     if args.scenes is not None and args.scenes < len(dataset):
         dataset = Subset(dataset, range(args.scenes))
     result = evaluate(model, dataset, device, IMAGE_SCENES)

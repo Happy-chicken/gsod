@@ -29,7 +29,7 @@ from gsod.utils.geometry import (
     scene_frame,
     to_world,
 )
-from gsod.utils.splatter import GsplatSplatter
+from gsod.utils.splatter import splat
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
@@ -83,29 +83,27 @@ def attention_anchors(
 class GSODModel(nn.Module):
     def __init__(
         self,
-        image_size: tuple[int, int] = (128, 128),
-        input_size: int = 64,
-        z_dim: int = 64,
-        num_slots: int = 6,
-        attn_iter: int = 3,
-        gaussians_per_slot: int = 512,
-        decoder_hidden_dim: int = 128,
-        focal_ratio: tuple[float, float] = (1.0, 1.0),
-        near: float = 0.1,
+        *,
+        image_size: tuple[int, int],
+        input_size: int,
+        z_dim: int,
+        num_slots: int,
+        attn_iter: int,
+        gaussians_per_slot: int,
+        decoder_hidden_dim: int,
+        focal_ratio: tuple[float, float],
+        near: float,
     ):
         """num_slots: K, the background slot included."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
-        self.splat = GsplatSplatter()
         self.image_size = tuple(image_size)
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
 
-        self.encoder = Encoder(3, z_dim=z_dim)
-        self.slot_attention = SlotAttention(
-            num_slots=num_slots, in_dim=z_dim, slot_dim=z_dim, iters=attn_iter
-        )
+        self.encoder = Encoder(z_dim)
+        self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
@@ -173,7 +171,7 @@ class GSODModel(nn.Module):
         n_obj, n_gauss = obj["mu"].shape[:2]
         every = self.gaussians(scene)
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
-        out = self.splat(every, *cams)
+        out = splat(every, *cams)
         image = out["rgb"]
 
         # Decomposition from the same blending (no gradient): per-slot weights
@@ -186,11 +184,11 @@ class GSODModel(nn.Module):
             ])
             onehot = F.one_hot(ids, n_obj + 1).float()
             obj_rgb = (onehot[:, 1:, None] * every["rgb"][:, None]).flatten(1)
-            parts = self.splat(every, *cams, features=torch.cat([onehot, obj_rgb], 1))["features"]
+            parts = splat(every, *cams, features=torch.cat([onehot, obj_rgb], 1))["features"]
             weights = parts[:, : n_obj + 1].clone()
             weights[:, 0] += (1.0 - out["alpha"][:, 0]).detach()
             slot_rgb = parts[:, n_obj + 1 :].unflatten(1, (n_obj, 3))
-            bg_rgb = self.splat({name: value.detach() for name, value in floor.items()}, *cams)["rgb"]
+            bg_rgb = splat({name: value.detach() for name, value in floor.items()}, *cams)["rgb"]
 
         return {
             "rgb": image,  # (N, 3, H, W)
@@ -215,7 +213,7 @@ class GSODModel(nn.Module):
         scene = self.scene(slots[0], attn[0], background, colours, frame)
 
         # What view 0 still leaves unexplained, per token (an input, no gradient).
-        view0 = self.splat(self.gaussians(scene), cam2world[:1], self.image_size, self.focal_ratio, self.near)
+        view0 = splat(self.gaussians(scene), cam2world[:1], self.image_size, self.focal_ratio, self.near)
         error = (images[:1] - view0["rgb"]).abs().mean(1, keepdim=True)
         error = F.interpolate(error, size=self.input_size, mode="area").flatten(1).detach()
         slots, attn = self.slot_attention.refine(tokens, bg_slot, slots, error)

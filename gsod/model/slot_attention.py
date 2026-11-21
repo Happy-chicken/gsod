@@ -22,6 +22,8 @@ SIGMA_START = 1.0
 SIGMA_FINAL = 0.0
 SIGMA_STEPS = 30000
 DROP_PATH = 0.2
+EPS = 1.0  # weighted mean: attention / (its sum + EPS)
+HIDDEN = 128  # MLP width (at least the slot size)
 
 
 def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
@@ -35,38 +37,30 @@ def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
 class SlotAttention(nn.Module):
     """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
 
-    def __init__(
-        self,
-        num_slots: int,
-        in_dim: int = 64,
-        slot_dim: int = 64,
-        iters: int = 3,
-        eps: float = 1.0,
-        hidden_dim: int = 128,
-    ):
+    def __init__(self, num_slots: int, dim: int, iters: int):
+        """dim: token and slot size."""
         super().__init__()
         assert num_slots >= 2, "need at least two slots"
         self.iters = iters
-        self.eps = eps
-        self.scale = slot_dim**-0.5
+        self.scale = dim**-0.5
         self.sigma = SIGMA_START
 
-        self.slots_init = nn.Embedding(num_slots, slot_dim)
+        self.slots_init = nn.Embedding(num_slots, dim)
         init.xavier_uniform_(self.slots_init.weight)
 
-        hidden_dim = max(slot_dim, hidden_dim)
-        self.to_pos = nn.Linear(4, in_dim)
-        self.mlp_feat = mlp(in_dim, hidden_dim, slot_dim, norm=True)
-        self.norm_feat = nn.LayerNorm(slot_dim)
-        self.to_k = nn.Linear(slot_dim, slot_dim, bias=False)
-        self.to_v = nn.Linear(slot_dim, slot_dim, bias=False)
-        self.to_q = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
-        self.to_q_bg = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
-        self.gru = nn.GRUCell(slot_dim, slot_dim)
-        self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
-        self.mlp = mlp(slot_dim, hidden_dim, slot_dim, norm=True)
-        self.mlp_bg = mlp(slot_dim, hidden_dim, slot_dim, norm=True)
-        self.to_err = nn.Linear(1, slot_dim)
+        hidden = max(dim, HIDDEN)
+        self.to_pos = nn.Linear(4, dim)
+        self.mlp_feat = mlp(dim, hidden, dim, norm=True)
+        self.norm_feat = nn.LayerNorm(dim)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.to_q = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim, bias=False))
+        self.to_q_bg = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim, bias=False))
+        self.gru = nn.GRUCell(dim, dim)
+        self.gru_bg = nn.GRUCell(dim, dim)
+        self.mlp = mlp(dim, hidden, dim, norm=True)
+        self.mlp_bg = mlp(dim, hidden, dim, norm=True)
+        self.to_err = nn.Linear(1, dim)
         nn.init.zeros_(self.to_err.weight)
         nn.init.zeros_(self.to_err.bias)
 
@@ -117,7 +111,7 @@ class SlotAttention(nn.Module):
         dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
         dots_obj = torch.einsum("bid,bjd->bij", self.to_q(slot_obj), k_obj) * self.scale
         attn = torch.cat([dots_bg, dots_obj], dim=1).softmax(dim=1)
-        attn_wm = attn / (attn.sum(-1, keepdim=True) + self.eps)
+        attn_wm = attn / (attn.sum(-1, keepdim=True) + EPS)
         return attn, torch.einsum("bij,bjd->bid", attn_wm, v)
 
     def _update(self, gru: nn.GRUCell, mlp: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:

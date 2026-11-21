@@ -1,4 +1,5 @@
-"""gsplat splatter: one set of Gaussians -> rgb, alpha, depth in all views."""
+"""gsplat (https://github.com/nerfstudio-project/gsplat): one set of Gaussians ->
+rgb, alpha, depth in all views."""
 
 from __future__ import annotations
 
@@ -6,93 +7,77 @@ import torch
 
 # Degree-0 real SH constant (gsplat / 3DGS).
 SH_C0 = 0.28209479177387814
+FAR = 100.0
+EPS2D = 0.3
 
 
-class GsplatSplatter:
-    """gsplat rasterizer from https://github.com/nerfstudio-project/gsplat."""
-
-    def __init__(
-        self,
-        far: float = 100.0,
-        *,
-        packed: bool = False,
-        rasterize_mode: str = "classic",
-        eps2d: float = 0.3,
-        radius_clip: float = 0.0,
-    ):
-        self.far = float(far)
-        self.packed = bool(packed)
-        self.rasterize_mode = str(rasterize_mode)
-        self.eps2d = float(eps2d)
-        self.radius_clip = float(radius_clip)
-
-    def __call__(
-        self,
-        gaussians: dict[str, torch.Tensor],
-        cam2world: torch.Tensor,
-        image_size: tuple[int, int],
-        focal_ratio: tuple[float, float] = (1.0, 1.0),
-        near: float = 0.1,
-        features: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """-> (V, C, H, W) "rgb", "depth" (premultiplied by alpha), "alpha";
-        with features (N, D) instead of colours: "features" (V, D, H, W), "alpha"."""
-        if not gaussians["mu"].is_cuda:
-            raise RuntimeError(
-                "GsplatSplatter needs CUDA tensors; this project requires CUDA"
-            )
-
-        from gsplat import rasterization
-
-        h, w = image_size
-        device = gaussians["mu"].device
-        mu = gaussians["mu"].float().contiguous()
-        scale = gaussians["scale"].float().contiguous()
-        quat = gaussians["quat"].float().contiguous()
-        opacity = gaussians["opacity"].float().contiguous()
-        if features is None:
-            colors, sh_degree = sh_coefficients(gaussians)
-        else:
-            colors, sh_degree = features.float().contiguous(), None
-
-        # gsplat takes OpenCV world-to-camera matrices.
-        cam2world = cam2world.to(device=device)
-        viewmats = torch.linalg.inv(cam2world.double()).float().contiguous()
-        Ks = (
-            _intrinsics(w, h, focal_ratio, device)
-            .unsqueeze(0)
-            .expand(viewmats.shape[0], 3, 3)
-            .contiguous()
+def splat(
+    gaussians: dict[str, torch.Tensor],
+    cam2world: torch.Tensor,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+    near: float,
+    features: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """One set of Gaussians -> (V, C, H, W) "rgb", "depth" (premultiplied by
+    alpha), "alpha"; with features (N, D) instead of colours: "features"
+    (V, D, H, W), "alpha"."""
+    if not gaussians["mu"].is_cuda:
+        raise RuntimeError(
+            "splat needs CUDA tensors; this project requires CUDA"
         )
 
-        rendered, alpha, _ = rasterization(
-            means=mu,
-            quats=quat,
-            scales=scale,
-            opacities=opacity,
-            colors=colors,
-            viewmats=viewmats,
-            Ks=Ks,
-            width=w,
-            height=h,
-            near_plane=near,
-            far_plane=self.far,
-            radius_clip=self.radius_clip,
-            eps2d=self.eps2d,
-            sh_degree=sh_degree,
-            packed=self.packed,
-            render_mode="RGB+D" if features is None else "RGB",
-            rasterize_mode=self.rasterize_mode,
-            camera_model="pinhole",
-        )
+    from gsplat import rasterization
 
-        if features is not None:
-            return {"features": rendered.permute(0, 3, 1, 2), "alpha": alpha.permute(0, 3, 1, 2)}
-        return {
-            "rgb": rendered[..., :3].permute(0, 3, 1, 2),
-            "depth": rendered[..., 3:4].permute(0, 3, 1, 2),
-            "alpha": alpha.permute(0, 3, 1, 2),
-        }
+    h, w = image_size
+    device = gaussians["mu"].device
+    mu = gaussians["mu"].float().contiguous()
+    scale = gaussians["scale"].float().contiguous()
+    quat = gaussians["quat"].float().contiguous()
+    opacity = gaussians["opacity"].float().contiguous()
+    if features is None:
+        colors, sh_degree = sh_coefficients(gaussians)
+    else:
+        colors, sh_degree = features.float().contiguous(), None
+
+    # gsplat takes OpenCV world-to-camera matrices.
+    cam2world = cam2world.to(device=device)
+    viewmats = torch.linalg.inv(cam2world.double()).float().contiguous()
+    Ks = (
+        _intrinsics(w, h, focal_ratio, device)
+        .unsqueeze(0)
+        .expand(viewmats.shape[0], 3, 3)
+        .contiguous()
+    )
+
+    rendered, alpha, _ = rasterization(
+        means=mu,
+        quats=quat,
+        scales=scale,
+        opacities=opacity,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=w,
+        height=h,
+        near_plane=near,
+        far_plane=FAR,
+        radius_clip=0.0,
+        eps2d=EPS2D,
+        sh_degree=sh_degree,
+        packed=False,
+        render_mode="RGB+D" if features is None else "RGB",
+        rasterize_mode="classic",
+        camera_model="pinhole",
+    )
+
+    if features is not None:
+        return {"features": rendered.permute(0, 3, 1, 2), "alpha": alpha.permute(0, 3, 1, 2)}
+    return {
+        "rgb": rendered[..., :3].permute(0, 3, 1, 2),
+        "depth": rendered[..., 3:4].permute(0, 3, 1, 2),
+        "alpha": alpha.permute(0, 3, 1, 2),
+    }
 
 
 def sh_coefficients(gaussians: dict[str, torch.Tensor]) -> tuple[torch.Tensor, int | None]:

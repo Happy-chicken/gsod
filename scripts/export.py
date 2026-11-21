@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from gsod.configs import DATASETS, config_for
-from gsod.data_loader import dataset_meta, make_dataset
+from gsod.data_loader import make_dataset
 from gsod.model import build_model
 from gsod.utils.geometry import from_world, rotate_gaussians
 from gsod.utils.io import latest_run_dir, load_networks, write_ply
@@ -29,7 +29,7 @@ _Y_UP_QUAT = torch.tensor([math.cos(-math.pi / 4), math.sin(-math.pi / 4), 0.0, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", choices=list(DATASETS), default="primordia")
+    parser.add_argument("--dataset", choices=list(DATASETS), required=True)
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--checkpoint", default=None, help="checkpoint directory")
     parser.add_argument("--suffix", default="latest")
@@ -45,13 +45,10 @@ def main() -> None:
     checkpoint = args.checkpoint or latest_run_dir(cfg.dataset_mode)
     if checkpoint is None:
         raise FileNotFoundError("no checkpoint found; pass --checkpoint")
-    kwargs = dict(dataset_mode=cfg.dataset_mode, image_size=cfg.dataset_image_size,
-                  focal_ratio=cfg.dataset_focal_ratio)
-    model = build_model(cfg, dataset_meta(root, **kwargs))
+    model = build_model(cfg)
     load_networks(str(checkpoint), args.suffix, model.networks(), device="cpu")
     model.eval()
-    data = make_dataset(root, args.split, n_views=cfg.n_views, val_fraction=cfg.val_fraction,
-                        seed=cfg.seed, **kwargs)
+    data = make_dataset(cfg, root, args.split)
     out = Path(args.out or Path(checkpoint) / "ply" / f"{args.split}_{args.suffix}")
 
     for index in args.scenes:

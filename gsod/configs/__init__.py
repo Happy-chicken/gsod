@@ -4,7 +4,6 @@ from gsod.configs.base import BaseConfig, LossConfig
 from gsod.configs.datasets import (
     DATASETS,
     Clevr567Config,
-    PrimordiaConfig,
     RoomChairConfig,
     RoomDiverseConfig,
     config_for,
@@ -15,7 +14,6 @@ __all__ = [
     "BaseConfig",
     "LossConfig",
     "DATASETS",
-    "PrimordiaConfig",
     "Clevr567Config",
     "RoomChairConfig",
     "RoomDiverseConfig",
