@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from gsod.model.layers import logit, mlp, shift_colour
+
 # Object radius range (units of R), shared by every dataset.
 OBJECT_RADIUS = (0.05, 0.2)
 # Half side of the area objects can be in.
@@ -25,19 +27,8 @@ SCALE_INIT = 1.0 / 8.0
 QUERY_STD = 2.0
 
 
-def _logit(p: float) -> float:
-    return math.log(p / (1.0 - p))
-
-
 def _log_uniform(raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
     return torch.exp(math.log(lo) + (math.log(hi) - math.log(lo)) * torch.sigmoid(raw))
-
-
-def positional_encoding(x: torch.Tensor, bands: int) -> torch.Tensor:
-    """x (N, 3) in [-1, 1] -> (N, 3 + 6 * bands): x, sin / cos(2^k pi x)."""
-    freqs = math.pi * 2.0 ** torch.arange(bands, device=x.device, dtype=x.dtype)
-    angles = x[..., None] * freqs  # (N, 3, bands)
-    return torch.cat([x, angles.sin().flatten(1), angles.cos().flatten(1)], -1)
 
 
 class RegionHead(nn.Module):
@@ -47,7 +38,7 @@ class RegionHead(nn.Module):
     def __init__(self, z_dim: int, hidden_dim: int = 64):
         super().__init__()
         r_min, r_max = OBJECT_RADIUS
-        self.mlp = nn.Sequential(nn.Linear(z_dim, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, 5))
+        self.mlp = mlp(z_dim, hidden_dim, 5)
         self.register_buffer("shift_bound", torch.tensor([0.5 * OBJECT_REGION, 0.5 * r_max]), persistent=False)
         self.r_min, self.r_max = r_min, r_max
         with torch.no_grad():
@@ -76,14 +67,14 @@ class ObjectHead(nn.Module):
         super().__init__()
         r_max = OBJECT_RADIUS[1]
         self.scale_range = (SCALE_RANGE[0] * r_max, SCALE_RANGE[1] * r_max)
-        self.project = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(True), nn.Linear(d_model, 23))
+        self.mlp = mlp(d_model, d_model, 23)
         lo, hi = (math.log(s) for s in self.scale_range)
         with torch.no_grad():
-            out = self.project[-1]
+            out = self.mlp[-1]
             out.weight[3:].mul_(0.1)
             out.weight[14:].zero_()  # view-independent at first
             out.bias.zero_()
-            out.bias[3:6] = _logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
+            out.bias[3:6] = logit((math.log(SCALE_INIT * r_max) - lo) / (hi - lo))
             out.bias[6] = 1.0  # identity quaternion (wxyz)
 
     def forward(
@@ -94,7 +85,7 @@ class ObjectHead(nn.Module):
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
-        raw = self.project(feat)
+        raw = self.mlp(feat)
         t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent] cut at the floor.
@@ -109,7 +100,7 @@ class ObjectHead(nn.Module):
             "scale": _log_uniform(raw[..., 3:6], *self.scale_range),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": opacity,
-            "rgb": torch.sigmoid(torch.logit(colour.clamp(0.02, 0.98))[:, None] + raw[..., 11:14]),
+            "rgb": shift_colour(colour[:, None], raw[..., 11:14]),
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
@@ -122,17 +113,17 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.norm_self = nn.LayerNorm(d_model)
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm_q = nn.LayerNorm(d_model)
-        self.cross = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm_ff = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, 2 * d_model), nn.GELU(), nn.Linear(2 * d_model, d_model))
+        self.norm_cross = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm_mlp = nn.LayerNorm(d_model)
+        self.mlp = mlp(d_model, 2 * d_model, d_model, act=nn.GELU)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """q (K, G, d), slot tokens k, v (K, M, d) -> (K, G, d)."""
         x = self.norm_self(q)
         q = q + self.self_attn(x, x, x, need_weights=False)[0]
-        q = q + self.cross(self.norm_q(q), k, v, need_weights=False)[0]
-        return q + self.ffn(self.norm_ff(q))
+        q = q + self.cross_attn(self.norm_cross(q), k, v, need_weights=False)[0]
+        return q + self.mlp(self.norm_mlp(q))
 
 
 class ObjectDecoder(nn.Module):
@@ -152,8 +143,8 @@ class ObjectDecoder(nn.Module):
         d = int(hidden_dim)
         self.M, self.d = int(n_tokens), d
         self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
-        self.k_proj = nn.Linear(z_dim, n_tokens * d)
-        self.v_proj = nn.Linear(z_dim, n_tokens * d)
+        self.to_k = nn.Linear(z_dim, n_tokens * d)
+        self.to_v = nn.Linear(z_dim, n_tokens * d)
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, n_heads) for _ in range(n_layers))
         self.region = RegionHead(z_dim)
@@ -166,8 +157,8 @@ class ObjectDecoder(nn.Module):
         K = slots.shape[0]
         centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
-        k = self.norm_kv(self.k_proj(slots).view(K, self.M, self.d))
-        v = self.norm_kv(self.v_proj(slots).view(K, self.M, self.d))
+        k = self.norm_kv(self.to_k(slots).view(K, self.M, self.d))
+        v = self.norm_kv(self.to_v(slots).view(K, self.M, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
         return self.head(q, centre, extent, colour), extent

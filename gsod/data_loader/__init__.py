@@ -18,6 +18,8 @@ __all__ = [
     "dataset_meta",
     "hit_distance_to_depth",
     "make_dataset",
+    "dataset_kwargs",
+    "eval_dataset",
     "scene_files",
 ]
 
@@ -49,6 +51,24 @@ def make_dataset(
         load_masks=load_masks,
         load_depth=load_depth,
     )
+
+
+def dataset_kwargs(cfg) -> dict:
+    """make_dataset keyword arguments from a config profile."""
+    return dict(
+        dataset_mode=cfg.dataset_mode,
+        image_size=cfg.dataset_image_size,
+        focal_ratio=cfg.dataset_focal_ratio,
+        n_views=cfg.n_views,
+        val_fraction=cfg.val_fraction,
+        seed=cfg.seed,
+    )
+
+
+def eval_dataset(cfg, root: str | Path, split: str):
+    """A split with GT masks, for evaluation."""
+    data = make_dataset(root, split, load_masks=True, **dataset_kwargs(cfg))
+    return WithGTMasks(data, root) if cfg.dataset_mode == "primordia" else data
 
 
 def dataset_meta(

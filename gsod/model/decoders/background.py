@@ -14,7 +14,7 @@ import math
 import torch
 from torch import nn
 
-from gsod.model.decoders.objects import positional_encoding
+from gsod.model.layers import logit, positional_encoding, shift_colour
 
 ANCHOR_SIDE = 10
 GAUSSIANS_PER_ANCHOR = 64
@@ -51,13 +51,13 @@ class BackgroundDecoder(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(d_in, hidden_dim), nn.ReLU(True), nn.Linear(hidden_dim, hidden_dim), nn.ReLU(True)
         )
-        self.out = nn.Linear(hidden_dim, GAUSSIANS_PER_ANCHOR * _N_OUT)
+        self.to_out = nn.Linear(hidden_dim, GAUSSIANS_PER_ANCHOR * _N_OUT)
         with torch.no_grad():
-            self.out.weight.mul_(0.1)
-            bias = self.out.bias.view(GAUSSIANS_PER_ANCHOR, _N_OUT)
+            self.to_out.weight.mul_(0.1)
+            bias = self.to_out.bias.view(GAUSSIANS_PER_ANCHOR, _N_OUT)
             bias.zero_()
-            bias[:, 4] = math.log(FLOOR_OPACITY_INIT / (1.0 - FLOOR_OPACITY_INIT))
-            self.out.weight.view(GAUSSIANS_PER_ANCHOR, _N_OUT, -1)[:, 8:].zero_()  # sh1: view-independent at first
+            bias[:, 4] = logit(FLOOR_OPACITY_INIT)
+            self.to_out.weight.view(GAUSSIANS_PER_ANCHOR, _N_OUT, -1)[:, 8:].zero_()  # sh1: view-independent at first
         self.register_buffer("anchors", _anchors(), persistent=False)
         self.register_buffer("pattern", _cell_pattern(), persistent=False)
 
@@ -72,11 +72,11 @@ class BackgroundDecoder(nn.Module):
         n_anchor = self.anchors.shape[0]
         pe = positional_encoding(self.anchors / _HALF, _PE_BANDS)
         feat = self.mlp(torch.cat([pe, torch.cat([latent, azimuth]).expand(n_anchor, -1)], -1))
-        raw = self.out(feat).view(n_anchor, GAUSSIANS_PER_ANCHOR, _N_OUT)
+        raw = self.to_out(feat).view(n_anchor, GAUSSIANS_PER_ANCHOR, _N_OUT)
 
         xy = self.anchors[:, None, :2] + self.pattern + 0.5 * _SPACING * torch.tanh(raw[..., :2])
         size = _SPACING / math.sqrt(GAUSSIANS_PER_ANCHOR) * torch.exp(2.0 * torch.tanh(raw[..., 2:4]))
-        rgb = torch.sigmoid(torch.logit(mean.clamp(0.02, 0.98)) + raw[..., 5:8])
+        rgb = shift_colour(mean, raw[..., 5:8])
         n = n_anchor * GAUSSIANS_PER_ANCHOR
         return {
             "mu": torch.cat([xy, torch.zeros_like(xy[..., :1])], -1).reshape(n, 3),

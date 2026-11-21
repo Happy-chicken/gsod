@@ -20,8 +20,8 @@ import wandb
 from torch.utils.data import Subset
 
 from gsod.configs import DATASETS, config_for, run_config
-from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
-from gsod.model import build_model
+from gsod.data_loader import eval_dataset
+from gsod.model import load_model
 from gsod.model.evaluate import (
     DIAGNOSTIC_KEYS,
     RECONSTRUCTION_KEYS,
@@ -31,10 +31,9 @@ from gsod.model.evaluate import (
     evaluate,
     slot_table,
 )
-from gsod.utils.io import latest_run_dir, load_networks
-from gsod.utils.visualize import panels, save_panels, scene_images, wandb_images, wandb_slot_table
+from gsod.utils.io import latest_run_dir
+from gsod.utils.visualize import WANDB_PROJECT, panels, save_panels, scene_images, wandb_images, wandb_slot_table
 
-WANDB_PROJECT = "gsod"
 IMAGE_SCENES = 16
 WORST_SCENES = 8
 
@@ -74,28 +73,8 @@ def main() -> None:
     device = torch.device("cuda")
 
     cfg = run_config(cfg, Path(checkpoint))
-    meta = dataset_meta(
-        data_root,
-        dataset_mode=cfg.dataset_mode,
-        image_size=cfg.dataset_image_size,
-        focal_ratio=cfg.dataset_focal_ratio,
-    )
-    model = build_model(cfg, meta).to(device)
-    load_networks(checkpoint, args.suffix, model.networks(), device=device)
-
-    dataset = make_dataset(
-        data_root,
-        args.split,
-        dataset_mode=cfg.dataset_mode,
-        image_size=cfg.dataset_image_size,
-        focal_ratio=cfg.dataset_focal_ratio,
-        n_views=cfg.n_views,
-        val_fraction=cfg.val_fraction,
-        seed=cfg.seed,
-        load_masks=True,  # CLEVR-567 *_mask.png; ignored by Primordia
-    )
-    if cfg.dataset_mode == "primordia":
-        dataset = WithGTMasks(dataset, data_root)
+    model = load_model(cfg, data_root, checkpoint, args.suffix, device)
+    dataset = eval_dataset(cfg, data_root, args.split)
     if args.scenes is not None and args.scenes < len(dataset):
         dataset = Subset(dataset, range(args.scenes))
     result = evaluate(model, dataset, device, IMAGE_SCENES)

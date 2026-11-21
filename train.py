@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import lightning as L
@@ -22,7 +22,7 @@ from lightning.pytorch.loggers import WandbLogger
 from torch.utils.data import DataLoader, Subset
 
 from gsod.configs import DATASETS, BaseConfig, config_for
-from gsod.data_loader import dataset_meta, make_dataset, WithGTMasks
+from gsod.data_loader import dataset_kwargs, dataset_meta, eval_dataset, make_dataset
 from gsod.model import build_model
 from gsod.model.evaluate import (
     DIAGNOSTIC_KEYS,
@@ -34,9 +34,8 @@ from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
 from gsod.utils.schedule import cosine
-from gsod.utils.visualize import wandb_images, wandb_slot_table
+from gsod.utils.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
 
-WANDB_PROJECT = "gsod"
 IMAGE_SCENES = 4
 
 
@@ -180,23 +179,11 @@ def _has_masks(dataset) -> bool:
 def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> None:
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    dataset_kwargs = dict(
-        dataset_mode=cfg.dataset_mode,
-        image_size=cfg.dataset_image_size,
-        focal_ratio=cfg.dataset_focal_ratio,
-        n_views=cfg.n_views,
-        val_fraction=cfg.val_fraction,
-        seed=cfg.seed,
-    )
-    train_set = _first(make_dataset(cfg.data_root, "train", **dataset_kwargs), cfg.train_scenes)
-    val_set = make_dataset(cfg.data_root, "val", load_masks=True, **dataset_kwargs)
-    if cfg.dataset_mode == "primordia":
-        val_set = WithGTMasks(val_set, cfg.data_root)
-    val_set = _first(val_set, cfg.val_scenes)
+    train_set = _first(make_dataset(cfg.data_root, "train", **dataset_kwargs(cfg)), cfg.train_scenes)
+    val_set = _first(eval_dataset(cfg, cfg.data_root, "val"), cfg.val_scenes)
     monitor_set, monitor_root = val_set, f"{cfg.data_root} (val)"
     if cfg.test_root:
-        test_set = make_dataset(cfg.test_root, "test", load_masks=True, **dataset_kwargs)
-        monitor_set = _first(test_set, cfg.monitor_scenes)
+        monitor_set = _first(eval_dataset(cfg, cfg.test_root, "test"), cfg.monitor_scenes)
         monitor_root = f"{cfg.test_root} (test, first {len(monitor_set)})"
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
     print(f"train: {cfg.data_root} ({len(train_set)} scenes)")
@@ -288,28 +275,8 @@ def main() -> None:
             )
         cfg = replace(cfg, out_dir=latest)
 
-    fields = [
-        "epochs",
-        "lr",
-        "seed",
-        "num_workers",
-        "eval_every",
-        "save_every",
-        "input_size",
-        "z_dim",
-        "num_slots",
-        "attn_iter",
-        "gaussians_per_slot",
-        "decoder_hidden_dim",
-        "train_scenes",
-        "val_scenes",
-        "monitor_scenes",
-    ]
-    values = {
-        field: getattr(args, field)
-        for field in fields
-        if getattr(args, field) is not None
-    }
+    known = {f.name for f in fields(cfg)}
+    values = {k: v for k, v in vars(args).items() if v is not None and k in known}
     if args.data is not None:
         values["data_root"] = args.data
     if args.out is not None:

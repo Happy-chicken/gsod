@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.nn import init
 
+from gsod.model.layers import mlp
 from gsod.utils.schedule import cosine
 
 # Query noise schedule.
@@ -29,11 +30,6 @@ def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
         return x
     keep = (torch.rand(x.shape[0], 1, 1, device=x.device) >= DROP_PATH).to(x.dtype)
     return x * keep / (1.0 - DROP_PATH)
-
-
-def _mlp(d_in: int, hidden: int, d_out: int) -> nn.Sequential:
-    """Pre-LayerNorm two-layer MLP: LayerNorm -> Linear -> ReLU -> Linear."""
-    return nn.Sequential(nn.LayerNorm(d_in), nn.Linear(d_in, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, d_out))
 
 
 class SlotAttention(nn.Module):
@@ -61,8 +57,8 @@ class SlotAttention(nn.Module):
         init.xavier_uniform_(self.slots_init.weight)
 
         hidden_dim = max(slot_dim, hidden_dim)
-        self.pos_proj = nn.Linear(4, in_dim)
-        self.feat_mlp = _mlp(in_dim, hidden_dim, slot_dim)
+        self.to_pos = nn.Linear(4, in_dim)
+        self.mlp_feat = mlp(in_dim, hidden_dim, slot_dim, norm=True)
         self.norm_feat = nn.LayerNorm(slot_dim)
         self.to_k = nn.Linear(slot_dim, slot_dim, bias=False)
         self.to_v = nn.Linear(slot_dim, slot_dim, bias=False)
@@ -70,16 +66,16 @@ class SlotAttention(nn.Module):
         self.to_q_bg = nn.Sequential(nn.LayerNorm(slot_dim), nn.Linear(slot_dim, slot_dim, bias=False))
         self.gru = nn.GRUCell(slot_dim, slot_dim)
         self.gru_bg = nn.GRUCell(slot_dim, slot_dim)
-        self.to_res = _mlp(slot_dim, hidden_dim, slot_dim)
-        self.to_res_bg = _mlp(slot_dim, hidden_dim, slot_dim)
-        self.res_proj = nn.Linear(1, slot_dim)
-        nn.init.zeros_(self.res_proj.weight)
-        nn.init.zeros_(self.res_proj.bias)
+        self.mlp = mlp(slot_dim, hidden_dim, slot_dim, norm=True)
+        self.mlp_bg = mlp(slot_dim, hidden_dim, slot_dim, norm=True)
+        self.to_err = nn.Linear(1, slot_dim)
+        nn.init.zeros_(self.to_err.weight)
+        nn.init.zeros_(self.to_err.bias)
 
-    def _update(self, gru: nn.GRUCell, res: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
+    def _update(self, gru: nn.GRUCell, mlp: nn.Module, updates: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         b, k, d = prev.shape
         slots = gru(updates.reshape(-1, d), prev.reshape(-1, d)).reshape(b, k, d)
-        return slots + _drop_path(res(slots), self.training)
+        return slots + _drop_path(mlp(slots), self.training)
 
     @staticmethod
     def _grid(n_tokens: int, device: torch.device) -> torch.Tensor:
@@ -96,7 +92,7 @@ class SlotAttention(nn.Module):
 
     def _keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
-        feat = self.feat_mlp(feat + self.pos_proj(self._grid(feat.shape[1], feat.device)))
+        feat = self.mlp_feat(feat + self.to_pos(self._grid(feat.shape[1], feat.device)))
         feat = self.norm_feat(feat)
         return self.to_k(feat), self.to_v(feat)
 
@@ -112,8 +108,8 @@ class SlotAttention(nn.Module):
         """Tokens (b, N, C), slots from forward, residual (b, N) -> object
         slots and attention after one residual-aware update."""
         k, v = self._keys_values(feat)
-        attn, updates = self._attend(slot_bg[:, None], slot_fg, k, v, k + self.res_proj(residual[..., None]))
-        return self._update(self.gru, self.to_res, updates[:, 1:], slot_fg), attn
+        attn, updates = self._attend(slot_bg[:, None], slot_fg, k, v, k + self.to_err(residual[..., None]))
+        return self._update(self.gru, self.mlp, updates[:, 1:], slot_fg), attn
 
     def forward(self, feat: torch.Tensor):
         b = feat.shape[0]
@@ -131,7 +127,7 @@ class SlotAttention(nn.Module):
                 slot_fg = slot_fg.detach() + start[:, 1:] - start[:, 1:].detach()
             attn, updates = self._attend(slot_bg, slot_fg, k, v, k)  # (b, K, N)
             updates_bg, updates_fg = updates[:, :1], updates[:, 1:]
-            slot_bg = self._update(self.gru_bg, self.to_res_bg, updates_bg, slot_bg)
-            slot_fg = self._update(self.gru, self.to_res, updates_fg, slot_fg)
+            slot_bg = self._update(self.gru_bg, self.mlp_bg, updates_bg, slot_bg)
+            slot_fg = self._update(self.gru, self.mlp, updates_fg, slot_fg)
 
         return slot_bg[:, 0], slot_fg, attn
