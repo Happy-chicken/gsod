@@ -36,13 +36,16 @@ class GSODModel(nn.Module):
         num_slots: int,
         attn_iter: int,
         gaussians_per_slot: int,
+        gaussians_per_query: int,
         decoder_hidden_dim: int,
         focal_ratio: tuple[float, float],
         near: float,
     ):
-        """num_slots: K, the background slot included."""
+        """num_slots: K, the background slot included; gaussians_per_slot: G,
+        gaussians_per_query: M (G / M decoder queries, M Gaussians each)."""
         super().__init__()
         assert num_slots >= 2, "num_slots counts the background; need >= 2"
+        assert gaussians_per_slot % gaussians_per_query == 0, "gaussians_per_slot must be a multiple of gaussians_per_query"
         self.image_size = tuple(image_size)
         self.input_size = input_size
         self.focal_ratio = tuple(focal_ratio)
@@ -50,7 +53,9 @@ class GSODModel(nn.Module):
 
         self.encoder = Encoder(z_dim)
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
-        self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
+        self.obj_decoder = ObjectDecoder(
+            z_dim, gaussians_per_slot, gaussians_per_query, decoder_hidden_dim, image_size, focal_ratio
+        )
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:

@@ -271,6 +271,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
+    parser.add_argument("--gaussians-per-query", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")

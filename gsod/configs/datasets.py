@@ -64,6 +64,7 @@ MODEL_FIELDS = (
     "num_slots",
     "attn_iter",
     "gaussians_per_slot",
+    "gaussians_per_query",
     "decoder_hidden_dim",
     "near",
 )
