@@ -105,8 +105,10 @@ class ObjectHead(nn.Module):
         t = torch.tanh(raw[..., 0:3])
         xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent], above the floor's Gaussians.
-        lo = (centre[:, 2] - extent[:, 2]).clamp_min(BACKGROUND_THICKNESS)[:, None, None]
-        hi = (centre[:, 2] + extent[:, 2])[:, None, None]
+        # centre_z = extent_z (box on the floor); not read from centre: Inductor can't compile
+        # a fixed column of RegionHead's cat.
+        lo = BACKGROUND_THICKNESS
+        hi = (2.0 * extent[:, 2])[:, None, None]
         mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
         return {
