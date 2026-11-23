@@ -71,40 +71,26 @@ def attention_anchors(
 
 class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes,
-    unbounded, in units of BOX_INIT; the box stands on the floor. Starts as a
-    box of half side BOX_INIT at the anchor.
-
-    One hidden layer, two zero-initialised output layers (shift, log size).
-    Everything is built with whole-row (K, 3) arithmetic, no slice + cat: a
-    concatenated column of a Linear output made Inductor emit a Triton load at
-    a constant index (tl.broadcast_to(4 + (0), ...)) that does not compile."""
+    unbounded, in units of BOX_INIT; the box stands on the floor (height
+    2 * extent_z). Starts as a box of half side BOX_INIT at the anchor."""
 
     def __init__(self, z_dim: int):
         super().__init__()
-        self.hidden = nn.Sequential(nn.Linear(z_dim, REGION_HIDDEN), nn.ReLU())
-        self.to_shift = nn.Linear(REGION_HIDDEN, 2)
-        self.to_size = nn.Linear(REGION_HIDDEN, 3)
-        for out in (self.to_shift, self.to_size):
-            nn.init.zeros_(out.weight)
-            nn.init.zeros_(out.bias)
-        self.register_buffer("flat", torch.tensor([1.0, 1.0, 0.0]), persistent=False)
-        self.register_buffer("up", torch.tensor([0.0, 0.0, 1.0]), persistent=False)
-        # (x, y, z) @ turn.mT = (-y, x, 0): a quarter turn about +z.
-        turn = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
-        self.register_buffer("turn", turn, persistent=False)
+        self.mlp = mlp(z_dim, REGION_HIDDEN, 5)
+        with torch.no_grad():
+            self.mlp[-1].weight.zero_()
+            self.mlp[-1].bias.zero_()
 
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
-        h = self.hidden(slots)
-        shift = BOX_INIT * self.to_shift(h)
-        extent = BOX_INIT * torch.exp(self.to_size(h))
-        along = F.normalize(ray * self.flat, dim=-1)
-        across = along @ self.turn.mT
-        # On the floor at the shifted anchor, raised by its half height.
-        centre = anchor * self.flat + shift[:, :1] * along + shift[:, 1:] * across + extent * self.up
-        return centre, extent
+        """slots (K, C), anchor, ray (K, 3) -> box centre on the floor (K, 2), half sizes (K, 3)."""
+        raw = self.mlp(slots)
+        ray_xy = F.normalize(ray[:, :2], dim=-1)
+        across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
+        t = BOX_INIT * raw[:, :2]
+        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
+        return xy, BOX_INIT * torch.exp(raw[:, 2:])
 
 
 class ObjectHead(nn.Module):
@@ -125,29 +111,29 @@ class ObjectHead(nn.Module):
             w[:, 3:].mul_(0.1)
             w[:, 14:].zero_()  # view-independent at first
             b[:, 6] = 1.0  # identity quaternion (wxyz)
-        # Box bottom above the floor's Gaussians (only z bounded).
-        self.register_buffer(
-            "floor", torch.tensor([-float("inf"), -float("inf"), BACKGROUND_THICKNESS]), persistent=False
-        )
 
     def forward(
         self,
         feat: torch.Tensor,
-        centre: torch.Tensor,
+        xy: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, Q, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, Q*M, ...)."""
+        """feat (K, Q, d), box centre on the floor (K, 2), half sizes / colour
+        (K, 3) -> Gaussians (K, Q*M, ...)."""
         query, child = self.mlp(feat).split([6, self.m * 23], -1)
         child = child.unflatten(-1, (self.m, 23))  # (K, Q, M, 23)
-        lo = torch.maximum(centre - extent, self.floor)[:, None]
-        hi = (centre + extent)[:, None]
-        sub_centre = lo + (hi - lo) * 0.5 * (torch.tanh(query[..., 0:3]) + 1.0)  # (K, Q, 3)
-        sub_extent = 0.5 * (hi - lo) / self.shrink * torch.exp(query[..., 3:6])
-        mu = sub_centre[:, :, None] + sub_extent[:, :, None] * torch.tanh(child[..., 0:3])
+        # Position in box units (about [-1, 1]^3): sub-box centre + sub-box size * offset.
+        size = torch.exp(query[..., 3:6]) / self.shrink
+        u = torch.tanh(query[..., None, 0:3]) + size[..., None, :] * torch.tanh(child[..., 0:3])
+        box_xy = xy[:, None, None] + extent[:, None, None, :2] * u[..., :2]
+        # Height: over [floor, 2 * extent_z], above the floor's Gaussians.
+        lo = BACKGROUND_THICKNESS
+        hi = (2.0 * extent[:, 2]).clamp_min(lo)[:, None, None, None]
+        z = lo + (hi - lo) * 0.5 * (u[..., 2:] + 1.0)
 
         gaussians = {
-            "mu": mu,
+            "mu": torch.cat([box_xy, z], -1),
             "scale": SCALE_FRACTION * BOX_INIT * torch.exp(child[..., 3:6]),
             "quat": F.normalize(child[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(child[..., 10]),
@@ -216,13 +202,13 @@ class ObjectDecoder(nn.Module):
         ray = ray.flatten(0, 1)
         colour = colour.flatten(0, 1)
         K = slots.shape[0]
-        centre, extent = self.region(slots, anchor, ray)
+        xy, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, centre, extent, colour)
+        gaussians = self.head(q, xy, extent, colour)
         presence = (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0)
         opacity = gaussians["opacity"]
         gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * presence[:, None]
