@@ -8,8 +8,6 @@ AREA_FULL, at most 1): the attention decides whether a slot shows, never 0.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -29,8 +27,6 @@ QUERY_STD = 2.0
 # Transformer: heads, slot tokens, layers; RegionHead MLP width.
 N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
 REGION_HIDDEN = 64
-# ObjectHead outputs per query (sub-centre, log sub-size) and per Gaussian.
-_QUERY_OUT, _CHILD_OUT = 6, 23
 
 
 # Anchors weight tokens by attn ** this (lean to the stronger core).
@@ -73,19 +69,6 @@ def attention_anchors(
     return p @ points, p @ colours
 
 
-def _child_pattern(m: int) -> torch.Tensor:
-    """(m, 3) initial child offsets in [-1, 1]^3, spread through the unit ball
-    (Fibonacci sphere, radius growing as cbrt); one child sits at the centre."""
-    if m == 1:
-        return torch.zeros(1, 3)
-    i = torch.arange(m, dtype=torch.float32) + 0.5
-    z = 1.0 - 2.0 * i / m
-    r_xy = (1.0 - z * z).clamp_min(0.0).sqrt()
-    angle = i * math.pi * (3.0 - math.sqrt(5.0))
-    unit = torch.stack([r_xy * angle.cos(), r_xy * angle.sin(), z], -1)
-    return unit * (i / m).pow(1.0 / 3.0)[:, None]
-
-
 class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes,
     unbounded, in units of BOX_INIT; the box stands on the floor. Starts as a
@@ -125,29 +108,24 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Query feature -> a sub-box inside the slot's box and M Gaussians in it.
-
-    Per query: sub-centre (3, tanh over the box) and log sub-size (3, starting
-    at box / Q^(1/3) so the Q sub-boxes tile the box); per child: offset in the
-    sub-box (3, tanh), log scale (3), quaternion (4), opacity, rgb residual (3),
-    sh1 (9)."""
+    """Query feature -> a sub-box in the slot's box (centre 3, log size 3) and
+    M Gaussians in it, 23 numbers each: offset 3, log scale 3, quaternion 4,
+    opacity 1, rgb residual 3, sh1 9."""
 
     def __init__(self, d_model: int, n_queries: int, m: int):
         super().__init__()
         self.m = int(m)
-        self.shrink = float(n_queries) ** (1.0 / 3.0)
-        self.mlp = mlp(d_model, d_model, _QUERY_OUT + self.m * _CHILD_OUT)
+        self.shrink = float(n_queries) ** (1.0 / 3.0)  # Q sub-boxes tile the box
+        self.mlp = mlp(d_model, d_model, 6 + self.m * 23)
         with torch.no_grad():
             out = self.mlp[-1]
             out.bias.zero_()
-            out.weight[3:_QUERY_OUT].mul_(0.1)  # sub-size starts near box / Q^(1/3)
-            w = out.weight[_QUERY_OUT:].view(self.m, _CHILD_OUT, -1)
-            b = out.bias[_QUERY_OUT:].view(self.m, _CHILD_OUT)
-            w.mul_(0.1)  # children start at their pattern, scale, identity rotation
+            out.weight[3:6].mul_(0.1)
+            w, b = out.weight[6:].view(self.m, 23, -1), out.bias[6:].view(self.m, 23)
+            w[:, 3:].mul_(0.1)
             w[:, 14:].zero_()  # view-independent at first
-            b[:, 0:3] = torch.atanh(0.8 * _child_pattern(self.m))
             b[:, 6] = 1.0  # identity quaternion (wxyz)
-        # Floor for positions: only z is bounded (above the floor's Gaussians).
+        # Box bottom above the floor's Gaussians (only z bounded).
         self.register_buffer(
             "floor", torch.tensor([-float("inf"), -float("inf"), BACKGROUND_THICKNESS]), persistent=False
         )
@@ -160,16 +138,13 @@ class ObjectHead(nn.Module):
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """feat (K, Q, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, Q*M, ...)."""
-        query, child = self.mlp(feat).split([_QUERY_OUT, self.m * _CHILD_OUT], -1)
-        child = child.unflatten(-1, (self.m, _CHILD_OUT))  # (K, Q, M, 23)
-
-        # The box, its bottom above the floor's Gaussians.
+        query, child = self.mlp(feat).split([6, self.m * 23], -1)
+        child = child.unflatten(-1, (self.m, 23))  # (K, Q, M, 23)
         lo = torch.maximum(centre - extent, self.floor)[:, None]
         hi = (centre + extent)[:, None]
         sub_centre = lo + (hi - lo) * 0.5 * (torch.tanh(query[..., 0:3]) + 1.0)  # (K, Q, 3)
         sub_extent = 0.5 * (hi - lo) / self.shrink * torch.exp(query[..., 3:6])
         mu = sub_centre[:, :, None] + sub_extent[:, :, None] * torch.tanh(child[..., 0:3])
-        mu = torch.maximum(mu, self.floor)
 
         gaussians = {
             "mu": mu,
