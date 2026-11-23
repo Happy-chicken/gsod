@@ -1,6 +1,8 @@
-"""Object decoder: slot -> box at the attention anchor -> G / M queries, each a
-sub-box in the box holding M Gaussians (G in all).
-The anchor: where the slot's view-0 tokens meet the floor, attention-weighted.
+"""Object decoder: slot -> box on the slot's attention ray -> G / M queries,
+each a sub-box in the box holding M Gaussians (G in all).
+The attention ray: view 0's ray through the slot's attention-weighted pixel;
+the box stands on the floor, centred where that ray reaches its half height,
+then moved along / across the ray as learned.
 Box sizes, shifts and Gaussian scales unbounded; BOX_INIT only sets where they start.
 Opacity = per-slot share of its brightest Gaussian x presence (attention area /
 AREA_FULL, at most 1): the attention decides whether a slot shows, never 0.
@@ -29,14 +31,15 @@ N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
 REGION_HIDDEN = 64
 
 
-# Anchors weight tokens by attn ** this (lean to the stronger core).
+# Attention rays weight tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 
 
 def _token_rays(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
-    """(..., side*side, 3) scene-frame directions of the tokens' view-0 rays."""
+    """(..., side*side, 3) scene-frame directions of the tokens' view-0 rays
+    (camera z = 1, so linear in the pixel position)."""
     h, w = image_size
     idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
     u = (idx + 0.5) * w / side - 0.5
@@ -45,52 +48,50 @@ def _token_rays(
     return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.mT
 
 
-def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
-    """Where the rays (..., N, 3) reach height z (..., N, 2); rays not going down stay at the camera."""
-    t = ((z - frame.origin[..., 2:]) / directions[..., 2].clamp(max=-1e-6)).clamp(min=0.0)
-    return frame.origin[..., None, :2] + t[..., None] * directions[..., :2]
-
-
-def token_points(
-    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
-) -> torch.Tensor:
-    """(..., side*side, 3): where each token's view-0 ray meets the floor (within it)."""
-    xy = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), 0.0)
-    xy = xy.clamp(-FLOOR_HALF, FLOOR_HALF)
-    return torch.cat([xy, torch.zeros_like(xy[..., :1])], -1)
-
-
-def attention_anchors(
-    attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
+def attention_rays(
+    attn: torch.Tensor, rays: torch.Tensor, colours: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """attn (..., K, N), token points and colours (..., N, 3) -> where each
-    slot's attention points and the colour there (..., K, 3)."""
+    """attn (..., K, N), token rays and colours (..., N, 3) -> each slot's
+    view-0 ray through its attention-weighted pixel (unit, (..., K, 3)) and the
+    colour there (..., K, 3). Rays are linear in the pixel, so their weighted
+    mean is the ray through the weighted mean pixel."""
     p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=-1)
-    return p @ points, p @ colours
+    return F.normalize(p @ rays, dim=-1), p @ colours
 
 
 class RegionHead(nn.Module):
-    """Slot latent -> box shift (along / across view 0's ray) and half sizes,
-    unbounded, in units of BOX_INIT; the box stands on the floor. Starts as a
-    box of half side BOX_INIT at the anchor."""
+    """Slot latent + view 0's ray through the slot's attention -> a box on the
+    floor around a point on that ray.
+
+    The object lies on the ray; the box centre is taken where the ray reaches
+    the box's half height (extent_z), plus a learned step along the ray (depth)
+    and across it (occlusion); its half sizes are learned. All unbounded, in
+    units of BOX_INIT; zero at first. Camera height and ray slope are inputs,
+    so the depth step can depend on the geometry."""
 
     def __init__(self, z_dim: int):
         super().__init__()
-        self.mlp = mlp(z_dim, REGION_HIDDEN, 5)
+        self.mlp = mlp(z_dim + 2, REGION_HIDDEN, 5)
         with torch.no_grad():
             self.mlp[-1].weight.zero_()
             self.mlp[-1].bias.zero_()
 
     def forward(
-        self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
+        self, slots: torch.Tensor, origin: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
-        raw = self.mlp(slots)
+        """slots (K, C), camera origin, unit ray (K, 3) -> box centre, half sizes (K, 3)."""
+        raw = self.mlp(torch.cat([slots, origin[:, 2:], ray[:, 2:]], -1))
+        extent = BOX_INIT * torch.exp(raw[:, 2:])
+        # Depth at which the ray reaches the box centre's height (no gradient
+        # into the height: position is moved by the depth step only).
+        height = extent[:, 2:].detach()
+        depth = ((height - origin[:, 2:]) / ray[:, 2:].clamp(max=-1e-3)).clamp_min(0.0)
+        depth = depth + BOX_INIT * raw[:, :1]
         ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
-        t = BOX_INIT * raw[:, :2]
-        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        extent = BOX_INIT * torch.exp(raw[:, 2:])
+        xy = origin[:, :2] + depth * ray[:, :2] + BOX_INIT * raw[:, 1:2] * across
+        xy = xy.clamp(-FLOOR_HALF, FLOOR_HALF)
+        # The box stands on the floor: centre at its half height.
         return torch.cat([xy, extent[:, 2:]], -1), extent
 
 
@@ -193,12 +194,12 @@ class ObjectDecoder(nn.Module):
         (B, K, 3); scene frame."""
         b, n_slots = slots.shape[:2]
         side = int(round(attn.shape[-1] ** 0.5))
-        points = token_points(frame, side, self.image_size, self.focal_ratio)
-        anchor, colour = attention_anchors(attn, points, colours)
-        ray = F.normalize(anchor - frame.origin[:, None], dim=-1)
-        slots, anchor, ray, colour = (x.flatten(0, 1) for x in (slots, anchor, ray, colour))
+        rays = _token_rays(frame, side, self.image_size, self.focal_ratio)
+        ray, colour = attention_rays(attn, rays, colours)
+        origin = frame.origin[:, None].expand(-1, n_slots, -1)
+        slots, origin, ray, colour = (x.flatten(0, 1) for x in (slots, origin, ray, colour))
         K = slots.shape[0]
-        centre, extent = self.region(slots, anchor, ray)
+        centre, extent = self.region(slots, origin, ray)
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
