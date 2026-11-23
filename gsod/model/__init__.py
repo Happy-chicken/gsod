@@ -19,7 +19,6 @@ def build_model(cfg: BaseConfig) -> GSODModel:
         num_slots=cfg.num_slots,
         attn_iter=cfg.attn_iter,
         gaussians_per_slot=cfg.gaussians_per_slot,
-        gaussians_per_query=cfg.gaussians_per_query,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         focal_ratio=tuple(cfg.dataset_focal_ratio),
         near=cfg.near,

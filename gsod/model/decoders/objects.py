@@ -1,5 +1,4 @@
-"""Object decoder: slot -> box on the slot's attention ray -> G / M queries,
-each a sub-box in the box holding M Gaussians (G in all).
+"""Object decoder: slot -> box on the slot's attention ray -> G Gaussians in it.
 The attention ray: view 0's ray through the slot's attention-weighted pixel;
 the box stands on the floor, centred where that ray reaches its half height,
 then moved along / across the ray as learned.
@@ -96,23 +95,17 @@ class RegionHead(nn.Module):
 
 
 class ObjectHead(nn.Module):
-    """Query feature -> a sub-box in the slot's box (centre 3, log size 3) and
-    M Gaussians in it, 23 numbers each: offset 3, log scale 3, quaternion 4,
-    opacity 1, rgb residual 3, sh1 9."""
+    """Gaussian feature -> one Gaussian."""
 
-    def __init__(self, d_model: int, n_queries: int, m: int):
+    def __init__(self, d_model: int):
         super().__init__()
-        self.m = int(m)
-        self.shrink = float(n_queries) ** (1.0 / 3.0)  # Q sub-boxes tile the box
-        self.mlp = mlp(d_model, d_model, 6 + self.m * 23)
+        self.mlp = mlp(d_model, d_model, 23)
         with torch.no_grad():
             out = self.mlp[-1]
+            out.weight[3:].mul_(0.1)
+            out.weight[14:].zero_()  # view-independent at first
             out.bias.zero_()
-            out.weight[3:6].mul_(0.1)
-            w, b = out.weight[6:].view(self.m, 23, -1), out.bias[6:].view(self.m, 23)
-            w[:, 3:].mul_(0.1)
-            w[:, 14:].zero_()  # view-independent at first
-            b[:, 6] = 1.0  # identity quaternion (wxyz)
+            out.bias[6] = 1.0  # identity quaternion (wxyz)
 
     def forward(
         self,
@@ -121,27 +114,23 @@ class ObjectHead(nn.Module):
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, Q, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, Q*M, ...)."""
-        query, child = self.mlp(feat).split([6, self.m * 23], -1)
-        child = child.unflatten(-1, (self.m, 23))  # (K, Q, M, 23)
-        # Position in box units (about [-1, 1]^3): sub-box centre + sub-box size * offset.
-        size = torch.exp(query[..., 3:6]) / self.shrink
-        u = torch.tanh(query[..., None, 0:3]) + size[..., None, :] * torch.tanh(child[..., 0:3])
-        xy = centre[:, None, None, :2] + extent[:, None, None, :2] * u[..., :2]
+        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
+        raw = self.mlp(feat)
+        t = torch.tanh(raw[..., 0:3])
+        xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
         # Height: over [centre - extent, centre + extent], above the floor's Gaussians.
-        lo = (centre[:, 2] - extent[:, 2]).clamp_min(BACKGROUND_THICKNESS)[:, None, None, None]
-        hi = (centre[:, 2] + extent[:, 2])[:, None, None, None]
-        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (u[..., 2:] + 1.0)], -1)
+        lo = (centre[:, 2] - extent[:, 2]).clamp_min(BACKGROUND_THICKNESS)[:, None, None]
+        hi = (centre[:, 2] + extent[:, 2])[:, None, None]
+        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
-        gaussians = {
+        return {
             "mu": mu,
-            "scale": SCALE_FRACTION * BOX_INIT * torch.exp(child[..., 3:6]),
-            "quat": F.normalize(child[..., 6:10], dim=-1),
-            "opacity": torch.sigmoid(child[..., 10]),
-            "rgb": shift_colour(colour[:, None, None], child[..., 11:14]),
-            "sh1": child[..., 14:23].unflatten(-1, (3, 3)),
+            "scale": SCALE_FRACTION * BOX_INIT * torch.exp(raw[..., 3:6]),
+            "quat": F.normalize(raw[..., 6:10], dim=-1),
+            "opacity": torch.sigmoid(raw[..., 10]),
+            "rgb": shift_colour(colour[:, None], raw[..., 11:14]),
+            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
-        return {name: value.flatten(1, 2) for name, value in gaussians.items()}
 
 
 class DecoderLayer(nn.Module):
@@ -158,7 +147,7 @@ class DecoderLayer(nn.Module):
         self.mlp = mlp(d_model, 2 * d_model, d_model, act=nn.GELU)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """q (K, Q, d), slot tokens k, v (K, T, d) -> (K, Q, d)."""
+        """q (K, G, d), slot tokens k, v (K, M, d) -> (K, G, d)."""
         x = self.norm_self(q)
         q = q + self.self_attn(x, x, x, need_weights=False)[0]
         q = q + self.cross_attn(self.norm_cross(q), k, v, need_weights=False)[0]
@@ -169,22 +158,20 @@ class ObjectDecoder(nn.Module):
     """Object slots -> Gaussians, scene frame."""
 
     def __init__(
-        self, z_dim: int, gaussians_per_slot: int, gaussians_per_query: int, hidden_dim: int,
+        self, z_dim: int, gaussians_per_slot: int, hidden_dim: int,
         image_size: tuple[int, int], focal_ratio: tuple[float, float],
     ):
         super().__init__()
-        assert gaussians_per_slot % gaussians_per_query == 0, "G must be a multiple of M"
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
         d = int(hidden_dim)
         self.d = d
-        n_queries = int(gaussians_per_slot) // int(gaussians_per_query)
-        self.queries = nn.Parameter(torch.randn(n_queries, d) * QUERY_STD)
+        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
         self.to_k = nn.Linear(z_dim, N_TOKENS * d)
         self.to_v = nn.Linear(z_dim, N_TOKENS * d)
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
-        self.head = ObjectHead(d, n_queries, gaussians_per_query)
+        self.head = ObjectHead(d)
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
