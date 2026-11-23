@@ -1,7 +1,4 @@
-"""Object decoder: slot -> box on the slot's attention ray -> G Gaussians in it.
-The attention ray: view 0's ray through the slot's attention-weighted pixel;
-the box stands on the floor, centred where that ray reaches its half height,
-then moved along / across the ray as learned.
+"""Object decoder: slot -> box on its attention ray -> G Gaussians in it.
 Box sizes, shifts and Gaussian scales unbounded; BOX_INIT only sets where they start.
 Opacity = per-slot share of its brightest Gaussian x presence (attention area /
 AREA_FULL, at most 1): the attention decides whether a slot shows, never 0.
@@ -37,8 +34,7 @@ _ANCHOR_SHARPNESS = 2.0
 def _token_rays(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
-    """(..., side*side, 3) scene-frame directions of the tokens' view-0 rays
-    (camera z = 1, so linear in the pixel position)."""
+    """(..., side*side, 3) scene-frame directions of the tokens' view-0 rays."""
     h, w = image_size
     idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
     u = (idx + 0.5) * w / side - 0.5
@@ -50,23 +46,13 @@ def _token_rays(
 def attention_rays(
     attn: torch.Tensor, rays: torch.Tensor, colours: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """attn (..., K, N), token rays and colours (..., N, 3) -> each slot's
-    view-0 ray through its attention-weighted pixel (unit, (..., K, 3)) and the
-    colour there (..., K, 3). Rays are linear in the pixel, so their weighted
-    mean is the ray through the weighted mean pixel."""
+    """attn (..., K, N), token rays / colours (..., N, 3) -> unit ray, colour (..., K, 3)."""
     p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=-1)
     return F.normalize(p @ rays, dim=-1), p @ colours
 
 
 class RegionHead(nn.Module):
-    """Slot latent + view 0's ray through the slot's attention -> a box on the
-    floor around a point on that ray.
-
-    The object lies on the ray; the box centre is taken where the ray reaches
-    the box's half height (extent_z), plus a learned step along the ray (depth)
-    and across it (occlusion); its half sizes are learned. All unbounded, in
-    units of BOX_INIT; zero at first. Camera height and ray slope are inputs,
-    so the depth step can depend on the geometry."""
+    """Slot + attention ray -> box on the floor around a point on the ray."""
 
     def __init__(self, z_dim: int):
         super().__init__()
@@ -79,18 +65,18 @@ class RegionHead(nn.Module):
         self, slots: torch.Tensor, origin: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """slots (K, C), camera origin, unit ray (K, 3) -> box centre, half sizes (K, 3)."""
+        # + camera height, ray slope
         raw = self.mlp(torch.cat([slots, origin[:, 2:], ray[:, 2:]], -1))
         extent = BOX_INIT * torch.exp(raw[:, 2:])
-        # Depth at which the ray reaches the box centre's height (no gradient
-        # into the height: position is moved by the depth step only).
+        # Start where the ray reaches the box's half height, then a learned depth step.
         height = extent[:, 2:].detach()
         depth = ((height - origin[:, 2:]) / ray[:, 2:].clamp(max=-1e-3)).clamp_min(0.0)
         depth = depth + BOX_INIT * raw[:, :1]
         ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
-        xy = origin[:, :2] + depth * ray[:, :2] + BOX_INIT * raw[:, 1:2] * across
+        xy = origin[:, :2] + depth * ray[:, :2] + BOX_INIT * raw[:, 1:2] * across  # + occlusion shift
         xy = xy.clamp(-FLOOR_HALF, FLOOR_HALF)
-        # The box stands on the floor: centre at its half height.
+        # Box on the floor.
         return torch.cat([xy, extent[:, 2:]], -1), extent
 
 
