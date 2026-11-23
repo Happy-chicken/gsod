@@ -1,0 +1,144 @@
+#!/usr/bin/env python
+"""Evaluate and render a checkpoint (model from the run's config.json).
+
+    python test.py --dataset clevr567 --split test --suffix best
+
+Writes metrics.json, scenes.csv, slots.csv, sc####/*.png to
+<checkpoint>/renders/<split>_<suffix>.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+from pathlib import Path
+
+import torch
+import wandb
+from torch.utils.data import Subset
+
+from gsod.configs import DATASETS, config_for, run_config
+from gsod.data_loader import make_dataset
+from gsod.eval.evaluate import (
+    DIAGNOSTIC_KEYS,
+    RECONSTRUCTION_KEYS,
+    SEGMENTATION_KEYS,
+    SLOT_COLUMNS,
+    collect,
+    evaluate,
+    slot_table,
+)
+from gsod.eval.visualize import WANDB_PROJECT, panels, save_panels, scene_images, wandb_images, wandb_slot_table
+from gsod.model import load_model
+from gsod.utils.io import latest_run_dir
+
+IMAGE_SCENES = 16
+WORST_SCENES = 8
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--dataset", choices=list(DATASETS), required=True
+    )
+    parser.add_argument("--data", default=None, help="dataset root")
+    parser.add_argument("--checkpoint", default=None, help="checkpoint directory")
+    parser.add_argument("--suffix", default="latest", help="checkpoint suffix")
+    parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    parser.add_argument("--out", default=None, help="output directory for PNGs")
+    parser.add_argument("--no-render", action="store_true", help="skip the PNG renders")
+    parser.add_argument("--scenes", type=int, default=None, help="first N scenes of the split")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = config_for(args.dataset)
+    data_root = args.data or (
+        cfg.test_root if args.split == "test" and cfg.test_root else cfg.data_root
+    )
+    checkpoint = args.checkpoint or latest_run_dir(cfg.dataset_mode)
+    if checkpoint is None:
+        raise FileNotFoundError(
+            "no timestamped checkpoint found; pass --checkpoint explicitly"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA testing requested but torch.cuda.is_available() is False"
+        )
+    device = torch.device("cuda")
+
+    cfg = run_config(cfg, Path(checkpoint))
+    model = load_model(cfg, checkpoint, args.suffix, device)
+    dataset = make_dataset(cfg, data_root, args.split, load_masks=True)
+    if args.scenes is not None and args.scenes < len(dataset):
+        dataset = Subset(dataset, range(args.scenes))
+    result = evaluate(model, dataset, device, IMAGE_SCENES)
+    groups = {
+        "seg": SEGMENTATION_KEYS,
+        "recon": RECONSTRUCTION_KEYS,
+        "diag": DIAGNOSTIC_KEYS,
+    }
+    summary = {
+        f"{group}/{key}": result.metrics[key] for group, keys in groups.items() for key in keys
+    }
+    m = result.metrics
+    print(f"{args.split} split ({len(dataset)} scenes)")
+    print(f"  2D   ARI {m['ari']:.4f}   FG-ARI {m['fg_ari']:.4f}")
+    print(f"  3D   NV-ARI {m['nv_ari']:.4f}")
+    print(f"  novel views   PSNR {m['psnr']:.2f}   SSIM {m['ssim']:.4f}   LPIPS {m['lpips']:.4f}")
+    print("  diag  " + "   ".join(f"{k} {m[k]:.3f}" for k in DIAGNOSTIC_KEYS))
+
+    # Worst NV-ARI first (scenes without GT last).
+    scenes = sorted(
+        result.per_scene, key=lambda r: (math.isnan(r["nv_ari"]), r["nv_ari"])
+    )
+    worst = {}
+    for row in scenes[:WORST_SCENES]:
+        rec = collect(model, dataset[row["index"]], device)
+        worst.update(scene_images(rec, slot_table(rec), prefix="worst_"))
+
+    run = wandb.init(
+        project=WANDB_PROJECT,
+        name=f"{Path(checkpoint).name}_{args.split}_{args.suffix}",
+        job_type="test",
+        dir=str(checkpoint),
+        config={"checkpoint": str(checkpoint), "suffix": args.suffix, "split": args.split},
+    )
+    run.summary.update(summary)
+    run.log(
+        {
+            "slots/table": wandb_slot_table(result.slots),
+            **wandb_images(result.images),
+            **wandb_images(worst),
+        }
+    )
+    run.finish()
+
+    out = Path(args.out or f"{checkpoint}/renders/{args.split}_{args.suffix}")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metrics.json").write_text(json.dumps(summary, indent=2))
+    _write_csv(out / "scenes.csv", scenes)
+    _write_csv(out / "slots.csv", result.slots, columns=list(SLOT_COLUMNS))
+    print(f"wrote {out}/metrics.json, scenes.csv (worst first) and slots.csv")
+    if not args.no_render:
+        for i in range(len(dataset)):
+            rec = collect(model, dataset[i], device)
+            save_panels(panels(rec, slot_table(rec)), out / f"sc{rec['scene']:04d}")
+        print(f"wrote the panels of {len(dataset)} scenes to {out}")
+
+
+def _write_csv(path: Path, rows: list[dict], columns: list[str] | None = None) -> None:
+    columns = columns or (list(rows[0]) if rows else [])
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+if __name__ == "__main__":
+    main()
