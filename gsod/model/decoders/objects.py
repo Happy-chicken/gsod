@@ -71,8 +71,8 @@ def attention_anchors(
 
 class RegionHead(nn.Module):
     """Slot latent -> box shift (along / across view 0's ray) and half sizes,
-    unbounded, in units of BOX_INIT; the box stands on the floor (height
-    2 * extent_z). Starts as a box of half side BOX_INIT at the anchor."""
+    unbounded, in units of BOX_INIT; the box stands on the floor. Starts as a
+    box of half side BOX_INIT at the anchor."""
 
     def __init__(self, z_dim: int):
         super().__init__()
@@ -84,13 +84,14 @@ class RegionHead(nn.Module):
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, ray (K, 3) -> box centre on the floor (K, 2), half sizes (K, 3)."""
+        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
         raw = self.mlp(slots)
         ray_xy = F.normalize(ray[:, :2], dim=-1)
         across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
         t = BOX_INIT * raw[:, :2]
         xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
-        return xy, BOX_INIT * torch.exp(raw[:, 2:])
+        extent = BOX_INIT * torch.exp(raw[:, 2:])
+        return torch.cat([xy, extent[:, 2:]], -1), extent
 
 
 class ObjectHead(nn.Module):
@@ -115,25 +116,24 @@ class ObjectHead(nn.Module):
     def forward(
         self,
         feat: torch.Tensor,
-        xy: torch.Tensor,
+        centre: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, Q, d), box centre on the floor (K, 2), half sizes / colour
-        (K, 3) -> Gaussians (K, Q*M, ...)."""
+        """feat (K, Q, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, Q*M, ...)."""
         query, child = self.mlp(feat).split([6, self.m * 23], -1)
         child = child.unflatten(-1, (self.m, 23))  # (K, Q, M, 23)
         # Position in box units (about [-1, 1]^3): sub-box centre + sub-box size * offset.
         size = torch.exp(query[..., 3:6]) / self.shrink
         u = torch.tanh(query[..., None, 0:3]) + size[..., None, :] * torch.tanh(child[..., 0:3])
-        box_xy = xy[:, None, None] + extent[:, None, None, :2] * u[..., :2]
-        # Height: over [floor, 2 * extent_z], above the floor's Gaussians.
-        lo = BACKGROUND_THICKNESS
-        hi = (2.0 * extent[:, 2]).clamp_min(lo)[:, None, None, None]
-        z = lo + (hi - lo) * 0.5 * (u[..., 2:] + 1.0)
+        xy = centre[:, None, None, :2] + extent[:, None, None, :2] * u[..., :2]
+        # Height: over [centre - extent, centre + extent], above the floor's Gaussians.
+        lo = (centre[:, 2] - extent[:, 2]).clamp_min(BACKGROUND_THICKNESS)[:, None, None, None]
+        hi = (centre[:, 2] + extent[:, 2])[:, None, None, None]
+        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (u[..., 2:] + 1.0)], -1)
 
         gaussians = {
-            "mu": torch.cat([box_xy, z], -1),
+            "mu": mu,
             "scale": SCALE_FRACTION * BOX_INIT * torch.exp(child[..., 3:6]),
             "quat": F.normalize(child[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(child[..., 10]),
@@ -144,7 +144,7 @@ class ObjectHead(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    """Self-attention among the queries, cross-attention to the slot tokens,
+    """Self-attention among the Gaussians, cross-attention to the slot tokens,
     FFN; pre-norm."""
 
     def __init__(self, d_model: int, n_heads: int):
@@ -196,19 +196,15 @@ class ObjectDecoder(nn.Module):
         points = token_points(frame, side, self.image_size, self.focal_ratio)
         anchor, colour = attention_anchors(attn, points, colours)
         ray = F.normalize(anchor - frame.origin[:, None], dim=-1)
-        # Explicit flattens: a generator expression here breaks the compiled graph.
-        slots = slots.flatten(0, 1)
-        anchor = anchor.flatten(0, 1)
-        ray = ray.flatten(0, 1)
-        colour = colour.flatten(0, 1)
+        slots, anchor, ray, colour = (x.flatten(0, 1) for x in (slots, anchor, ray, colour))
         K = slots.shape[0]
-        xy, extent = self.region(slots, anchor, ray)
+        centre, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, xy, extent, colour)
+        gaussians = self.head(q, centre, extent, colour)
         presence = (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0)
         opacity = gaussians["opacity"]
         gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * presence[:, None]
