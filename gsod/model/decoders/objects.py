@@ -186,10 +186,11 @@ class ObjectDecoder(nn.Module):
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
         """Object slots (B, K, C), their attention (B, K, N), token colours
-        (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...) and the box
-        {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)}; scene frame."""
+        (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...), the box
+        {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)} and
+        the state for gaussians() (q (B*K, G, d) ...); scene frame."""
         b, n_slots = slots.shape[:2]
         anchor_init, colour = init_attention_anchor(attn, colours, frame, self.image_size, self.focal_ratio)
         ray = F.normalize(anchor_init - frame.origin[:, None], dim=-1)  # camera -> anchor_init
@@ -202,11 +203,17 @@ class ObjectDecoder(nn.Module):
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, anchor, extent, colour)
         presence = (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0)
-        opacity = gaussians["opacity"]
-        gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * presence[:, None]
-        unflat = {name: value.unflatten(0, (b, n_slots)) for name, value in gaussians.items()}
+        state = {"q": q, "anchor": anchor, "extent": extent, "colour": colour, "presence": presence,
+                 "shape": (b, n_slots)}
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        return unflat, box
+        return self.gaussians(state), box, state
+
+    def gaussians(self, state: dict) -> dict[str, torch.Tensor]:
+        """State from forward (q possibly refined) -> Gaussians (B, K, G, ...), scene frame."""
+        gaussians = self.head(state["q"], state["anchor"], state["extent"], state["colour"])
+        # Each slot's brightest Gaussian at its presence.
+        opacity = gaussians["opacity"]
+        gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * state["presence"][:, None]
+        return {name: value.unflatten(0, state["shape"]) for name, value in gaussians.items()}

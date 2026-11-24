@@ -65,6 +65,8 @@ MODEL_FIELDS = (
     "attn_iter",
     "gaussians_per_slot",
     "decoder_hidden_dim",
+    "refine_steps",
+    "refine_feedback",
     "near",
 )
 

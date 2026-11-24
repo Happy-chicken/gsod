@@ -15,6 +15,7 @@ class LossConfig:
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
     lpips_start: float = 0.3  # LPIPS from this fraction of training on
+    refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
 
 
 @dataclass
@@ -26,6 +27,8 @@ class BaseConfig:
     attn_iter: int = 3
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
+    refine_steps: int = 1  # rounds of render-feedback refinement; 0 = off
+    refine_feedback: bool = True  # False: encoder features only (no residual)
     near: float = 0.1
 
     # --- optimisation (ramps as fractions of training)

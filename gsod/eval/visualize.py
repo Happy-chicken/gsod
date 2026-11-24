@@ -104,6 +104,7 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
         images = [
             (_rgb(rec["target"][v]), "input"),
             (_rgb(rec["rgb"][v]), "render"),
+            *([(_rgb(rec["rgb_pre"][v]), "render before refine")] if rec.get("rgb_pre") is not None else []),
             (foreground, "foreground"),
             (_rgb(rec["bg_rgb"][v]), "background"),
         ]
