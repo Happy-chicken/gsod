@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.background import BACKGROUND_THICKNESS, FLOOR_HALF
+from gsod.model.decoders.refine import FEEDBACK_DIM
 from gsod.model.layers import mlp, shift_colour
 from gsod.utils.geometry import SceneFrame, camera_directions
 
@@ -183,14 +184,20 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
+        # Refine: per-Gaussian hint [feedback, encoder features, occlusion] -> q; zero at first.
+        self.from_hint = nn.Linear(FEEDBACK_DIM + z_dim + 1, d)
+        nn.init.zeros_(self.from_hint.weight)
+        nn.init.zeros_(self.from_hint.bias)
 
     def forward(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame,
+        q: torch.Tensor | None = None, hint: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
         """Object slots (B, K, C), their attention (B, K, N), token colours
         (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...), the box
         {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)} and
-        the state for gaussians() (q (B*K, G, d) ...); scene frame."""
+        the state (q (B*K, G, d) ...); scene frame. q, hint (B*K, G, ...): continue
+        from a previous q plus the per-Gaussian hint instead of the learned queries."""
         b, n_slots = slots.shape[:2]
         anchor_init, colour = init_attention_anchor(attn, colours, frame, self.image_size, self.focal_ratio)
         ray = F.normalize(anchor_init - frame.origin[:, None], dim=-1)  # camera -> anchor_init
@@ -198,7 +205,7 @@ class ObjectDecoder(nn.Module):
         slots, anchor_init, ray, colour = (x.flatten(0, 1) for x in (slots, anchor_init, ray, colour))
         K = slots.shape[0]
         anchor, extent = self.region(slots, anchor_init, ray)
-        q = self.queries.expand(K, -1, -1)
+        q = self.queries.expand(K, -1, -1) if q is None else q + self.from_hint(hint)
         k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:

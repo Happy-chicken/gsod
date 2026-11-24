@@ -5,11 +5,10 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    view 0 rendered, its per-token error -> one more
-                              object-slot update, objects decoded again
-    refine_objects            view 0 rendered again; each object Gaussian
-                              samples the residual / encoder features at its
-                              pixel -> its decoder feature corrected (refine_steps)
+    refine                    view 0 rendered once -> a feedback map; per token
+                              -> one more object-slot update; at each object
+                              Gaussian's pixel (+ encoder features) -> object
+                              decoding continues from its q (refine_steps rounds)
     render                    all Gaussians blended together; masks from the
                               same blending
 
@@ -25,7 +24,7 @@ from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.decoders.refine import Refiner
+from gsod.model.decoders.refine import Feedback, sample_at_gaussians
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
@@ -60,7 +59,7 @@ class GSODModel(nn.Module):
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
         self.refine_steps = refine_steps
-        self.refiner = Refiner(z_dim, decoder_hidden_dim, image_size, focal_ratio, refine_feedback)
+        self.feedback = Feedback(refine_feedback)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -69,7 +68,7 @@ class GSODModel(nn.Module):
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
-            "Refiner": self.refiner,
+            "Feedback": self.feedback,
         }
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -83,36 +82,21 @@ class GSODModel(nn.Module):
         attn: torch.Tensor,
         colours: torch.Tensor,
         frame: SceneFrame,
+        q: torch.Tensor | None = None,
+        hint: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
         (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
         (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchor_init (B, K-1, 3)."""
-        local, box, state = self.obj_decoder(slots, attn, colours, frame)
+        local, box, state = self.obj_decoder(slots, attn, colours, frame, q, hint)
         return {
             "gaussians": to_world(local, frame),
             "local": local,  # scene frame
-            "state": state,  # for refine_objects
+            "state": state,  # q etc., for the refine round
             "extent": box["extent"],
             "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
             "anchor_init": points_to_world(box["anchor_init"], frame),
         }
-
-    def refine_objects(
-        self, scenes: dict, image: torch.Tensor, cam2world: torch.Tensor, enc: torch.Tensor, detach: bool = False
-    ) -> dict:
-        """Scenes, view 0 image (B, 3, H, W) and cam2world (B, 4, 4), encoder map
-        (B, C, s, s) -> scenes with the object Gaussians refined once."""
-        frame = scenes["frame"]
-        view0 = splat(self.gaussians(scenes), cam2world[:, None], self.image_size, self.focal_ratio, self.near)
-        render = {name: value[:, 0].detach() for name, value in view0.items()}
-        objects = scenes["objects"]
-        state = objects["state"]
-        q = state["q"].unflatten(0, state["shape"])
-        q = self.refiner(q.detach() if detach else q, objects["local"]["mu"], image, render, enc, frame)
-        state = {**state, "q": q.flatten(0, 1)}
-        local = self.obj_decoder.gaussians(state)
-        objects = {**objects, "gaussians": to_world(local, frame), "local": local, "state": state}
-        return {**scenes, "objects": objects}
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -122,10 +106,11 @@ class GSODModel(nn.Module):
         gaussians = self.bg_decoder(bg_slot, attn, colours, frame)
         return {"gaussians": to_world(gaussians, frame, rotate=False)}
 
-    def scene(self, slots, attn, background, colours, frame) -> dict:
-        """Object slots (B, K-1, C), attention (B, K, s*s), decoded background -> scenes."""
+    def scene(self, slots, attn, background, colours, frame, q=None, hint=None) -> dict:
+        """Object slots (B, K-1, C), attention (B, K, s*s), decoded background -> scenes;
+        q, hint: continue the object decoding (refine)."""
         return {
-            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame),
+            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame, q, hint),
             "background": background,
             "attn": attn,
             "slots": slots,
@@ -187,20 +172,24 @@ class GSODModel(nn.Module):
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)
         background = self.decode_background(bg_slot, attn[:, 0], colours, frame)
-        scenes = self.scene(slots, attn, background, colours, frame)
+        scenes = self.scene(slots, attn, background, colours, frame)  # the sketch
 
-        # What view 0 still leaves unexplained, per token (an input, no gradient).
-        view0 = splat(self.gaussians(scenes), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)["rgb"]
-        error = (images[:, 0] - view0[:, 0]).abs().mean(1, keepdim=True)
-        error = F.interpolate(error, size=self.input_size, mode="area").flatten(1).detach()
-        slots, attn = self.slot_attention.refine(k, v, bg_slot, slots, error)
-        scenes = self.scene(slots, attn, background, colours, frame)
-
-        # Object Gaussians corrected from what view 0 shows at their pixels.
+        # Refine: one view-0 render of the current Gaussians, read by the slots
+        # (per token) and by each object Gaussian (at its pixel).
         pre = scenes
         enc = tokens.transpose(1, 2).unflatten(2, (self.input_size, self.input_size))  # (B, C, s, s)
         for i in range(self.refine_steps):
-            scenes = self.refine_objects(scenes, images[:, 0], cam2world[:, 0], enc, detach=i > 0)
+            view0 = splat(self.gaussians(scenes), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
+            render0 = {name: value[:, 0].detach() for name, value in view0.items()}
+            feedback = self.feedback(images[:, 0], render0)  # (B, 32, H/2, W/2)
+            per_token = F.interpolate(feedback, size=self.input_size, mode="bilinear", align_corners=False)
+            slots, attn = self.slot_attention.refine(k, v, bg_slot, slots, per_token.flatten(2).transpose(1, 2))
+            objects = scenes["objects"]
+            hint = sample_at_gaussians([feedback, enc], objects["local"]["mu"], render0, frame,
+                                       self.image_size, self.focal_ratio)
+            q = objects["state"]["q"]
+            q = q.detach() if i > 0 else q
+            scenes = self.scene(slots, attn, background, colours, frame, q, hint.flatten(0, 1))
         if not render:
             return scenes
         out = self.render(scenes, cam2world)
