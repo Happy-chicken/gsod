@@ -13,6 +13,8 @@ class LossConfig:
 
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
+    lpips: float = 0.05  # LPIPS (VGG); 0 = off
+    lpips_start: float = 0.3  # LPIPS from this fraction of training on
 
 
 @dataclass

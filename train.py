@@ -110,7 +110,8 @@ class GSODTraining(L.LightningModule):
         step = self.start_epoch * self.steps_per_epoch + self.global_step
         self.model.slot_attention.anneal(step * self.cfg.batch_scenes)
         outputs = self.model(images, cams)
-        loss, terms = self.criterion(outputs, images)
+        progress = step / (self.cfg.epochs * self.steps_per_epoch)
+        loss, terms = self.criterion(outputs, images, progress)
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
         return loss

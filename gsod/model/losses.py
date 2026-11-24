@@ -1,6 +1,7 @@
 """Reconstruction loss (no masks), every view:
 
     total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
+            + lpips * LPIPS (VGG; from lpips_start of training on)
 """
 
 from __future__ import annotations
@@ -45,11 +46,17 @@ class GSODLoss(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
+        self.lpips = None
+        if cfg.lpips > 0:
+            import lpips  # pip install lpips; VGG weights download on first use
+
+            self.lpips = lpips.LPIPS(net="vgg", use_dropout=False, verbose=False).requires_grad_(False)
 
     def forward(
-        self, outputs: dict[str, torch.Tensor], images: torch.Tensor
+        self, outputs: dict[str, torch.Tensor], images: torch.Tensor, progress: float = 1.0
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """-> (total, per-term values for logging; tensors, so no GPU sync)."""
+        """progress: fraction of training done -> (total, per-term values for
+        logging; tensors, so no GPU sync)."""
         cfg = self.cfg
         rendered, images = outputs["rgb"].flatten(0, -4), images.flatten(0, -4)  # every view of every scene
         terms = {
@@ -57,6 +64,9 @@ class GSODLoss(nn.Module):
             "ssim": 1.0 - ssim(rendered, images),
         }
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
+        if self.lpips is not None and progress >= cfg.lpips_start:
+            terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]
+            weights["lpips"] = cfg.lpips
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: value.detach() for name, value in terms.items()}
         logged["total"] = total.detach()
