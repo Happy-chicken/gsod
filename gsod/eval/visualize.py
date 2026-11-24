@@ -52,47 +52,33 @@ def _gray(hw: np.ndarray) -> np.ndarray:
     return np.repeat(g[..., None], 3, axis=-1)
 
 
-# Box drawing: upsampling, edges (corner pairs; 0-3 bottom, 4-7 top).
-BOX_UPSAMPLE = 4
-BOX_EDGES = [(i, (i + 1) % 4) for i in range(4)] + [(4 + i, 4 + (i + 1) % 4) for i in range(4)] + [(i, i + 4) for i in range(4)]
+# Box corners: 0-3 bottom, 4-7 top.
+BOX_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
 
 
-def _project(points: np.ndarray, cam2world: np.ndarray, size, focal_ratio) -> tuple[np.ndarray, np.ndarray]:
-    """World points (..., 3) -> pixels (..., 2) (centres at integers), depth (...)."""
-    h, w = size
+def draw_boxes(image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, cam2world: np.ndarray,
+               focal_ratio, slots: list[int]) -> np.ndarray:
+    """Image (H, W, 3), world box corners (K-1, 8, 3), anchor_init (K-1, 3) -> the
+    image with slot k's box in its mask colour, anchor_init (ring), anchor (dot)."""
+    h, w = image.shape[:2]
+    anchor = box[:, :4].mean(1, keepdims=True)  # bottom centre
+    points = np.concatenate([box, anchor_init[:, None], anchor], 1)  # (K-1, 10, 3)
+    # Project (pinhole, pixel centres at integers).
     world2cam = np.linalg.inv(cam2world)
     cam = points @ world2cam[:3, :3].T + world2cam[:3, 3]
-    z = cam[..., 2]
-    zs = np.where(z > 1e-6, z, 1e-6)
-    u = focal_ratio[0] * w * cam[..., 0] / zs + (w - 1) / 2
-    v = focal_ratio[1] * h * cam[..., 1] / zs + (h - 1) / 2
-    return np.stack([u, v], -1), z
-
-
-def draw_boxes(image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, anchor: np.ndarray,
-               cam2world: np.ndarray, focal_ratio, slots: list[int]) -> np.ndarray:
-    """Image (H, W, 3), world box corners (K-1, 8, 3), anchor_init / anchor
-    (K-1, 3) -> the image (upsampled) with slot k's box (mask colour),
-    anchor_init (ring) and anchor (dot)."""
-    size = image.shape[:2]
-    s = BOX_UPSAMPLE
-    canvas = Image.fromarray(image).resize((size[1] * s, size[0] * s), Image.NEAREST)
+    uv = cam[..., :2] / cam[..., 2:] * [focal_ratio[0] * w, focal_ratio[1] * h] + [(w - 1) / 2, (h - 1) / 2]
+    canvas = Image.fromarray(image)
     draw = ImageDraw.Draw(canvas)
-    pix, depth = _project(box, cam2world, size, focal_ratio)
-    ring, ring_depth = _project(anchor_init, cam2world, size, focal_ratio)
-    dot, dot_depth = _project(anchor, cam2world, size, focal_ratio)
-    pix, ring, dot = ((p + 0.5) * s - 0.5 for p in (pix, ring, dot))
     for k in slots:
+        if (cam[k - 1, :, 2] <= 0).any():  # behind the camera
+            continue
+        p = [tuple(xy) for xy in uv[k - 1]]
         colour = tuple(int(c) for c in PALETTE[(k - 1) % len(PALETTE)])
         for i, j in BOX_EDGES:
-            if depth[k - 1, i] > 0 and depth[k - 1, j] > 0:  # both corners in front of the camera
-                draw.line([tuple(pix[k - 1, i]), tuple(pix[k - 1, j])], fill=colour, width=2)
-        if ring_depth[k - 1] > 0:
-            x, y = ring[k - 1]
-            draw.ellipse([x - 5, y - 5, x + 5, y + 5], outline=colour, width=2)
-        if dot_depth[k - 1] > 0:
-            x, y = dot[k - 1]
-            draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=colour, outline=(255, 255, 255))
+            draw.line([p[i], p[j]], fill=colour)
+        (x, y), (a, b) = p[8], p[9]
+        draw.ellipse([x - 3, y - 3, x + 3, y + 3], outline=colour)  # anchor_init
+        draw.ellipse([a - 2, b - 2, a + 2, b + 2], fill=colour, outline=(255, 255, 255))  # anchor
     return np.asarray(canvas)
 
 
@@ -113,8 +99,8 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
         foreground = _rgb(rec["fg_rgb"][v])
         if "box" in rec:  # boxes of the slots that draw something; ring = anchor_init, dot = anchor
             shown = [row["slot"] for row in rows if row["role"] != "empty"]
-            foreground = draw_boxes(foreground, rec["box"], rec["anchor_init"], rec["anchor"],
-                                    rec["cam2world"][v], rec["focal_ratio"], shown)
+            foreground = draw_boxes(foreground, rec["box"], rec["anchor_init"], rec["cam2world"][v],
+                                    rec["focal_ratio"], shown)
         images = [
             (_rgb(rec["target"][v]), "input"),
             (_rgb(rec["rgb"][v]), "render"),

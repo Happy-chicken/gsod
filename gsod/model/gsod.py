@@ -77,8 +77,7 @@ class GSODModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
         (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
-        (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3), anchor_init
-        and anchor (B, K-1, 3, world, on the floor)."""
+        (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchor_init (B, K-1, 3)."""
         k = slots.shape[1]
         gaussians, box = self.obj_decoder(slots, attn, colours, frame)
         flat = {name: value.flatten(1, 2) for name, value in gaussians.items()}
@@ -89,7 +88,6 @@ class GSODModel(nn.Module):
             "extent": box["extent"],
             "box": points_to_world(corners, frame).unflatten(1, (k, 8)),
             "anchor_init": points_to_world(box["anchor_init"], frame),
-            "anchor": points_to_world(F.pad(box["anchor"], (0, 1)), frame),  # z = 0
         }
 
     def decode_background(
@@ -153,7 +151,6 @@ class GSODModel(nn.Module):
             "extent": scenes["objects"]["extent"],  # (B, K-1, 3)
             "box": scenes["objects"]["box"],  # (B, K-1, 8, 3) world corners
             "anchor_init": scenes["objects"]["anchor_init"],  # (B, K-1, 3) world, on the floor
-            "anchor": scenes["objects"]["anchor"],  # (B, K-1, 3) world, on the floor
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
