@@ -14,7 +14,6 @@ import torch
 from torch import nn
 from torch.nn import init
 
-from gsod.model.decoders.refine import FEEDBACK_DIM
 from gsod.model.layers import mlp
 from gsod.utils.schedule import cosine
 
@@ -63,9 +62,6 @@ class SlotAttention(nn.Module):
         self.gru_bg = nn.GRUCell(dim, dim)
         self.mlp = mlp(dim, hidden, dim, norm=True)
         self.mlp_bg = mlp(dim, hidden, dim, norm=True)
-        self.to_feedback = nn.Linear(FEEDBACK_DIM, dim)  # refine: the feedback map per token
-        nn.init.zeros_(self.to_feedback.weight)
-        nn.init.zeros_(self.to_feedback.bias)
 
     def anneal(self, step: int) -> None:
         """Cosine-anneal the noise sigma."""
@@ -99,11 +95,10 @@ class SlotAttention(nn.Module):
         return slot_bg[:, 0], slot_obj, attn
 
     def refine(
-        self, k: torch.Tensor, v: torch.Tensor, slot_bg: torch.Tensor, slot_obj: torch.Tensor, feedback: torch.Tensor
+        self, k: torch.Tensor, v: torch.Tensor, slot_bg: torch.Tensor, slot_obj: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Keys / values, slots from forward, feedback map per token (b, N, FEEDBACK_DIM)
-        -> object slots and attention after one feedback-aware update."""
-        attn, updates = self._attend(slot_bg[:, None], slot_obj, k, v, k + self.to_feedback(feedback))
+        """Keys / values, slots from forward -> object slots and attention after one more update."""
+        attn, updates = self._attend(slot_bg[:, None], slot_obj, k, v, k)
         return self._update(self.gru, self.mlp, updates[:, 1:], slot_obj), attn
 
     def _attend(

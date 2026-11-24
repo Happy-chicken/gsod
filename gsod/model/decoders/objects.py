@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.background import BACKGROUND_THICKNESS, FLOOR_HALF
-from gsod.model.decoders.refine import FEEDBACK_DIM
 from gsod.model.layers import mlp, shift_colour
 from gsod.utils.geometry import SceneFrame, camera_directions
 
@@ -171,8 +170,9 @@ class ObjectDecoder(nn.Module):
 
     def __init__(
         self, z_dim: int, gaussians_per_slot: int, hidden_dim: int,
-        image_size: tuple[int, int], focal_ratio: tuple[float, float],
+        image_size: tuple[int, int], focal_ratio: tuple[float, float], hint_dim: int,
     ):
+        """hint_dim: per-Gaussian refine hint (encoder features [+ occlusion])."""
         super().__init__()
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
         d = int(hidden_dim)
@@ -184,10 +184,10 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
-        # Refine: per-Gaussian hint [feedback, encoder features, occlusion] -> q; zero at first.
-        self.from_hint = nn.Linear(FEEDBACK_DIM + z_dim + 1, d)
-        nn.init.zeros_(self.from_hint.weight)
-        nn.init.zeros_(self.from_hint.bias)
+        # Refine: per-Gaussian hint -> q; zero at first.
+        self.hint_in = nn.Linear(hint_dim, d)
+        nn.init.zeros_(self.hint_in.weight)
+        nn.init.zeros_(self.hint_in.bias)
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame,
@@ -205,7 +205,7 @@ class ObjectDecoder(nn.Module):
         slots, anchor_init, ray, colour = (x.flatten(0, 1) for x in (slots, anchor_init, ray, colour))
         K = slots.shape[0]
         anchor, extent = self.region(slots, anchor_init, ray)
-        q = self.queries.expand(K, -1, -1) if q is None else q + self.from_hint(hint)
+        q = self.queries.expand(K, -1, -1) if q is None else q + self.hint_in(hint)
         k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:

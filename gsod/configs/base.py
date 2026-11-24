@@ -27,8 +27,8 @@ class BaseConfig:
     attn_iter: int = 3
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
-    refine_steps: int = 1  # refine rounds (slots + object Gaussians from one view-0 render); 0 = off
-    refine_feedback: bool = True  # False: no rendered feedback (encoder features only)
+    refine_steps: int = 1  # refine rounds (one more slot update + object Gaussians re-decoded); 0 = off
+    refine_occlusion: bool = True  # occlusion from a view-0 render in the hint; False: no render
     near: float = 0.1
 
     # --- optimisation (ramps as fractions of training)
