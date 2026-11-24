@@ -24,7 +24,6 @@ from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.decoders.refine import sample_at_gaussians
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
@@ -84,17 +83,18 @@ class GSODModel(nn.Module):
         attn: torch.Tensor,
         colours: torch.Tensor,
         frame: SceneFrame,
-        q: torch.Tensor | None = None,
-        hint: torch.Tensor | None = None,
+        prev: dict[str, torch.Tensor] | None = None,
+        enc: torch.Tensor | None = None,
+        render: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
         (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
         (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchor_init (B, K-1, 3)."""
-        local, box, state = self.obj_decoder(slots, attn, colours, frame, q, hint)
+        local, box, q = self.obj_decoder(slots, attn, colours, frame, prev, enc, render)
         return {
             "gaussians": to_world(local, frame),
             "local": local,  # scene frame
-            "state": state,  # q etc., for the refine round
+            "q": q,  # for the refine round
             "extent": box["extent"],
             "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
             "anchor_init": points_to_world(box["anchor_init"], frame),
@@ -108,11 +108,11 @@ class GSODModel(nn.Module):
         gaussians = self.bg_decoder(bg_slot, attn, colours, frame)
         return {"gaussians": to_world(gaussians, frame, rotate=False)}
 
-    def scene(self, slots, attn, background, colours, frame, q=None, hint=None) -> dict:
+    def scene(self, slots, attn, background, colours, frame, prev=None, enc=None, render=None) -> dict:
         """Object slots (B, K-1, C), attention (B, K, s*s), decoded background -> scenes;
-        q, hint: continue the object decoding (refine)."""
+        prev, enc, render: continue the object decoding (refine)."""
         return {
-            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame, q, hint),
+            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame, prev, enc, render),
             "background": background,
             "attn": attn,
             "slots": slots,
@@ -186,11 +186,9 @@ class GSODModel(nn.Module):
                 view0 = splat(self.gaussians(scenes), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
                 render0 = {name: value[:, 0].detach() for name, value in view0.items()}
             slots, attn = self.slot_attention.refine(k, v, bg_slot, slots)
-            objects = scenes["objects"]
-            hint = sample_at_gaussians(enc, objects["local"]["mu"], frame, self.image_size, self.focal_ratio, render0)
-            q = objects["state"]["q"]
-            q = q.detach() if i > 0 else q
-            scenes = self.scene(slots, attn, background, colours, frame, q, hint.flatten(0, 1))
+            q = scenes["objects"]["q"]
+            prev = {"q": q.detach() if i > 0 else q, "mu": scenes["objects"]["local"]["mu"]}
+            scenes = self.scene(slots, attn, background, colours, frame, prev, enc, render0)
         if not render:
             return scenes
         out = self.render(scenes, cam2world)
