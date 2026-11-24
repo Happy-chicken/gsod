@@ -41,38 +41,29 @@ REGION_HIDDEN = 64
 _ANCHOR_SHARPNESS = 2.0
 
 
-def _token_rays(
-    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
-) -> torch.Tensor:
-    """(..., side*side, 3) scene-frame directions of the tokens' view-0 rays."""
+def init_attention_anchor(
+    attn: torch.Tensor,
+    colours: torch.Tensor,
+    frame: SceneFrame,
+    image_size: tuple[int, int],
+    focal_ratio: tuple[float, float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """attn (B, K, N), token colours (B, N, 3), view 0's SceneFrames ->
+    anchor_init on the floor, colour there (B, K, 3); scene frame."""
+    # Pixel centre of each token (a side x side grid over the image).
     h, w = image_size
+    side = int(round(attn.shape[-1] ** 0.5))
     idx = torch.arange(side, device=frame.rot.device, dtype=frame.rot.dtype)
     u = (idx + 0.5) * w / side - 0.5
     v = (idx + 0.5) * h / side - 0.5
     vv, uu = torch.meshgrid(v, u, indexing="ij")
-    return camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.mT
-
-
-def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.Tensor:
-    """Where the rays (..., N, 3) reach height z (..., N, 2); rays not going down stay at the camera."""
-    t = ((z - frame.origin[..., 2:]) / directions[..., 2].clamp(max=-1e-6)).clamp(min=0.0)
-    return frame.origin[..., None, :2] + t[..., None] * directions[..., :2]
-
-
-def floor_points(
-    frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
-) -> torch.Tensor:
-    """(..., side*side, 3): where each token's view-0 ray meets the floor (within it)."""
-    xy = _at_height(frame, _token_rays(frame, side, image_size, focal_ratio), 0.0)
-    xy = xy.clamp(-FLOOR_HALF, FLOOR_HALF)
-    return torch.cat([xy, torch.zeros_like(xy[..., :1])], -1)
-
-
-def attention_anchor_init(
-    attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """attn (..., K, N), floor points / token colours (..., N, 3) -> anchor_init
-    on the floor, colour there (..., K, 3)."""
+    # Back-project with the camera: each token's view-0 ray (B, N, 3).
+    rays = camera_directions(uu, vv, image_size, focal_ratio).reshape(-1, 3) @ frame.rot.mT
+    # Where each ray meets the floor z = 0 (rays not going down stay at the camera), kept on the floor.
+    t = (-frame.origin[..., 2:] / rays[..., 2].clamp(max=-1e-6)).clamp(min=0.0)
+    xy = (frame.origin[..., None, :2] + t[..., None] * rays[..., :2]).clamp(-FLOOR_HALF, FLOOR_HALF)
+    points = torch.cat([xy, torch.zeros_like(xy[..., :1])], -1)
+    # Attention-weighted mean, weights attn ** _ANCHOR_SHARPNESS normalised.
     p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=-1)
     return p @ points, p @ colours
 
@@ -200,9 +191,7 @@ class ObjectDecoder(nn.Module):
         (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...) and the box
         {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)}; scene frame."""
         b, n_slots = slots.shape[:2]
-        side = int(round(attn.shape[-1] ** 0.5))
-        points = floor_points(frame, side, self.image_size, self.focal_ratio)
-        anchor_init, colour = attention_anchor_init(attn, points, colours)
+        anchor_init, colour = init_attention_anchor(attn, colours, frame, self.image_size, self.focal_ratio)
         ray = F.normalize(anchor_init - frame.origin[:, None], dim=-1)  # camera -> anchor_init
         box = {"anchor_init": anchor_init}
         slots, anchor_init, ray, colour = (x.flatten(0, 1) for x in (slots, anchor_init, ray, colour))
