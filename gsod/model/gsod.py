@@ -21,9 +21,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
+from gsod.model.decoders.objects import box_corners
 from gsod.model.encoder import Encoder
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import SceneFrame, scene_frame, to_world
+from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
 
 class GSODModel(nn.Module):
@@ -75,12 +76,19 @@ class GSODModel(nn.Module):
         frame: SceneFrame,
     ) -> dict[str, torch.Tensor]:
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
-        (B, s*s, 3) -> Gaussians (B, K-1, G, ...), extent (B, K-1, 3)."""
+        (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
+        (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchors (B, K-1, 3)."""
         k = slots.shape[1]
-        gaussians, extent = self.obj_decoder(slots, attn, colours, frame)
+        gaussians, box = self.obj_decoder(slots, attn, colours, frame)
         flat = {name: value.flatten(1, 2) for name, value in gaussians.items()}
         world = {name: value.unflatten(1, (k, -1)) for name, value in to_world(flat, frame).items()}
-        return {"gaussians": world, "extent": extent}
+        corners = box_corners(box["foot"], box["extent"]).flatten(1, 2)
+        return {
+            "gaussians": world,
+            "extent": box["extent"],
+            "box": points_to_world(corners, frame).unflatten(1, (k, 8)),
+            "anchor": points_to_world(box["anchor"], frame),
+        }
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -141,6 +149,8 @@ class GSODModel(nn.Module):
             "mask_idx": weights.argmax(dim=2),  # (B, V, H, W)
             "attn": scenes["attn"],  # (B, K, s*s)
             "extent": scenes["objects"]["extent"],  # (B, K-1, 3)
+            "box": scenes["objects"]["box"],  # (B, K-1, 8, 3) world corners
+            "anchor": scenes["objects"]["anchor"],  # (B, K-1, 3) world, on the floor
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:

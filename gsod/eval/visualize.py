@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw
 
 from gsod.eval.metrics import upsample_labels
 from gsod.utils.io import save_png
@@ -51,6 +52,45 @@ def _gray(hw: np.ndarray) -> np.ndarray:
     return np.repeat(g[..., None], 3, axis=-1)
 
 
+# Box drawing: upsampling, edges (corner pairs; 0-3 bottom, 4-7 top).
+BOX_UPSAMPLE = 4
+BOX_EDGES = [(i, (i + 1) % 4) for i in range(4)] + [(4 + i, 4 + (i + 1) % 4) for i in range(4)] + [(i, i + 4) for i in range(4)]
+
+
+def _project(points: np.ndarray, cam2world: np.ndarray, size, focal_ratio) -> tuple[np.ndarray, np.ndarray]:
+    """World points (..., 3) -> pixels (..., 2) (centres at integers), depth (...)."""
+    h, w = size
+    world2cam = np.linalg.inv(cam2world)
+    cam = points @ world2cam[:3, :3].T + world2cam[:3, 3]
+    z = cam[..., 2]
+    zs = np.where(z > 1e-6, z, 1e-6)
+    u = focal_ratio[0] * w * cam[..., 0] / zs + (w - 1) / 2
+    v = focal_ratio[1] * h * cam[..., 1] / zs + (h - 1) / 2
+    return np.stack([u, v], -1), z
+
+
+def draw_boxes(image: np.ndarray, box: np.ndarray, anchor: np.ndarray, cam2world: np.ndarray,
+               focal_ratio, slots: list[int]) -> np.ndarray:
+    """Image (H, W, 3), world box corners (K-1, 8, 3), anchors (K-1, 3) -> the
+    image (upsampled) with slot k's box (mask colour) and anchor (dot)."""
+    size = image.shape[:2]
+    s = BOX_UPSAMPLE
+    canvas = Image.fromarray(image).resize((size[1] * s, size[0] * s), Image.NEAREST)
+    draw = ImageDraw.Draw(canvas)
+    pix, depth = _project(box, cam2world, size, focal_ratio)
+    dot, dot_depth = _project(anchor, cam2world, size, focal_ratio)
+    pix, dot = (pix + 0.5) * s - 0.5, (dot + 0.5) * s - 0.5
+    for k in slots:
+        colour = tuple(int(c) for c in PALETTE[(k - 1) % len(PALETTE)])
+        for i, j in BOX_EDGES:
+            if depth[k - 1, i] > 0 and depth[k - 1, j] > 0:  # both corners in front of the camera
+                draw.line([tuple(pix[k - 1, i]), tuple(pix[k - 1, j])], fill=colour, width=2)
+        if dot_depth[k - 1] > 0:
+            x, y = dot[k - 1]
+            draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=colour, outline=(255, 255, 255))
+    return np.asarray(canvas)
+
+
 def _slot_caption(row: dict) -> str:
     target = f" #{row['gt_object']}" if row["gt_object"] >= 0 else ""
     return (
@@ -74,6 +114,11 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
         if gt is not None:
             images.append((colorize(gt[v]), "GT mask"))
         images.append((colorize(rec["mask_idx"][v]), "render mask"))
+        if "box" in rec:  # slots that draw something; dot = anchor
+            shown = [row["slot"] for row in rows if row["role"] != "empty"]
+            boxes = draw_boxes(_rgb(rec["target"][v]), rec["box"], rec["anchor"], rec["cam2world"][v],
+                               rec["focal_ratio"], shown)
+            images.append((boxes, "boxes"))
         slots = [
             (_rgb(rec["slot_rgb"][v, k - 1]), _slot_caption(row))
             for k, row in zip(range(1, len(rows) + 1), rows)

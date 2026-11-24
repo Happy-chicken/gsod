@@ -122,6 +122,10 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
         "occupancy": occupancy,
         "extent": np_(result["extent"]),  # (K-1, 3)
+        "box": np_(result["box"]),  # (K-1, 8, 3) world
+        "anchor": np_(result["anchor"]),  # (K-1, 3) world
+        "cam2world": item["cam2world"].float().numpy(),  # (V, 4, 4)
+        "focal_ratio": tuple(model.focal_ratio),
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),

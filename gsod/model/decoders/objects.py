@@ -1,5 +1,13 @@
-"""Object decoder: slot -> box at the attention anchor -> G Gaussians in it.
-The anchor: where the slot's view-0 tokens meet the floor, attention-weighted.
+"""Object decoder: slot -> a box standing on the floor -> G Gaussians in it.
+
+1. anchor  each view-0 token's ray (pixel back-projected with the camera)
+           meets the floor z = 0; their attention-weighted mean = the anchor,
+           a point on the floor.
+2. box     RegionHead: foot = anchor + learned shift along / across the ray
+           (a point on the floor); half sizes (ex, ey, ez). The box spans
+           x, y: foot +- (ex, ey), z: [0, 2 ez], so its centre is at height ez.
+3. Gaussians  ObjectHead: G Gaussians inside the box.
+
 Box sizes, shifts and Gaussian scales unbounded; BOX_INIT only sets where they start.
 Opacity = per-slot share of its brightest Gaussian x presence (attention area /
 AREA_FULL, at most 1): the attention decides whether a slot shows, never 0.
@@ -28,7 +36,7 @@ N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
 REGION_HIDDEN = 64
 
 
-# Anchors weight tokens by attn ** this (lean to the stronger core).
+# The anchor weights tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
 
 
@@ -50,7 +58,7 @@ def _at_height(frame: SceneFrame, directions: torch.Tensor, z: float) -> torch.T
     return frame.origin[..., None, :2] + t[..., None] * directions[..., :2]
 
 
-def token_points(
+def floor_points(
     frame: SceneFrame, side: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]
 ) -> torch.Tensor:
     """(..., side*side, 3): where each token's view-0 ray meets the floor (within it)."""
@@ -59,23 +67,35 @@ def token_points(
     return torch.cat([xy, torch.zeros_like(xy[..., :1])], -1)
 
 
-def attention_anchors(
+def attention_anchor(
     attn: torch.Tensor, points: torch.Tensor, colours: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """attn (..., K, N), token points and colours (..., N, 3) -> where each
-    slot's attention points and the colour there (..., K, 3)."""
+    """attn (..., K, N), floor points / token colours (..., N, 3) -> anchor on
+    the floor, colour there (..., K, 3)."""
     p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=-1)
     return p @ points, p @ colours
 
 
+def box_corners(foot: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
+    """Foot on the floor (..., 2), half sizes (..., 3) -> 8 corners (..., 8, 3);
+    0-3 bottom, 4-7 top, both counter-clockwise."""
+    sx = foot.new_tensor([-1.0, 1.0, 1.0, -1.0] * 2)
+    sy = foot.new_tensor([-1.0, -1.0, 1.0, 1.0] * 2)
+    top = foot.new_tensor([0.0] * 4 + [1.0] * 4)
+    x = foot[..., None, 0] + sx * extent[..., None, 0]
+    y = foot[..., None, 1] + sy * extent[..., None, 1]
+    z = 2.0 * top * extent[..., None, 2]
+    return torch.stack([x, y, z], -1)
+
+
 class RegionHead(nn.Module):
-    """Slot latent -> box shift (along / across view 0's ray) and half sizes,
-    unbounded, in units of BOX_INIT; the box stands on the floor. Starts as a
-    box of half side BOX_INIT at the anchor."""
+    """Slot -> the box: foot = anchor + shift along / across view 0's ray, half
+    sizes; in units of BOX_INIT, zero at first (a box of half side BOX_INIT at
+    the anchor)."""
 
     def __init__(self, z_dim: int):
         super().__init__()
-        self.mlp = mlp(z_dim, REGION_HIDDEN, 5)
+        self.mlp = mlp(z_dim, REGION_HIDDEN, 5)  # shift along, shift across, log (ex, ey, ez)
         with torch.no_grad():
             self.mlp[-1].weight.zero_()
             self.mlp[-1].bias.zero_()
@@ -83,14 +103,14 @@ class RegionHead(nn.Module):
     def forward(
         self, slots: torch.Tensor, anchor: torch.Tensor, ray: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """slots (K, C), anchor, ray (K, 3) -> centre, half sizes (K, 3)."""
+        """slots (K, C), anchor, ray (K, 3) -> foot on the floor (K, 2), half sizes (K, 3)."""
         raw = self.mlp(slots)
-        ray_xy = F.normalize(ray[:, :2], dim=-1)
-        across = torch.stack([-ray_xy[:, 1], ray_xy[:, 0]], -1)
-        t = BOX_INIT * raw[:, :2]
-        xy = anchor[:, :2] + t[:, :1] * ray_xy + t[:, 1:] * across
+        along = F.normalize(ray[:, :2], dim=-1)  # the ray, seen from above
+        across = torch.stack([-along[:, 1], along[:, 0]], -1)
+        shift = BOX_INIT * raw[:, :2]
+        foot = anchor[:, :2] + shift[:, :1] * along + shift[:, 1:] * across
         extent = BOX_INIT * torch.exp(raw[:, 2:])
-        return torch.cat([xy, extent[:, 2:]], -1), extent
+        return foot, extent
 
 
 class ObjectHead(nn.Module):
@@ -109,17 +129,15 @@ class ObjectHead(nn.Module):
     def forward(
         self,
         feat: torch.Tensor,
-        centre: torch.Tensor,
+        foot: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box centre / half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), box foot (K, 2), half sizes / colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.mlp(feat)
-        t = torch.tanh(raw[..., 0:3])
-        xy = centre[:, None, :2] + extent[:, None, :2] * t[..., :2]
-        # Height: over [centre - extent, centre + extent], above the floor's Gaussians.
-        # centre_z = extent_z (box on the floor); not read from centre: Inductor can't compile
-        # a fixed column of RegionHead's cat.
+        t = torch.tanh(raw[..., 0:3])  # position in the box, [-1, 1]^3
+        xy = foot[:, None] + extent[:, None, :2] * t[..., :2]
+        # Height: the box's [0, 2 ez], kept above the floor's Gaussians.
         lo = BACKGROUND_THICKNESS
         hi = (2.0 * extent[:, 2])[:, None, None]
         mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
@@ -176,26 +194,28 @@ class ObjectDecoder(nn.Module):
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Object slots (B, K, C), their attention (B, K, N), token colours
-        (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...), half sizes
-        (B, K, 3); scene frame."""
+        (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...) and the box
+        {"anchor" (B, K, 3), "foot" (B, K, 2), "extent" (B, K, 3)}; scene frame."""
         b, n_slots = slots.shape[:2]
         side = int(round(attn.shape[-1] ** 0.5))
-        points = token_points(frame, side, self.image_size, self.focal_ratio)
-        anchor, colour = attention_anchors(attn, points, colours)
-        ray = F.normalize(anchor - frame.origin[:, None], dim=-1)
+        points = floor_points(frame, side, self.image_size, self.focal_ratio)
+        anchor, colour = attention_anchor(attn, points, colours)
+        ray = F.normalize(anchor - frame.origin[:, None], dim=-1)  # camera -> anchor
+        box_anchor = anchor
         slots, anchor, ray, colour = (x.flatten(0, 1) for x in (slots, anchor, ray, colour))
         K = slots.shape[0]
-        centre, extent = self.region(slots, anchor, ray)
+        foot, extent = self.region(slots, anchor, ray)
         q = self.queries.expand(K, -1, -1)
         k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
         v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
         for layer in self.layers:
             q = layer(q, k, v)
-        gaussians = self.head(q, centre, extent, colour)
+        gaussians = self.head(q, foot, extent, colour)
         presence = (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0)
         opacity = gaussians["opacity"]
         gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * presence[:, None]
         unflat = {name: value.unflatten(0, (b, n_slots)) for name, value in gaussians.items()}
-        return unflat, extent.unflatten(0, (b, n_slots))
+        box = {"anchor": box_anchor, "foot": foot.unflatten(0, (b, n_slots)), "extent": extent.unflatten(0, (b, n_slots))}
+        return unflat, box
