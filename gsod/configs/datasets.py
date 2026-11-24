@@ -38,9 +38,6 @@ class RoomDiverseConfig(BaseConfig):
     test_root: str | None = "data/room_diverse/room_diverse_test"
     num_slots: int = 5
     input_size: int = 128
-    epochs: int = 40
-    eval_every: int = 2
-    save_every: int = 5
 
 
 PROFILES: dict[str, type[BaseConfig]] = {
