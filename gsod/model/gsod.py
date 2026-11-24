@@ -87,24 +87,15 @@ class GSODModel(nn.Module):
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
         (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
         (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchor_init (B, K-1, 3)."""
-        k = slots.shape[1]
         local, box, state = self.obj_decoder(slots, attn, colours, frame)
-        corners = box_corners(box["anchor"], box["extent"]).flatten(1, 2)
         return {
-            "gaussians": self._to_world(local, frame),
+            "gaussians": to_world(local, frame),
             "local": local,  # scene frame
             "state": state,  # for refine_objects
             "extent": box["extent"],
-            "box": points_to_world(corners, frame).unflatten(1, (k, 8)),
+            "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
             "anchor_init": points_to_world(box["anchor_init"], frame),
         }
-
-    @staticmethod
-    def _to_world(local: dict[str, torch.Tensor], frame: SceneFrame) -> dict[str, torch.Tensor]:
-        """Object Gaussians (B, K-1, G, ...), scene frame -> world."""
-        k = local["mu"].shape[1]
-        flat = {name: value.flatten(1, 2) for name, value in local.items()}
-        return {name: value.unflatten(1, (k, -1)) for name, value in to_world(flat, frame).items()}
 
     def refine_objects(
         self, scenes: dict, image: torch.Tensor, cam2world: torch.Tensor, enc: torch.Tensor, detach: bool = False
@@ -120,7 +111,7 @@ class GSODModel(nn.Module):
         q = self.refiner(q.detach() if detach else q, objects["local"]["mu"], image, render, enc, frame)
         state = {**state, "q": q.flatten(0, 1)}
         local = self.obj_decoder.gaussians(state)
-        objects = {**objects, "gaussians": self._to_world(local, frame), "local": local, "state": state}
+        objects = {**objects, "gaussians": to_world(local, frame), "local": local, "state": state}
         return {**scenes, "objects": objects}
 
     def decode_background(

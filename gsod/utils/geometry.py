@@ -113,22 +113,27 @@ def rotate_gaussians(
 
 
 def points_to_world(points: torch.Tensor, frame: SceneFrame, rotate: bool = True) -> torch.Tensor:
-    """Scene-frame points (..., M, 3) -> world."""
+    """Scene-frame points (B, ..., 3) -> world."""
+    flat = points.flatten(1, -2)  # (B, M, 3)
     if rotate:
-        points = points @ yaw_matrix(frame.yaw).to(points.dtype).mT
-    return points * frame.scale.to(points.dtype)[..., None, None] + frame.centre.to(points.dtype)[..., None, :]
+        flat = flat @ yaw_matrix(frame.yaw).to(points.dtype).mT
+    flat = flat * frame.scale.to(points.dtype)[..., None, None] + frame.centre.to(points.dtype)[..., None, :]
+    return flat.view(points.shape)
 
 
 def to_world(
     gaussians: dict[str, torch.Tensor], frame: SceneFrame, rotate: bool = True
 ) -> dict[str, torch.Tensor]:
-    """Gaussians, scene frame -> world."""
-    out = rotate_gaussians(gaussians, yaw_matrix(frame.yaw), yaw_quat(frame.yaw)) if rotate else gaussians
-    return {
+    """Gaussians (B, ..., per-Gaussian dims), scene frame -> world."""
+    lead = gaussians["mu"].shape[1:-1]  # e.g. (M,) or (slots, G)
+    flat = {name: value.flatten(1, len(lead)) for name, value in gaussians.items()}  # (B, M, ...)
+    out = rotate_gaussians(flat, yaw_matrix(frame.yaw), yaw_quat(frame.yaw)) if rotate else flat
+    out = {
         **out,
-        "mu": points_to_world(gaussians["mu"], frame, rotate),
-        "scale": gaussians["scale"] * frame.scale.to(gaussians["scale"].dtype)[..., None, None],
+        "mu": points_to_world(flat["mu"], frame, rotate),
+        "scale": flat["scale"] * frame.scale.to(flat["scale"].dtype)[..., None, None],
     }
+    return {name: value.unflatten(1, lead) for name, value in out.items()}
 
 
 def from_world(gaussians: dict[str, torch.Tensor], frame: SceneFrame) -> dict[str, torch.Tensor]:
