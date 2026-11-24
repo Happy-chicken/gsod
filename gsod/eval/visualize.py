@@ -69,22 +69,27 @@ def _project(points: np.ndarray, cam2world: np.ndarray, size, focal_ratio) -> tu
     return np.stack([u, v], -1), z
 
 
-def draw_boxes(image: np.ndarray, box: np.ndarray, anchor: np.ndarray, cam2world: np.ndarray,
-               focal_ratio, slots: list[int]) -> np.ndarray:
-    """Image (H, W, 3), world box corners (K-1, 8, 3), anchors (K-1, 3) -> the
-    image (upsampled) with slot k's box (mask colour) and anchor (dot)."""
+def draw_boxes(image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, anchor: np.ndarray,
+               cam2world: np.ndarray, focal_ratio, slots: list[int]) -> np.ndarray:
+    """Image (H, W, 3), world box corners (K-1, 8, 3), anchor_init / anchor
+    (K-1, 3) -> the image (upsampled) with slot k's box (mask colour),
+    anchor_init (ring) and anchor (dot)."""
     size = image.shape[:2]
     s = BOX_UPSAMPLE
     canvas = Image.fromarray(image).resize((size[1] * s, size[0] * s), Image.NEAREST)
     draw = ImageDraw.Draw(canvas)
     pix, depth = _project(box, cam2world, size, focal_ratio)
+    ring, ring_depth = _project(anchor_init, cam2world, size, focal_ratio)
     dot, dot_depth = _project(anchor, cam2world, size, focal_ratio)
-    pix, dot = (pix + 0.5) * s - 0.5, (dot + 0.5) * s - 0.5
+    pix, ring, dot = ((p + 0.5) * s - 0.5 for p in (pix, ring, dot))
     for k in slots:
         colour = tuple(int(c) for c in PALETTE[(k - 1) % len(PALETTE)])
         for i, j in BOX_EDGES:
             if depth[k - 1, i] > 0 and depth[k - 1, j] > 0:  # both corners in front of the camera
                 draw.line([tuple(pix[k - 1, i]), tuple(pix[k - 1, j])], fill=colour, width=2)
+        if ring_depth[k - 1] > 0:
+            x, y = ring[k - 1]
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], outline=colour, width=2)
         if dot_depth[k - 1] > 0:
             x, y = dot[k - 1]
             draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=colour, outline=(255, 255, 255))
@@ -105,20 +110,20 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
     gt = rec["gt"]
 
     def view(v: int) -> dict[str, Tiles]:
+        foreground = _rgb(rec["fg_rgb"][v])
+        if "box" in rec:  # boxes of the slots that draw something; ring = anchor_init, dot = anchor
+            shown = [row["slot"] for row in rows if row["role"] != "empty"]
+            foreground = draw_boxes(foreground, rec["box"], rec["anchor_init"], rec["anchor"],
+                                    rec["cam2world"][v], rec["focal_ratio"], shown)
         images = [
             (_rgb(rec["target"][v]), "input"),
             (_rgb(rec["rgb"][v]), "render"),
-            (_rgb(rec["fg_rgb"][v]), "foreground"),
+            (foreground, "foreground"),
             (_rgb(rec["bg_rgb"][v]), "background"),
         ]
         if gt is not None:
             images.append((colorize(gt[v]), "GT mask"))
         images.append((colorize(rec["mask_idx"][v]), "render mask"))
-        if "box" in rec:  # slots that draw something; dot = anchor
-            shown = [row["slot"] for row in rows if row["role"] != "empty"]
-            boxes = draw_boxes(_rgb(rec["target"][v]), rec["box"], rec["anchor"], rec["cam2world"][v],
-                               rec["focal_ratio"], shown)
-            images.append((boxes, "boxes"))
         slots = [
             (_rgb(rec["slot_rgb"][v, k - 1]), _slot_caption(row))
             for k, row in zip(range(1, len(rows) + 1), rows)

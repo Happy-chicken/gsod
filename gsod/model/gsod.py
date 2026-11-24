@@ -2,7 +2,7 @@
 batch of scenes at once.
 
     encode / slot attention   view 0 -> background slot + K-1 object slots
-    decode_objects            object slot -> box at its attention anchor ->
+    decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
     refine                    view 0 rendered, its per-token error -> one more
@@ -77,17 +77,19 @@ class GSODModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
         (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
-        (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchors (B, K-1, 3)."""
+        (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3), anchor_init
+        and anchor (B, K-1, 3, world, on the floor)."""
         k = slots.shape[1]
         gaussians, box = self.obj_decoder(slots, attn, colours, frame)
         flat = {name: value.flatten(1, 2) for name, value in gaussians.items()}
         world = {name: value.unflatten(1, (k, -1)) for name, value in to_world(flat, frame).items()}
-        corners = box_corners(box["foot"], box["extent"]).flatten(1, 2)
+        corners = box_corners(box["anchor"], box["extent"]).flatten(1, 2)
         return {
             "gaussians": world,
             "extent": box["extent"],
             "box": points_to_world(corners, frame).unflatten(1, (k, 8)),
-            "anchor": points_to_world(box["anchor"], frame),
+            "anchor_init": points_to_world(box["anchor_init"], frame),
+            "anchor": points_to_world(F.pad(box["anchor"], (0, 1)), frame),  # z = 0
         }
 
     def decode_background(
@@ -150,6 +152,7 @@ class GSODModel(nn.Module):
             "attn": scenes["attn"],  # (B, K, s*s)
             "extent": scenes["objects"]["extent"],  # (B, K-1, 3)
             "box": scenes["objects"]["box"],  # (B, K-1, 8, 3) world corners
+            "anchor_init": scenes["objects"]["anchor_init"],  # (B, K-1, 3) world, on the floor
             "anchor": scenes["objects"]["anchor"],  # (B, K-1, 3) world, on the floor
         }
 
