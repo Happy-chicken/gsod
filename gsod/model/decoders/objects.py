@@ -39,10 +39,6 @@ REGION_HIDDEN = 64
 
 # anchor_init weights tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Refine: footprint points (in projected radii), visibility softness (x box size), empty-pixel depth.
-FOOTPRINT = [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
-VIS_SOFTNESS = 0.1
-FAR = 1e4
 
 
 def init_attention_anchor(
@@ -72,50 +68,33 @@ def init_attention_anchor(
     return p @ points, p @ colours
 
 
-def look_up_view0(
+def sample_own_pixels(
     mu: torch.Tensor,
-    scale: torch.Tensor,
-    extent: torch.Tensor,
-    image: torch.Tensor,
+    attn: torch.Tensor,
     enc: torch.Tensor,
-    render: dict[str, torch.Tensor],
+    image: torch.Tensor,
     frame: SceneFrame,
     image_size: tuple[int, int],
     focal_ratio: tuple[float, float],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gaussians (B, K, G, ...) over their view-0 footprint -> visible share (B, K, G, 1),
-    image colour and encoder features of the visible part."""
+    """Gaussian centres mu (B, K, G, 3), slot attention maps (B, K, s, s), encoder map (B, C, s, s),
+    view-0 image (B, 3, H, W) -> at each centre's view-0 pixel: its slot's ownership (B, K, G, 1),
+    features (B, K, G, C), rgb (B, K, G, 3); 0 outside the image."""
     k, g = mu.shape[1:3]
     h, w = image_size
     f = mu.new_tensor([focal_ratio[0] * w, focal_ratio[1] * h])
     size = mu.new_tensor([w, h])
-
-    # Project centres into view 0.
+    # Project the centres into view 0 (pixel centres at integers).
     cam = (mu.flatten(1, 2).detach() - frame.origin[:, None]) @ frame.rot  # (B, N, 3)
-    z = cam[..., 2:].clamp_min(1e-4)  # (B, N, 1)
-    uv = f * cam[..., :2] / z + (size - 1) / 2  # (B, N, 2)
+    uv = f * cam[..., :2] / cam[..., 2:].clamp_min(1e-4) + (size - 1) / 2
+    grid = ((uv + 0.5) / size * 2 - 1)[:, :, None]  # (B, N, 1, 2)
 
-    # Footprint points.
-    radius = f[0] * scale.flatten(1, 2).detach().mean(-1, keepdim=True) / z  # (B, N, 1) pixels
-    points = uv[:, :, None] + radius[:, :, None] * mu.new_tensor(FOOTPRINT)  # (B, N, P, 2)
-    grid = (points + 0.5) / size * 2 - 1
+    def sample(x: torch.Tensor) -> torch.Tensor:  # (B, C, h, w) -> (B, N, C)
+        return F.grid_sample(x, grid, align_corners=False)[..., 0].transpose(1, 2)
 
-    def sample(x: torch.Tensor) -> torch.Tensor:  # (B, C, h, w) -> (B, N, P, C); 0 outside the image
-        return F.grid_sample(x, grid, align_corners=False).permute(0, 2, 3, 1)
-
-    # Visible: in the image, not behind the rendered surface (on it: ~0.9).
-    alpha = render["alpha"].detach()
-    depth = torch.where(alpha > 1e-3, render["depth"].detach() / alpha.clamp_min(1e-3), FAR)
-    depth = depth / frame.scale[:, None, None, None]  # scene units
-    tau = VIS_SOFTNESS * extent.mean(-1)[:, :, None].expand(-1, -1, g).flatten(1, 2)[..., None, None]
-    inside = (grid.abs() <= 1).all(-1, keepdim=True)
-    vis = torch.sigmoid((sample(depth) - z[:, :, None]) / tau + 2.0) * inside  # (B, N, P, 1)
-
-    weight = vis / vis.sum(2, keepdim=True).clamp_min(1e-6)
-    visible = vis.mean(2)
-    colour = (weight * sample(image)).sum(2)
-    feature = (weight * sample(enc)).sum(2)
-    return tuple(x.unflatten(1, (k, g)) for x in (visible, colour, feature))
+    own_slot = torch.arange(k, device=mu.device).repeat_interleave(g)  # slot of each Gaussian
+    ownership = sample(attn)[:, torch.arange(k * g, device=mu.device), own_slot][..., None]
+    return tuple(x.unflatten(1, (k, g)) for x in (ownership, sample(enc), sample(image)))
 
 
 def box_corners(anchor: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
@@ -173,10 +152,9 @@ class ObjectHead(nn.Module):
         feat: torch.Tensor,
         anchor: torch.Tensor,
         extent: torch.Tensor,
-        base: torch.Tensor,
+        colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box anchor (K, 2), half sizes (K, 3), base colour
-        (K, G or 1, 3) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d), box anchor (K, 2), half sizes / slot colour (K, 3) -> Gaussians (K, G, ...)."""
         raw = self.mlp(feat)
         t = torch.tanh(raw[..., 0:3])  # position in the box, [-1, 1]^3
         xy = anchor[:, None] + extent[:, None, :2] * t[..., :2]
@@ -190,7 +168,7 @@ class ObjectHead(nn.Module):
             "scale": SCALE_FRACTION * BOX_INIT * torch.exp(raw[..., 3:6]),
             "quat": F.normalize(raw[..., 6:10], dim=-1),
             "opacity": torch.sigmoid(raw[..., 10]),
-            "rgb": shift_colour(base, raw[..., 11:14]),  # base colour + a residual
+            "rgb": shift_colour(colour[:, None], raw[..., 11:14]),  # slot colour + a residual
             "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
         }
 
@@ -239,10 +217,9 @@ class ObjectDecoder(nn.Module):
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
         # Refine: view-0 features -> q (zero at first); the feature of a hidden Gaussian.
-        self.from_view0 = nn.Linear(z_dim, d)
-        nn.init.zeros_(self.from_view0.weight)
-        nn.init.zeros_(self.from_view0.bias)
-        self.hidden_feature = nn.Parameter(torch.zeros(z_dim))
+        self.pixel_to_q = nn.Linear(z_dim + 3, d)
+        nn.init.zeros_(self.pixel_to_q.weight)
+        nn.init.zeros_(self.pixel_to_q.bias)
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -270,8 +247,8 @@ class ObjectDecoder(nn.Module):
         state["q"] = self._layers(self.queries.expand(K, -1, -1), state)
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        gaussians = self._gaussians(state["q"], state, state["colour"][:, None])  # the slot's colour
-        state["gaussians"] = gaussians  # where refine() looks
+        gaussians = self._gaussians(state["q"], state)
+        state["mu"] = gaussians["mu"]  # where refine() samples
         return gaussians, box, state
 
     def refine(
@@ -279,23 +256,17 @@ class ObjectDecoder(nn.Module):
         state: dict,
         image: torch.Tensor,
         enc: torch.Tensor,
-        render: dict[str, torch.Tensor],
+        attn: torch.Tensor,
         frame: SceneFrame,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """Decode on from q: visible Gaussians take view 0's colour and features, hidden ones the slot's."""
-        g = state["gaussians"]
-        extent = state["extent"].unflatten(0, state["shape"])
-        visible, colour, feature = (
-            x.flatten(0, 1)  # (B*K, G, ...)
-            for x in look_up_view0(
-                g["mu"], g["scale"], extent, image, enc, render, frame, self.image_size, self.focal_ratio
-            )
+        """Decode on from q, adding what each Gaussian sees at its view-0 pixel where its slot owns it."""
+        ownership, features, rgb = sample_own_pixels(
+            state["mu"], attn, enc, image, frame, self.image_size, self.focal_ratio
         )
-        base = visible * colour + (1 - visible) * state["colour"][:, None]
-        seen = visible * feature + (1 - visible) * self.hidden_feature
-        q = self._layers(state["q"] + self.from_view0(seen), state)
-        gaussians = self._gaussians(q, state, base)
-        return gaussians, {**state, "q": q, "gaussians": gaussians}
+        pixel_info = (ownership * torch.cat([features, rgb], -1)).flatten(0, 1)  # (B*K, G, C + 3)
+        q = self._layers(state["q"] + self.pixel_to_q(pixel_info), state)
+        gaussians = self._gaussians(q, state)
+        return gaussians, {**state, "q": q, "mu": gaussians["mu"]}
 
     def _layers(self, q: torch.Tensor, state: dict) -> torch.Tensor:
         """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens)."""
@@ -303,9 +274,9 @@ class ObjectDecoder(nn.Module):
             q = layer(q, state["k"], state["v"])
         return q
 
-    def _gaussians(self, q: torch.Tensor, state: dict, base: torch.Tensor) -> dict[str, torch.Tensor]:
-        """q (B*K, G, d), base colour (B*K, G or 1, 3) -> Gaussians (B, K, G, ...) in the box."""
-        gaussians = self.head(q, state["anchor"], state["extent"], base)
+    def _gaussians(self, q: torch.Tensor, state: dict) -> dict[str, torch.Tensor]:
+        """q (B*K, G, d) -> Gaussians (B, K, G, ...) in the box."""
+        gaussians = self.head(q, state["anchor"], state["extent"], state["colour"])
         # Each slot's brightest Gaussian at its presence.
         opacity = gaussians["opacity"]
         gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * state["presence"][:, None]

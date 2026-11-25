@@ -5,7 +5,7 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    objects decoded on from what each Gaussian sees in view 0
+    refine                    objects decoded on from each Gaussian's view-0 pixel, where its slot owns it
     render                    all Gaussians blended together; masks from the
                               same blending
 
@@ -97,14 +97,14 @@ class GSODModel(nn.Module):
         state: dict,
         image: torch.Tensor,
         enc: torch.Tensor,
-        render: dict[str, torch.Tensor],
+        attn: torch.Tensor,
         frame: SceneFrame,
         detach: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """One refine round -> world object Gaussians, new state."""
         if detach:
             state = {**state, "q": state["q"].detach()}
-        local, state = self.obj_decoder.refine(state, image, enc, render, frame)
+        local, state = self.obj_decoder.refine(state, image, enc, attn, frame)
         return to_world(local, frame), state
 
     @staticmethod
@@ -161,13 +161,13 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine from a view-0 render of the current Gaussians.
+        # Refine: each object Gaussian reads its view-0 pixel where its slot owns it.
         sketch = objects
-        enc = tokens.transpose(1, 2).unflatten(2, (self.input_size, self.input_size))  # (B, C, s, s)
+        side = (self.input_size, self.input_size)
+        enc = tokens.transpose(1, 2).unflatten(2, side)  # (B, C, s, s)
+        obj_attn = attn[:, 1:].unflatten(2, side)  # (B, K-1, s, s)
         for i in range(self.refine_steps):
-            view0 = splat(self.merge(objects, floor), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
-            render0 = {name: value[:, 0].detach() for name, value in view0.items()}
-            objects, state = self.refine_objects(state, images[:, 0], enc, render0, frame, detach=i > 0)
+            objects, state = self.refine_objects(state, images[:, 0], enc, obj_attn, frame, detach=i > 0)
 
         out = self.render(objects, floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
