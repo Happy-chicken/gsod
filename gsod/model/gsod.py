@@ -105,16 +105,6 @@ class GSODModel(nn.Module):
         gaussians = self.bg_decoder(bg_slot, attn, colours, frame)
         return {"gaussians": to_world(gaussians, frame, rotate=False)}
 
-    def scene(self, slots, attn, background, colours, frame) -> dict:
-        """Object slots (B, K-1, C), attention (B, K, s*s), decoded background -> scenes."""
-        return {
-            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame),
-            "background": background,
-            "attn": attn,
-            "slots": slots,
-            "frame": frame,
-        }
-
     def refine_scene(
         self, scenes: dict, enc: torch.Tensor, render: dict[str, torch.Tensor] | None, detach: bool = False
     ) -> dict:
@@ -183,7 +173,12 @@ class GSODModel(nn.Module):
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)
         background = self.decode_background(bg_slot, attn[:, 0], colours, frame)
-        scenes = self.scene(slots, attn, background, colours, frame)  # the sketch
+        scenes = {  # the sketch
+            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame),
+            "background": background,
+            "attn": attn,
+            "frame": frame,
+        }
 
         # Refine: each object Gaussian reads the encoder features (+ its
         # occlusion in a view-0 render) at its pixel; same slots and attention.
