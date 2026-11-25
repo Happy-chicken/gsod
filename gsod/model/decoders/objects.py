@@ -39,6 +39,8 @@ REGION_HIDDEN = 64
 
 # anchor_init weights tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
+# Refine: per-Gaussian view-0 gradient size (mu 3, scale 3, opacity 1, rgb 3).
+GRAD_DIM = 10
 
 
 def init_attention_anchor(
@@ -217,7 +219,7 @@ class ObjectDecoder(nn.Module):
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
         # Refine: view-0 features -> q (zero at first); the feature of a hidden Gaussian.
-        self.pixel_to_q = nn.Linear(z_dim + 4, d)  # [features, rgb, ownership]
+        self.pixel_to_q = nn.Linear(z_dim + 4 + GRAD_DIM, d)  # [features, rgb, ownership, view-0 gradient]
         nn.init.zeros_(self.pixel_to_q.weight)
         nn.init.zeros_(self.pixel_to_q.bias)
 
@@ -248,7 +250,7 @@ class ObjectDecoder(nn.Module):
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
         gaussians = self._gaussians(state["q"], state)
-        state["mu"] = gaussians["mu"]  # where refine() samples
+        state["gaussians"] = gaussians  # where refine() samples, what view-0 gradients are taken of
         return gaussians, box, state
 
     def refine(
@@ -258,15 +260,17 @@ class ObjectDecoder(nn.Module):
         enc: torch.Tensor,
         attn: torch.Tensor,
         frame: SceneFrame,
+        grads: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """Decode on from q, adding what each Gaussian sees at its view-0 pixel and its slot's ownership there."""
+        """Decode on from q, adding what each Gaussian sees at its view-0 pixel, its slot's ownership
+        there and the view-0 loss gradient on it (B, K, G, GRAD_DIM)."""
         ownership, features, rgb = sample_own_pixels(
-            state["mu"], attn, enc, image, frame, self.image_size, self.focal_ratio
+            state["gaussians"]["mu"], attn, enc, image, frame, self.image_size, self.focal_ratio
         )
-        pixel_info = torch.cat([features, rgb, ownership], -1).flatten(0, 1)  # (B*K, G, C + 4)
+        pixel_info = torch.cat([features, rgb, ownership, grads], -1).flatten(0, 1)  # (B*K, G, C + 4 + GRAD_DIM)
         q = self._layers(state["q"] + self.pixel_to_q(pixel_info), state)
         gaussians = self._gaussians(q, state)
-        return gaussians, {**state, "q": q, "mu": gaussians["mu"]}
+        return gaussians, {**state, "q": q, "gaussians": gaussians}
 
     def _layers(self, q: torch.Tensor, state: dict) -> torch.Tensor:
         """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens)."""
