@@ -24,7 +24,7 @@ class BaseConfig:
     input_size: int = 64  # encoder input side
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
-    attn_iter: int = 4
+    attn_iter: int = 3
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
     refine_steps: int = 1  # refine rounds (object Gaussians re-decoded from q + hint); 0 = off
