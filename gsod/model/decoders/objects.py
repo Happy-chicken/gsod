@@ -39,9 +39,7 @@ REGION_HIDDEN = 64
 
 # anchor_init weights tokens by attn ** this (lean to the stronger core).
 _ANCHOR_SHARPNESS = 2.0
-# Refine, view-0 look-up: footprint points (centre + one projected radius along
-# u and v), visibility softness (fraction of the box's mean half size), depth
-# where nothing was rendered.
+# Refine: footprint points (in projected radii), visibility softness (x box size), empty-pixel depth.
 FOOTPRINT = [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
 VIS_SOFTNESS = 0.1
 FAR = 1e4
@@ -85,27 +83,19 @@ def look_up_view0(
     image_size: tuple[int, int],
     focal_ratio: tuple[float, float],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """What each object Gaussian sees of itself in view 0, over its footprint.
-
-    mu, scale (B, K, G, 3) and box half sizes extent (B, K, 3), scene frame;
-    view 0's image (B, 3, H, W), encoder map (B, C, s, s) and the render of the
-    current Gaussians {"depth", "alpha"} (B, 1, H, W) ->
-        visible (B, K, G, 1): share of the footprint not hidden behind something
-        colour  (B, K, G, 3): image colour over the visible part of the footprint
-        feature (B, K, G, C): encoder features over the visible part
-    No gradient into mu, scale or the render."""
+    """Gaussians (B, K, G, ...) over their view-0 footprint -> visible share (B, K, G, 1),
+    image colour and encoder features of the visible part."""
     k, g = mu.shape[1:3]
     h, w = image_size
     f = mu.new_tensor([focal_ratio[0] * w, focal_ratio[1] * h])
     size = mu.new_tensor([w, h])
 
-    # 1. Centres in view 0's camera (inverse of the rays in init_attention_anchor):
-    #    depth z, pixel uv (pixel centres at integers).
+    # Project centres into view 0.
     cam = (mu.flatten(1, 2).detach() - frame.origin[:, None]) @ frame.rot  # (B, N, 3)
     z = cam[..., 2:].clamp_min(1e-4)  # (B, N, 1)
     uv = f * cam[..., :2] / z + (size - 1) / 2  # (B, N, 2)
 
-    # 2. Footprint: the centre and FOOTPRINT points one projected radius away.
+    # Footprint points.
     radius = f[0] * scale.flatten(1, 2).detach().mean(-1, keepdim=True) / z  # (B, N, 1) pixels
     points = uv[:, :, None] + radius[:, :, None] * mu.new_tensor(FOOTPRINT)  # (B, N, P, 2)
     grid = (points + 0.5) / size * 2 - 1
@@ -113,8 +103,7 @@ def look_up_view0(
     def sample(x: torch.Tensor) -> torch.Tensor:  # (B, C, h, w) -> (B, N, P, C); 0 outside the image
         return F.grid_sample(x, grid, align_corners=False).permute(0, 2, 3, 1)
 
-    # 3. Each point is visible if it is in the image and the Gaussian is not
-    #    behind the rendered surface there (on it counts as visible, about 0.9).
+    # Visible: in the image, not behind the rendered surface (on it: ~0.9).
     alpha = render["alpha"].detach()
     depth = torch.where(alpha > 1e-3, render["depth"].detach() / alpha.clamp_min(1e-3), FAR)
     depth = depth / frame.scale[:, None, None, None]  # scene units
@@ -122,7 +111,6 @@ def look_up_view0(
     inside = (grid.abs() <= 1).all(-1, keepdim=True)
     vis = torch.sigmoid((sample(depth) - z[:, :, None]) / tau + 2.0) * inside  # (B, N, P, 1)
 
-    # 4. Over the footprint: the visible share; colour and features of the visible points.
     weight = vis / vis.sum(2, keepdim=True).clamp_min(1e-6)
     visible = vis.mean(2)
     colour = (weight * sample(image)).sum(2)
@@ -246,8 +234,7 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
-        # Refine: the view-0 features a Gaussian sees -> its q (zero at first);
-        # what a hidden Gaussian gets instead.
+        # Refine: view-0 features -> q (zero at first); the feature of a hidden Gaussian.
         self.from_view0 = nn.Linear(z_dim, d)
         nn.init.zeros_(self.from_view0.weight)
         nn.init.zeros_(self.from_view0.bias)
@@ -287,13 +274,7 @@ class ObjectDecoder(nn.Module):
         self, state: dict, image: torch.Tensor, enc: torch.Tensor, render: dict[str, torch.Tensor],
         frame: SceneFrame,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """State, view 0's image (B, 3, H, W), encoder map (B, C, s, s) and render of
-        the current Gaussians {"depth", "alpha"} -> Gaussians (B, K, G, ...) decoded
-        on from q, new state; same box and slot tokens.
-
-        Each Gaussian looks at its footprint in view 0. Where it is visible it takes
-        the image colour (as its base colour) and the encoder features there; where
-        it is hidden, the slot's colour and a learned "hidden" feature."""
+        """Decode on from q: visible Gaussians take view 0's colour and features, hidden ones the slot's."""
         g = state["gaussians"]
         extent = state["extent"].unflatten(0, state["shape"])
         visible, colour, feature = (

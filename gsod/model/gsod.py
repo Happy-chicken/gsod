@@ -5,10 +5,7 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    view 0 rendered; each object Gaussian looks at its
-                              footprint there: visible -> the image colour and
-                              encoder features, hidden -> the slot's colour and a
-                              learned feature; object decoding continues from q
+    refine                    objects decoded on from what each Gaussian sees in view 0
     render                    all Gaussians blended together; masks from the
                               same blending
 
@@ -98,9 +95,7 @@ class GSODModel(nn.Module):
         self, state: dict, image: torch.Tensor, enc: torch.Tensor, render: dict[str, torch.Tensor],
         frame: SceneFrame, detach: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """Decoder state, view 0's image (B, 3, H, W), encoder map (B, C, s, s) and
-        render {"depth", "alpha"} -> world object Gaussians decoded on from what
-        each sees in view 0, new state."""
+        """One refine round -> world object Gaussians, new state."""
         if detach:
             state = {**state, "q": state["q"].detach()}
         local, state = self.obj_decoder.refine(state, image, enc, render, frame)
@@ -158,9 +153,7 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine: render view 0; each object Gaussian looks at its footprint there
-        # (visible: image colour and features; hidden: the slot's) and decoding
-        # continues from its q. Same slots, attention and boxes.
+        # Refine from a view-0 render of the current Gaussians.
         sketch = objects
         enc = tokens.transpose(1, 2).unflatten(2, (self.input_size, self.input_size))  # (B, C, s, s)
         for i in range(self.refine_steps):
