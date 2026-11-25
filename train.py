@@ -274,8 +274,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--refine-steps", type=int, default=None, help="0 = no refinement")
-    parser.add_argument("--refine-occlusion", type=int, choices=(0, 1), default=None,
-                        help="0: no occlusion, no view-0 render in the refine")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")

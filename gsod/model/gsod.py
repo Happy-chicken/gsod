@@ -5,10 +5,10 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    each object Gaussian samples the encoder features
-                              (+ its occlusion in a view-0 render) at its pixel
-                              -> object decoding continues from its q
-                              (refine_steps rounds; slots unchanged)
+    refine                    view 0 rendered; each object Gaussian looks at its
+                              footprint there: visible -> the image colour and
+                              encoder features, hidden -> the slot's colour and a
+                              learned feature; object decoding continues from q
     render                    all Gaussians blended together; masks from the
                               same blending
 
@@ -43,7 +43,6 @@ class GSODModel(nn.Module):
         focal_ratio: tuple[float, float],
         near: float,
         refine_steps: int = 1,
-        refine_occlusion: bool = True,
     ):
         """num_slots: K, the background slot included."""
         super().__init__()
@@ -55,13 +54,9 @@ class GSODModel(nn.Module):
 
         self.encoder = Encoder(z_dim)
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
-        self.obj_decoder = ObjectDecoder(
-            z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio,
-            hint_dim=z_dim + int(refine_occlusion),
-        )
+        self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
         self.refine_steps = refine_steps
-        self.refine_occlusion = refine_occlusion  # False: no view-0 render in the refine
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -100,14 +95,15 @@ class GSODModel(nn.Module):
         return to_world(self.bg_decoder(bg_slot, attn, colours, frame), frame, rotate=False)
 
     def refine_objects(
-        self, state: dict, enc: torch.Tensor, frame: SceneFrame, render: dict[str, torch.Tensor] | None,
-        detach: bool = False,
+        self, state: dict, image: torch.Tensor, enc: torch.Tensor, render: dict[str, torch.Tensor],
+        frame: SceneFrame, detach: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """Decoder state, encoder map (B, C, s, s) [, view-0 render] -> world object
-        Gaussians decoded on from q + their hint, new state."""
+        """Decoder state, view 0's image (B, 3, H, W), encoder map (B, C, s, s) and
+        render {"depth", "alpha"} -> world object Gaussians decoded on from what
+        each sees in view 0, new state."""
         if detach:
             state = {**state, "q": state["q"].detach()}
-        local, state = self.obj_decoder.refine(state, enc, frame, render)
+        local, state = self.obj_decoder.refine(state, image, enc, render, frame)
         return to_world(local, frame), state
 
     @staticmethod
@@ -162,16 +158,15 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine: each object Gaussian reads the encoder features (+ its
-        # occlusion in a view-0 render) at its pixel; same slots and attention.
+        # Refine: render view 0; each object Gaussian looks at its footprint there
+        # (visible: image colour and features; hidden: the slot's) and decoding
+        # continues from its q. Same slots, attention and boxes.
         sketch = objects
         enc = tokens.transpose(1, 2).unflatten(2, (self.input_size, self.input_size))  # (B, C, s, s)
         for i in range(self.refine_steps):
-            render0 = None
-            if self.refine_occlusion:
-                view0 = splat(self.merge(objects, floor), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
-                render0 = {name: value[:, 0].detach() for name, value in view0.items()}
-            objects, state = self.refine_objects(state, enc, frame, render0, detach=i > 0)
+            view0 = splat(self.merge(objects, floor), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
+            render0 = {name: value[:, 0].detach() for name, value in view0.items()}
+            objects, state = self.refine_objects(state, images[:, 0], enc, render0, frame, detach=i > 0)
 
         out = self.render(objects, floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init

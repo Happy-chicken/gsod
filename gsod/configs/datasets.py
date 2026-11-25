@@ -63,7 +63,6 @@ MODEL_FIELDS = (
     "gaussians_per_slot",
     "decoder_hidden_dim",
     "refine_steps",
-    "refine_occlusion",
     "near",
 )
 
