@@ -5,10 +5,10 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    one more object-slot update; each object Gaussian
-                              samples the encoder features (+ its occlusion in a
-                              view-0 render) at its pixel -> object decoding
-                              continues from its q (refine_steps rounds)
+    refine                    each object Gaussian samples the encoder features
+                              (+ its occlusion in a view-0 render) at its pixel
+                              -> object decoding continues from its q
+                              (refine_steps rounds; slots unchanged)
     render                    all Gaussians blended together; masks from the
                               same blending
 
@@ -176,8 +176,8 @@ class GSODModel(nn.Module):
         background = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         scenes = self.scene(slots, attn, background, colours, frame)  # the sketch
 
-        # Refine: one more slot update; each object Gaussian reads the encoder
-        # features (+ its occlusion in a view-0 render) at its pixel.
+        # Refine: each object Gaussian reads the encoder features (+ its
+        # occlusion in a view-0 render) at its pixel; same slots and attention.
         pre = scenes
         enc = tokens.transpose(1, 2).unflatten(2, (self.input_size, self.input_size))  # (B, C, s, s)
         for i in range(self.refine_steps):
@@ -185,7 +185,6 @@ class GSODModel(nn.Module):
             if self.refine_occlusion:
                 view0 = splat(self.gaussians(scenes), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
                 render0 = {name: value[:, 0].detach() for name, value in view0.items()}
-            slots, attn = self.slot_attention.refine(k, v, bg_slot, slots)
             q = scenes["objects"]["q"]
             prev = {"q": q.detach() if i > 0 else q, "mu": scenes["objects"]["local"]["mu"]}
             scenes = self.scene(slots, attn, background, colours, frame, prev, enc, render0)

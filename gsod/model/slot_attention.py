@@ -2,11 +2,7 @@
 rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
 per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
 the residual MLP, bi-level (only the last iteration is differentiated, straight
-through to the queries). Slot 0 is the background.
-
-refine(): one more object-slot update whose keys also see a per-token error
-(what the current slots leave unexplained), so an idle slot can be drawn to a
-missed object (after MONet / IODINE). Starts as a plain iteration."""
+through to the queries). Slot 0 is the background."""
 
 from __future__ import annotations
 
@@ -93,13 +89,6 @@ class SlotAttention(nn.Module):
             slot_obj = self._update(self.gru, self.mlp, updates_obj, slot_obj)
 
         return slot_bg[:, 0], slot_obj, attn
-
-    def refine(
-        self, k: torch.Tensor, v: torch.Tensor, slot_bg: torch.Tensor, slot_obj: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Keys / values, slots from forward -> object slots and attention after one more update."""
-        attn, updates = self._attend(slot_bg[:, None], slot_obj, k, v, k)
-        return self._update(self.gru, self.mlp, updates[:, 1:], slot_obj), attn
 
     def _attend(
         self, slot_bg: torch.Tensor, slot_obj: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_obj: torch.Tensor
