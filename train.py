@@ -262,6 +262,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--refine-steps", type=int, default=None, help="0 = no refinement")
+    parser.add_argument("--box", type=float, default=None, help="box size penalty weight; 0 = off")
+    parser.add_argument("--lpips-box-start", type=float, default=None, help="LPIPS and box from this fraction on")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
@@ -284,6 +286,8 @@ def main() -> None:
         values["data_root"] = args.data
     if args.out is not None:
         values["out_dir"] = args.out
+    loss = {k: v for k, v in (("box", args.box), ("lpips_box_start", args.lpips_box_start)) if v is not None}
+    values["loss"] = replace(cfg.loss, **loss)
     cfg = replace(cfg, **values)
 
     if not torch.cuda.is_available():
