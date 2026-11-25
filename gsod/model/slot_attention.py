@@ -30,8 +30,7 @@ def _drop_path(x: torch.Tensor, training: bool) -> torch.Tensor:
 
 
 class SlotAttention(nn.Module):
-    """Keys / values of (b, N, C) tokens -> background slot, object slots,
-    attention (b, K, N)."""
+    """(b, N, C) tokens -> background slot, object slots, attention (b, K, N)."""
 
     def __init__(self, num_slots: int, dim: int, iters: int):
         """dim: token and slot size."""
@@ -65,13 +64,13 @@ class SlotAttention(nn.Module):
         self.sigma.fill_(sigma)
         self.noisy = sigma > 0
 
-    def keys_values(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokens (b, N, C) + position embedding -> keys, values (b, N, D)."""
-        feat = self.mlp_feat(feat + self.to_pos(self._grid(feat.shape[1], feat.device)))
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokens (b, N, C) -> background slot (b, D), object slots (b, K-1, D), attention (b, K, N)."""
+        # Keys / values: tokens + position embedding.
+        feat = self.mlp_feat(tokens + self.to_pos(self._grid(tokens.shape[1], tokens.device)))
         feat = self.norm_feat(feat)
-        return self.to_k(feat), self.to_v(feat)
+        k, v = self.to_k(feat), self.to_v(feat)
 
-    def forward(self, k: torch.Tensor, v: torch.Tensor):
         b = k.shape[0]
         start = self.slots_init.weight.expand(b, -1, -1)
         if self.training and self.noisy:
@@ -83,7 +82,7 @@ class SlotAttention(nn.Module):
             if i == self.iters - 1:  # bi-level
                 slot_bg = slot_bg.detach() + start[:, :1] - start[:, :1].detach()
                 slot_obj = slot_obj.detach() + start[:, 1:] - start[:, 1:].detach()
-            attn, updates = self._attend(slot_bg, slot_obj, k, v, k)  # (b, K, N)
+            attn, updates = self._attend(slot_bg, slot_obj, k, v)  # (b, K, N)
             updates_bg, updates_obj = updates[:, :1], updates[:, 1:]
             slot_bg = self._update(self.gru_bg, self.mlp_bg, updates_bg, slot_bg)
             slot_obj = self._update(self.gru, self.mlp, updates_obj, slot_obj)
@@ -91,11 +90,11 @@ class SlotAttention(nn.Module):
         return slot_bg[:, 0], slot_obj, attn
 
     def _attend(
-        self, slot_bg: torch.Tensor, slot_obj: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_obj: torch.Tensor
+        self, slot_bg: torch.Tensor, slot_obj: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """-> attention (b, K, N) and the weighted means of v (b, K, D)."""
         dots_bg = torch.einsum("bid,bjd->bij", self.to_q_bg(slot_bg), k) * self.scale
-        dots_obj = torch.einsum("bid,bjd->bij", self.to_q(slot_obj), k_obj) * self.scale
+        dots_obj = torch.einsum("bid,bjd->bij", self.to_q(slot_obj), k) * self.scale
         attn = torch.cat([dots_bg, dots_obj], dim=1).softmax(dim=1)
         attn_wm = attn / (attn.sum(-1, keepdim=True) + EPS)
         return attn, torch.einsum("bij,bjd->bid", attn_wm, v)

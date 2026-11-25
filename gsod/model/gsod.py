@@ -156,8 +156,7 @@ class GSODModel(nn.Module):
         outputs (B, ...), attention and boxes."""
         tokens = self.encode(images[:, 0])
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
-        k, v = self.slot_attention.keys_values(tokens)
-        bg_slot, slots, attn = self.slot_attention(k, v)
+        bg_slot, slots, attn = self.slot_attention(tokens)
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
