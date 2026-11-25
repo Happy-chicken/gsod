@@ -94,7 +94,8 @@ def evaluate(model: GSODModel, dataset, device: torch.device, n_images: int = 0)
 def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     """One forward pass, as numpy."""
     images = item["images"].to(device)
-    result = {name: value[0] for name, value in model(images[None], item["cam2world"].to(device)[None]).items()}
+    outputs = model(images[None], item["cam2world"].to(device)[None])
+    result = {name: value[0] for name, value in outputs.items() if torch.is_tensor(value)}
     rgb = result["rgb"].clamp(0, 1)
     n_views = images.shape[0]
     novel_ssim = [float(ssim(rgb[v : v + 1], images[v : v + 1])) for v in range(1, n_views)]

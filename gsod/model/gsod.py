@@ -194,6 +194,7 @@ class GSODModel(nn.Module):
 
         out = self.render(objects, floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
+        out["gaussians"] = {"objects": objects, "background": floor}  # world, for diagnostics
         if self.refine_steps:  # before refinement: auxiliary loss, panels
             out["rgb_pre"] = splat(self.merge(sketch, floor), cam2world, self.image_size, self.focal_ratio, self.near)[
                 "rgb"
