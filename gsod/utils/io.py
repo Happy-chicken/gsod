@@ -57,8 +57,9 @@ def load_networks(
     optimizers: Sequence[torch.optim.Optimizer] = (),
     device: str | torch.device = "cuda",
 ) -> dict[str, object]:
-    """Load weights (strict=False, mismatched keys are reported); missing files
-    are skipped. A network none of whose keys match raises."""
+    """Load weights (strict=False; missing / unexpected keys and tensors of another
+    shape are reported and skipped); missing files are skipped. A network none of
+    whose keys match raises."""
     save_dir = Path(save_dir)
     result: dict[str, object] = {}
     for name, net in networks.items():
@@ -67,6 +68,11 @@ def load_networks(
             print(f"not found: {path}, skip {name}")
             continue
         state = torch.load(path, map_location=device)
+        own = net.state_dict()
+        reshaped = [k for k, v in state.items() if k in own and own[k].shape != v.shape]
+        if reshaped:
+            print(f"{name}: {len(reshaped)} tensors of another shape, left as initialised: {reshaped[:4]}")
+        state = {k: v for k, v in state.items() if k not in reshaped}
         result[name] = keys = net.load_state_dict(state, strict=False)
         if keys.missing_keys or keys.unexpected_keys:
             print(

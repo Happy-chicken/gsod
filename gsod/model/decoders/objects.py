@@ -217,7 +217,7 @@ class ObjectDecoder(nn.Module):
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
         # Refine: view-0 features -> q (zero at first); the feature of a hidden Gaussian.
-        self.pixel_to_q = nn.Linear(z_dim + 3, d)
+        self.pixel_to_q = nn.Linear(z_dim + 4, d)  # [features, rgb, ownership]
         nn.init.zeros_(self.pixel_to_q.weight)
         nn.init.zeros_(self.pixel_to_q.bias)
 
@@ -259,11 +259,11 @@ class ObjectDecoder(nn.Module):
         attn: torch.Tensor,
         frame: SceneFrame,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """Decode on from q, adding what each Gaussian sees at its view-0 pixel where its slot owns it."""
+        """Decode on from q, adding what each Gaussian sees at its view-0 pixel and its slot's ownership there."""
         ownership, features, rgb = sample_own_pixels(
             state["mu"], attn, enc, image, frame, self.image_size, self.focal_ratio
         )
-        pixel_info = (ownership * torch.cat([features, rgb], -1)).flatten(0, 1)  # (B*K, G, C + 3)
+        pixel_info = torch.cat([features, rgb, ownership], -1).flatten(0, 1)  # (B*K, G, C + 4)
         q = self._layers(state["q"] + self.pixel_to_q(pixel_info), state)
         gaussians = self._gaussians(q, state)
         return gaussians, {**state, "q": q, "mu": gaussians["mu"]}
