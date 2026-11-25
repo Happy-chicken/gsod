@@ -56,8 +56,9 @@ def _gray(hw: np.ndarray) -> np.ndarray:
 BOX_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
 
 
-def draw_boxes(image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, cam2world: np.ndarray,
-               focal_ratio, slots: list[int]) -> np.ndarray:
+def draw_boxes(
+    image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, cam2world: np.ndarray, focal_ratio, slots: list[int]
+) -> np.ndarray:
     """Image (H, W, 3), world box corners (K-1, 8, 3), anchor_init (K-1, 3) -> the
     image with slot k's box in its mask colour, anchor_init (ring), anchor (dot)."""
     h, w = image.shape[:2]
@@ -84,10 +85,7 @@ def draw_boxes(image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, cam2
 
 def _slot_caption(row: dict) -> str:
     target = f" #{row['gt_object']}" if row["gt_object"] >= 0 else ""
-    return (
-        f"s{row['slot']} {row['role']}{target} "
-        f"occ{row['occupancy']:.2f}"
-    )
+    return f"s{row['slot']} {row['role']}{target} occ{row['occupancy']:.2f}"
 
 
 def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
@@ -99,8 +97,9 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
         foreground = _rgb(rec["fg_rgb"][v])
         if "box" in rec:  # boxes of the slots that draw something; ring = anchor_init, dot = anchor
             shown = [row["slot"] for row in rows if row["role"] != "empty"]
-            foreground = draw_boxes(foreground, rec["box"], rec["anchor_init"], rec["cam2world"][v],
-                                    rec["focal_ratio"], shown)
+            foreground = draw_boxes(
+                foreground, rec["box"], rec["anchor_init"], rec["cam2world"][v], rec["focal_ratio"], shown
+            )
         images = [
             (_rgb(rec["target"][v]), "input"),
             (_rgb(rec["rgb"][v]), "render"),
@@ -111,17 +110,13 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
         if gt is not None:
             images.append((colorize(gt[v]), "GT mask"))
         images.append((colorize(rec["mask_idx"][v]), "render mask"))
-        slots = [
-            (_rgb(rec["slot_rgb"][v, k - 1]), _slot_caption(row))
-            for k, row in zip(range(1, len(rows) + 1), rows)
-        ]
+        slots = [(_rgb(rec["slot_rgb"][v, k - 1]), _slot_caption(row)) for k, row in zip(range(1, len(rows) + 1), rows)]
         return {"images": images, "slots": slots}
 
     out = {"view0": view(0)}
     attn_up = np.stack([upsample_labels(a, size) for a in rec["attn"]])
     out["view0"]["attention"] = [(colorize(attn_up.argmax(0)), "attention mask")] + [
-        (_gray(a), f"{'bg' if k == 0 else f's{k}'} {float(a.mean()):.0%}")
-        for k, a in enumerate(attn_up)
+        (_gray(a), f"{'bg' if k == 0 else f's{k}'} {float(a.mean()):.0%}") for k, a in enumerate(attn_up)
     ]
     if rec["rgb"].shape[0] > 1:
         out["view1"] = view(1)
@@ -151,8 +146,7 @@ def wandb_images(tiles_by_key: dict) -> dict:
     import wandb
 
     return {
-        key: [wandb.Image(image, caption=caption) for image, caption in tiles]
-        for key, tiles in tiles_by_key.items()
+        key: [wandb.Image(image, caption=caption) for image, caption in tiles] for key, tiles in tiles_by_key.items()
     }
 
 

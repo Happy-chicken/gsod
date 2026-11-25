@@ -39,12 +39,8 @@ WORST_SCENES = 8
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument(
-        "--dataset", choices=list(DATASETS), required=True
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset", choices=list(DATASETS), required=True)
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--checkpoint", default=None, help="checkpoint directory")
     parser.add_argument("--suffix", default="latest", help="checkpoint suffix")
@@ -58,18 +54,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = config_for(args.dataset)
-    data_root = args.data or (
-        cfg.test_root if args.split == "test" and cfg.test_root else cfg.data_root
-    )
+    data_root = args.data or (cfg.test_root if args.split == "test" and cfg.test_root else cfg.data_root)
     checkpoint = args.checkpoint or latest_run_dir(cfg.dataset_mode)
     if checkpoint is None:
-        raise FileNotFoundError(
-            "no timestamped checkpoint found; pass --checkpoint explicitly"
-        )
+        raise FileNotFoundError("no timestamped checkpoint found; pass --checkpoint explicitly")
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA testing requested but torch.cuda.is_available() is False"
-        )
+        raise RuntimeError("CUDA testing requested but torch.cuda.is_available() is False")
     device = torch.device("cuda")
 
     cfg = run_config(cfg, Path(checkpoint))
@@ -83,9 +73,7 @@ def main() -> None:
         "recon": RECONSTRUCTION_KEYS,
         "diag": DIAGNOSTIC_KEYS,
     }
-    summary = {
-        f"{group}/{key}": result.metrics[key] for group, keys in groups.items() for key in keys
-    }
+    summary = {f"{group}/{key}": result.metrics[key] for group, keys in groups.items() for key in keys}
     m = result.metrics
     print(f"{args.split} split ({len(dataset)} scenes)")
     print(f"  2D   ARI {m['ari']:.4f}   FG-ARI {m['fg_ari']:.4f}")
@@ -94,9 +82,7 @@ def main() -> None:
     print("  diag  " + "   ".join(f"{k} {m[k]:.3f}" for k in DIAGNOSTIC_KEYS))
 
     # Worst NV-ARI first (scenes without GT last).
-    scenes = sorted(
-        result.per_scene, key=lambda r: (math.isnan(r["nv_ari"]), r["nv_ari"])
-    )
+    scenes = sorted(result.per_scene, key=lambda r: (math.isnan(r["nv_ari"]), r["nv_ari"]))
     worst = {}
     for row in scenes[:WORST_SCENES]:
         rec = collect(model, dataset[row["index"]], device)

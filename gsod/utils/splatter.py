@@ -23,9 +23,7 @@ def splat(
     "rgb", "depth" (premultiplied by alpha), "alpha"; with features
     (..., N, D) instead of colours: "features" (..., V, D, H, W), "alpha"."""
     if not gaussians["mu"].is_cuda:
-        raise RuntimeError(
-            "splat needs CUDA tensors; this project requires CUDA"
-        )
+        raise RuntimeError("splat needs CUDA tensors; this project requires CUDA")
 
     from gsplat import rasterization
 
@@ -81,9 +79,7 @@ def sh_coefficients(gaussians: dict[str, torch.Tensor]) -> tuple[torch.Tensor, i
     return torch.cat([dc[..., None, :], gaussians["sh1"].float()], -2).contiguous(), 1
 
 
-def _intrinsics(
-    width: int, height: int, focal_ratio: tuple[float, float], device: torch.device
-) -> torch.Tensor:
+def _intrinsics(width: int, height: int, focal_ratio: tuple[float, float], device: torch.device) -> torch.Tensor:
     """Pinhole intrinsics; +0.5 matches gsplat's pixel centres to the dataset's."""
     fx = float(focal_ratio[0]) * width
     fy = float(focal_ratio[1]) * height

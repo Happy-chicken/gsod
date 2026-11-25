@@ -220,8 +220,12 @@ class ObjectDecoder(nn.Module):
     """Object slots -> Gaussians, scene frame."""
 
     def __init__(
-        self, z_dim: int, gaussians_per_slot: int, hidden_dim: int,
-        image_size: tuple[int, int], focal_ratio: tuple[float, float],
+        self,
+        z_dim: int,
+        gaussians_per_slot: int,
+        hidden_dim: int,
+        image_size: tuple[int, int],
+        focal_ratio: tuple[float, float],
     ):
         super().__init__()
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
@@ -271,7 +275,11 @@ class ObjectDecoder(nn.Module):
         return gaussians, box, state
 
     def refine(
-        self, state: dict, image: torch.Tensor, enc: torch.Tensor, render: dict[str, torch.Tensor],
+        self,
+        state: dict,
+        image: torch.Tensor,
+        enc: torch.Tensor,
+        render: dict[str, torch.Tensor],
         frame: SceneFrame,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """Decode on from q: visible Gaussians take view 0's colour and features, hidden ones the slot's."""
@@ -279,8 +287,9 @@ class ObjectDecoder(nn.Module):
         extent = state["extent"].unflatten(0, state["shape"])
         visible, colour, feature = (
             x.flatten(0, 1)  # (B*K, G, ...)
-            for x in look_up_view0(g["mu"], g["scale"], extent, image, enc, render, frame,
-                                   self.image_size, self.focal_ratio)
+            for x in look_up_view0(
+                g["mu"], g["scale"], extent, image, enc, render, frame, self.image_size, self.focal_ratio
+            )
         )
         base = visible * colour + (1 - visible) * state["colour"][:, None]
         seen = visible * feature + (1 - visible) * self.hidden_feature

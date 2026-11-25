@@ -30,10 +30,7 @@ _AUX_SUFFIXES = (
 
 
 def _natural_key(path: Path) -> list[tuple[int, str | int]]:
-    return [
-        (1, int(part)) if part.isdigit() else (0, part.lower())
-        for part in _NUM_RE.split(path.name)
-    ]
+    return [(1, int(part)) if part.isdigit() else (0, part.lower()) for part in _NUM_RE.split(path.name)]
 
 
 def scene_files(root: str | Path) -> dict[int, list[Path]]:
@@ -110,9 +107,7 @@ class MultiViewScenes(Dataset):
         self.scene_ids = chosen
 
     @staticmethod
-    def _split_ids(
-        ids: list[int], val_fraction: float, seed: int
-    ) -> tuple[list[int], list[int]]:
+    def _split_ids(ids: list[int], val_fraction: float, seed: int) -> tuple[list[int], list[int]]:
         if len(ids) < 2 or val_fraction <= 0:
             return list(ids), []
         shuffled = list(ids)

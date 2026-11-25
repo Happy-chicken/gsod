@@ -88,9 +88,7 @@ class GSODTraining(L.LightningModule):
 
     def on_fit_start(self) -> None:
         if self.resume is not None:
-            load_networks(
-                str(self.out), self.resume, {}, self.trainer.optimizers, device=self.device
-            )
+            load_networks(str(self.out), self.resume, {}, self.trainer.optimizers, device=self.device)
 
     def on_train_start(self) -> None:
         if self.resume is None:
@@ -134,9 +132,7 @@ class GSODTraining(L.LightningModule):
         if not len(self.val_set):
             return
         monitor = evaluate(self.model, self.monitor_set, self.device, IMAGE_SCENES)
-        val = monitor if self.monitor_set is self.val_set else evaluate(
-            self.model, self.val_set, self.device
-        )
+        val = monitor if self.monitor_set is self.val_set else evaluate(self.model, self.val_set, self.device)
         self.logger.log_metrics(
             {
                 **{f"val/{key}": val.metrics[key] for key in RECONSTRUCTION_KEYS},
@@ -163,9 +159,7 @@ class GSODTraining(L.LightningModule):
     def _save(self, suffix: str, epoch: int) -> None:
         """epoch: epochs done (where --resume starts)."""
         save_networks(str(self.out), suffix, self.model.networks(), self.trainer.optimizers)
-        (self.out / f"{suffix}_state.json").write_text(
-            json.dumps({"epoch": epoch, "best_psnr": self.best_psnr})
-        )
+        (self.out / f"{suffix}_state.json").write_text(json.dumps({"epoch": epoch, "best_psnr": self.best_psnr}))
 
 
 def _lr_factor(cfg: BaseConfig, epoch: float) -> float:
@@ -228,9 +222,7 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
         best_psnr=best_psnr,
     )
 
-    logger = WandbLogger(
-        project=WANDB_PROJECT, name=out.name, save_dir=str(out), config=asdict(cfg)
-    )
+    logger = WandbLogger(project=WANDB_PROJECT, name=out.name, save_dir=str(out), config=asdict(cfg))
     for counter in ("trainer/global_step", "epoch"):
         logger.experiment.define_metric(counter, hidden=True)
     # Evaluation curves against epochs (comparable across batch_scenes).
@@ -252,12 +244,8 @@ def train(model: GSODModel, cfg: BaseConfig, *, resume: str | None = None) -> No
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument(
-        "--dataset", choices=list(DATASETS), required=True
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset", choices=list(DATASETS), required=True)
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--out", default=None, help="checkpoint directory")
     parser.add_argument("--epochs", type=int, default=None)
@@ -287,9 +275,7 @@ def main() -> None:
     if args.resume is not None and args.out is None:
         latest = latest_run_dir(args.dataset)
         if latest is None:
-            raise FileNotFoundError(
-                "--resume needs --out or an existing timestamped run"
-            )
+            raise FileNotFoundError("--resume needs --out or an existing timestamped run")
         cfg = replace(cfg, out_dir=latest)
 
     known = {f.name for f in fields(cfg)}
@@ -301,9 +287,7 @@ def main() -> None:
     cfg = replace(cfg, **values)
 
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA training requested but torch.cuda.is_available() is False"
-        )
+        raise RuntimeError("CUDA training requested but torch.cuda.is_available() is False")
 
     torch.manual_seed(cfg.seed)
     model = build_model(cfg)

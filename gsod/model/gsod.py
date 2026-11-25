@@ -26,6 +26,7 @@ from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
 
+
 class GSODModel(nn.Module):
     def __init__(
         self,
@@ -92,8 +93,13 @@ class GSODModel(nn.Module):
         return to_world(self.bg_decoder(bg_slot, attn, colours, frame), frame, rotate=False)
 
     def refine_objects(
-        self, state: dict, image: torch.Tensor, enc: torch.Tensor, render: dict[str, torch.Tensor],
-        frame: SceneFrame, detach: bool = False,
+        self,
+        state: dict,
+        image: torch.Tensor,
+        enc: torch.Tensor,
+        render: dict[str, torch.Tensor],
+        frame: SceneFrame,
+        detach: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """One refine round -> world object Gaussians, new state."""
         if detach:
@@ -121,10 +127,12 @@ class GSODModel(nn.Module):
         # (0 = floor and uncovered) and per-object colour contributions.
         with torch.no_grad():
             every = {name: value.detach() for name, value in every.items()}
-            ids = torch.cat([
-                torch.arange(1, n_obj + 1, device=image.device).repeat_interleave(n_gauss),
-                torch.zeros(floor["mu"].shape[1], dtype=torch.long, device=image.device),
-            ])
+            ids = torch.cat(
+                [
+                    torch.arange(1, n_obj + 1, device=image.device).repeat_interleave(n_gauss),
+                    torch.zeros(floor["mu"].shape[1], dtype=torch.long, device=image.device),
+                ]
+            )
             onehot = F.one_hot(ids, n_obj + 1).float().expand(b, -1, -1)  # (B, N, K)
             obj_rgb = (onehot[..., 1:, None] * every["rgb"][..., None, :]).flatten(-2)
             parts = splat(every, *cams, features=torch.cat([onehot, obj_rgb], -1))["features"]
@@ -164,5 +172,7 @@ class GSODModel(nn.Module):
         out = self.render(objects, floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
         if self.refine_steps:  # before refinement: auxiliary loss, panels
-            out["rgb_pre"] = splat(self.merge(sketch, floor), cam2world, self.image_size, self.focal_ratio, self.near)["rgb"]
+            out["rgb_pre"] = splat(self.merge(sketch, floor), cam2world, self.image_size, self.focal_ratio, self.near)[
+                "rgb"
+            ]
         return out

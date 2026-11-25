@@ -35,9 +35,7 @@ class SceneFrame(NamedTuple):
     rot: torch.Tensor
 
 
-def scene_frame(
-    cam2world: torch.Tensor, image_size: tuple[int, int], focal_ratio: tuple[float, float]
-) -> SceneFrame:
+def scene_frame(cam2world: torch.Tensor, image_size: tuple[int, int], focal_ratio: tuple[float, float]) -> SceneFrame:
     """View 0's cam2world (..., 4, 4) -> its SceneFrame."""
     rot, o = cam2world[..., :3, :3], cam2world[..., :3, 3]
     forward = rot[..., 2]
@@ -105,7 +103,9 @@ def rotate_gaussians(
     out = {
         **gaussians,
         "mu": gaussians["mu"] @ rot.to(gaussians["mu"].dtype).mT,
-        "quat": quat_mul(quat.to(gaussians["quat"].dtype)[..., None, :].expand_as(gaussians["quat"]), gaussians["quat"]),
+        "quat": quat_mul(
+            quat.to(gaussians["quat"].dtype)[..., None, :].expand_as(gaussians["quat"]), gaussians["quat"]
+        ),
     }
     if "sh1" in gaussians:
         out["sh1"] = rotate_sh1(gaussians["sh1"], rot)
@@ -121,9 +121,7 @@ def points_to_world(points: torch.Tensor, frame: SceneFrame, rotate: bool = True
     return flat.view(points.shape)
 
 
-def to_world(
-    gaussians: dict[str, torch.Tensor], frame: SceneFrame, rotate: bool = True
-) -> dict[str, torch.Tensor]:
+def to_world(gaussians: dict[str, torch.Tensor], frame: SceneFrame, rotate: bool = True) -> dict[str, torch.Tensor]:
     """Gaussians (B, ..., per-Gaussian dims), scene frame -> world."""
     lead = gaussians["mu"].shape[1:-1]  # e.g. (M,) or (slots, G)
     flat = {name: value.flatten(1, len(lead)) for name, value in gaussians.items()}  # (B, M, ...)

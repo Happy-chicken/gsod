@@ -1,0 +1,8 @@
+# Code style: `ruff format` (black style). Arguments fit on one line, or one per
+# line with a trailing comma.
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "double"

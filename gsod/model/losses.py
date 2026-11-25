@@ -1,8 +1,8 @@
 """Reconstruction loss (no masks), every view:
 
-    total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
-            + lpips * LPIPS (VGG; from lpips_start of training on)
-            + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
+total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
+        + lpips * LPIPS (VGG; from lpips_start of training on)
+        + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
 """
 
 from __future__ import annotations
@@ -14,9 +14,7 @@ from torch import nn
 from gsod.configs.base import LossConfig
 
 
-def _gaussian_window(
-    size: int, sigma: float, channels: int, device, dtype
-) -> torch.Tensor:
+def _gaussian_window(size: int, sigma: float, channels: int, device, dtype) -> torch.Tensor:
     coords = torch.arange(size, device=device, dtype=dtype) - size // 2
     g = torch.exp(-(coords**2) / (2.0 * sigma**2))
     g = g / g.sum()
@@ -24,9 +22,7 @@ def _gaussian_window(
     return window.expand(channels, 1, size, size)
 
 
-def ssim(
-    x: torch.Tensor, y: torch.Tensor, size: int = 11, sigma: float = 1.5
-) -> torch.Tensor:
+def ssim(x: torch.Tensor, y: torch.Tensor, size: int = 11, sigma: float = 1.5) -> torch.Tensor:
     """Mean SSIM over channels and batches; x, y in [0, 1], shape (B, C, H, W)."""
     window = _gaussian_window(size, sigma, x.shape[1], x.device, x.dtype)
     pad = size // 2
