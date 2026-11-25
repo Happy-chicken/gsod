@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--scenes", type=int, default=50, help="scenes for the statistics")
     parser.add_argument("--optimize-scenes", type=int, default=5, help="scenes for the optimisation")
+    parser.add_argument("--objects-only", action="store_true", help="optimise the object Gaussians, background fixed")
     return parser.parse_args()
 
 
@@ -77,8 +78,16 @@ def gaussian_stats(model, outputs, cam2world: torch.Tensor) -> list[dict]:
     return rows
 
 
-def optimise(model, gaussians: dict, images: torch.Tensor, cam2world: torch.Tensor, views: list[int]):
-    """Every Gaussian (1, N, ...) optimised on the given views -> render of all views (V, 3, H, W)."""
+def optimise(
+    model,
+    gaussians: dict,
+    fixed: dict | None,
+    images: torch.Tensor,
+    cam2world: torch.Tensor,
+    views: list[int],
+):
+    """Gaussians (1, N, ...) optimised on the given views, with fixed Gaussians (1, M, ...) or None
+    rendered alongside -> render of all views (V, 3, H, W)."""
     spread = gaussians["mu"].std().item()
     params = {
         "mu": gaussians["mu"].detach().clone(),
@@ -102,6 +111,8 @@ def optimise(model, gaussians: dict, images: torch.Tensor, cam2world: torch.Tens
             "rgb": torch.sigmoid(params["rgb"]),
             "sh1": params["sh1"],
         }
+        if fixed is not None:
+            g = {k: torch.cat([v, fixed[k].detach()], 1) for k, v in g.items()}
         return splat(g, cam[None], *cams)["rgb"][0]
 
     target = images[views]
@@ -144,23 +155,29 @@ def main() -> None:
     print(f"   area per active Gaussian:   median {np.median(area / np.maximum(active, 1)):.1f} px")
 
     # 2. Optimisation ceiling.
-    print(f"2. Optimised directly ({STEPS} steps); PSNR per view [view 0, novel views...]")
+    mode = "object Gaussians only, background fixed" if args.objects_only else "every Gaussian"
+    tag = "_objects" if args.objects_only else ""
+    print(f"2. Optimised directly ({mode}, {STEPS} steps); PSNR per view [view 0, novel views...]")
     for i in range(min(args.optimize_scenes, len(dataset))):
         item = dataset[i]
         images, cams = item["images"].to(device), item["cam2world"].to(device)
         with torch.no_grad():
             outputs = model(images[None], cams[None])
         g = outputs["gaussians"]
-        every = model.merge(g["objects"], g["background"])
+        if args.objects_only:  # objects optimised, background fixed
+            free = {k: v.flatten(1, 2) for k, v in g["objects"].items()}
+            fixed = g["background"]
+        else:  # everything optimised
+            free, fixed = model.merge(g["objects"], g["background"]), None
         before = outputs["rgb"][0].clamp(0, 1)
-        all_views = optimise(model, every, images, cams, list(range(images.shape[0])))
-        view0 = optimise(model, every, images, cams, [0])
+        all_views = optimise(model, free, fixed, images, cams, list(range(images.shape[0])))
+        view0 = optimise(model, free, fixed, images, cams, [0])
         fmt = lambda x: "[" + ", ".join(f"{v:.1f}" for v in x) + "]"  # noqa: E731
         print(f"   scene {i}: model {fmt(psnr(before, images))}")
         print(f"            all views {fmt(psnr(all_views, images))}   view 0 only {fmt(psnr(view0, images))}")
         rows_img = [images, before, all_views, view0]  # rows: input, model, optimised (all views / view 0)
         grid = torch.cat([torch.cat(list(r), -1) for r in rows_img], -2)  # (3, 4H, VW)
-        save_png(out_dir / f"scene{i:04d}.png", (grid.permute(1, 2, 0).cpu().numpy() * 255 + 0.5).astype(np.uint8))
+        save_png(out_dir / f"scene{i:04d}{tag}.png", (grid.permute(1, 2, 0).cpu().numpy() * 255 + 0.5).astype(np.uint8))
     print(f"   images (rows: input, model, optimised on all views, on view 0 only): {out_dir}")
 
 
