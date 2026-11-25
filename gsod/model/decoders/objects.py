@@ -247,18 +247,20 @@ class ObjectDecoder(nn.Module):
         state["q"] = self._layers(self.queries.expand(K, -1, -1), state)
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        return self._gaussians(state["q"], state), box, state
+        gaussians = self._gaussians(state["q"], state)
+        state["mu"] = gaussians["mu"]  # where refine() samples
+        return gaussians, box, state
 
     def refine(
-        self, state: dict, mu: torch.Tensor, enc: torch.Tensor, frame: SceneFrame,
-        render: dict[str, torch.Tensor] | None = None,
+        self, state: dict, enc: torch.Tensor, frame: SceneFrame, render: dict[str, torch.Tensor] | None = None
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """State, current Gaussian centres mu (B, K, G, 3), encoder map (B, C, s, s)
-        [, a view-0 render for occlusion] -> Gaussians decoded on from q + the hint
-        at each Gaussian's pixel, new state; same box and slot tokens."""
-        hint = sample_at_gaussians(enc, mu, frame, self.image_size, self.focal_ratio, render)
+        """State, encoder map (B, C, s, s) [, a view-0 render for occlusion] ->
+        Gaussians (B, K, G, ...) decoded on from q + the hint at each Gaussian's
+        pixel, new state; same box and slot tokens."""
+        hint = sample_at_gaussians(enc, state["mu"], frame, self.image_size, self.focal_ratio, render)
         q = self._layers(state["q"] + self.hint_in(hint.flatten(0, 1)), state)
-        return self._gaussians(q, state), {**state, "q": q}
+        gaussians = self._gaussians(q, state)
+        return gaussians, {**state, "q": q, "mu": gaussians["mu"]}
 
     def _layers(self, q: torch.Tensor, state: dict) -> torch.Tensor:
         """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens)."""

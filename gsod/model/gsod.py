@@ -78,58 +78,50 @@ class GSODModel(nn.Module):
         return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
-        self,
-        slots: torch.Tensor,
-        attn: torch.Tensor,
-        colours: torch.Tensor,
-        frame: SceneFrame,
-    ) -> dict[str, torch.Tensor]:
-        """slots (B, K-1, C), their attention (B, K-1, s*s), token colours
-        (B, s*s, 3) -> world Gaussians (B, K-1, G, ...), box half sizes
-        (B, K-1, 3, scene frame), world box corners (B, K-1, 8, 3) and anchor_init (B, K-1, 3)."""
+        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
+        """slots (B, K-1, C), their attention (B, K-1, s*s), token colours (B, s*s, 3)
+        -> world Gaussians (B, K-1, G, ...), the box {"extent" (B, K-1, 3, scene
+        frame), "box" (B, K-1, 8, 3) world corners, "anchor_init" (B, K-1, 3) world},
+        the decoder state for refine_objects."""
         local, box, state = self.obj_decoder(slots, attn, colours, frame)
-        return {
-            "gaussians": to_world(local, frame),
-            "local": local,  # scene frame
-            "state": state,  # for refine_scene
+        box = {
             "extent": box["extent"],
             "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
             "anchor_init": points_to_world(box["anchor_init"], frame),
         }
+        return to_world(local, frame), box, state
 
     def decode_background(
         self, bg_slot: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> dict[str, torch.Tensor]:
         """Background slots (B, C), attention (B, s*s), token colours
         (B, s*s, 3) -> world floor Gaussians (B, M, ...)."""
-        gaussians = self.bg_decoder(bg_slot, attn, colours, frame)
-        return {"gaussians": to_world(gaussians, frame, rotate=False)}
+        return to_world(self.bg_decoder(bg_slot, attn, colours, frame), frame, rotate=False)
 
-    def refine_scene(
-        self, scenes: dict, enc: torch.Tensor, render: dict[str, torch.Tensor] | None, detach: bool = False
-    ) -> dict:
-        """Scenes, encoder map (B, C, s, s) [, view-0 render] -> scenes with the
-        object Gaussians decoded on from q + their hint; box, slots, attention kept."""
-        frame, objects = scenes["frame"], scenes["objects"]
-        state = objects["state"]
+    def refine_objects(
+        self, state: dict, enc: torch.Tensor, frame: SceneFrame, render: dict[str, torch.Tensor] | None,
+        detach: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """Decoder state, encoder map (B, C, s, s) [, view-0 render] -> world object
+        Gaussians decoded on from q + their hint, new state."""
         if detach:
             state = {**state, "q": state["q"].detach()}
-        local, state = self.obj_decoder.refine(state, objects["local"]["mu"], enc, frame, render)
-        objects = {**objects, "gaussians": to_world(local, frame), "local": local, "state": state}
-        return {**scenes, "objects": objects}
+        local, state = self.obj_decoder.refine(state, enc, frame, render)
+        return to_world(local, frame), state
 
     @staticmethod
-    def gaussians(scenes: dict) -> dict[str, torch.Tensor]:
-        """Every Gaussian of each scene (B, N, ...), objects first."""
-        obj, floor = scenes["objects"]["gaussians"], scenes["background"]["gaussians"]
-        return {name: torch.cat([obj[name].flatten(1, 2), floor[name]], 1) for name in obj}
+    def merge(objects: dict[str, torch.Tensor], floor: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Object (B, K-1, G, ...) and floor (B, M, ...) Gaussians -> every Gaussian (B, N, ...), objects first."""
+        return {name: torch.cat([objects[name].flatten(1, 2), floor[name]], 1) for name in objects}
 
-    def render(self, scenes: dict, cam2world: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Scenes (forward(render=False)) rendered into cam2world (B, V, 4, 4):
-        every Gaussian, object or floor, sorted and blended together."""
-        obj, floor = scenes["objects"]["gaussians"], scenes["background"]["gaussians"]
-        b, n_obj, n_gauss = obj["mu"].shape[:3]
-        every = self.gaussians(scenes)
+    def render(
+        self, objects: dict[str, torch.Tensor], floor: dict[str, torch.Tensor], cam2world: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """World object and floor Gaussians rendered into cam2world (B, V, 4, 4):
+        all sorted and blended together; per-slot masks from the same blending."""
+        b, n_obj, n_gauss = objects["mu"].shape[:3]
+        every = self.merge(objects, floor)
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         out = splat(every, *cams)
         image = out["rgb"]
@@ -157,42 +149,33 @@ class GSODModel(nn.Module):
             "bg_rgb": bg_rgb,  # the floor alone
             "slot_alpha": weights,  # (B, V, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=2),  # (B, V, H, W)
-            "attn": scenes["attn"],  # (B, K, s*s)
-            "extent": scenes["objects"]["extent"],  # (B, K-1, 3)
-            "box": scenes["objects"]["box"],  # (B, K-1, 8, 3) world corners
-            "anchor_init": scenes["objects"]["anchor_init"],  # (B, K-1, 3) world, on the floor
         }
 
-    def forward(self, images: torch.Tensor, cam2world: torch.Tensor, render: bool = True) -> dict:
+    def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
         """images (B, V, 3, H, W) in [0, 1], cam2world (B, V, 4, 4) -> render
-        outputs (B, ...), or with render=False the decoded scenes."""
+        outputs (B, ...), attention and boxes."""
         tokens = self.encode(images[:, 0])
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         k, v = self.slot_attention.keys_values(tokens)
         bg_slot, slots, attn = self.slot_attention(k, v)
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)
-        background = self.decode_background(bg_slot, attn[:, 0], colours, frame)
-        scenes = {  # the sketch
-            "objects": self.decode_objects(slots, attn[:, 1:], colours, frame),
-            "background": background,
-            "attn": attn,
-            "frame": frame,
-        }
+        floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
+        objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
         # Refine: each object Gaussian reads the encoder features (+ its
         # occlusion in a view-0 render) at its pixel; same slots and attention.
-        pre = scenes
+        sketch = objects
         enc = tokens.transpose(1, 2).unflatten(2, (self.input_size, self.input_size))  # (B, C, s, s)
         for i in range(self.refine_steps):
             render0 = None
             if self.refine_occlusion:
-                view0 = splat(self.gaussians(scenes), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
+                view0 = splat(self.merge(objects, floor), cam2world[:, :1], self.image_size, self.focal_ratio, self.near)
                 render0 = {name: value[:, 0].detach() for name, value in view0.items()}
-            scenes = self.refine_scene(scenes, enc, render0, detach=i > 0)
-        if not render:
-            return scenes
-        out = self.render(scenes, cam2world)
+            objects, state = self.refine_objects(state, enc, frame, render0, detach=i > 0)
+
+        out = self.render(objects, floor, cam2world)
+        out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
         if self.refine_steps:  # before refinement: auxiliary loss, panels
-            out["rgb_pre"] = splat(self.gaussians(pre), cam2world, self.image_size, self.focal_ratio, self.near)["rgb"]
+            out["rgb_pre"] = splat(self.merge(sketch, floor), cam2world, self.image_size, self.focal_ratio, self.near)["rgb"]
         return out
