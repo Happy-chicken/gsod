@@ -17,7 +17,6 @@ class LossConfig:
     lpips_box_start: float = 0.3  # LPIPS and box from this fraction of training on
     refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
     box: float = 0.005  # mean box half size (keeps boxes tight)
-    bg_smooth: float = 0.01  # L1 differences of neighbouring background depth shares
 
 
 @dataclass

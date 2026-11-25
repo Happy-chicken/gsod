@@ -11,7 +11,6 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
-import torch.nn.functional as F
 
 
 def camera_directions(u: torch.Tensor, v: torch.Tensor, size: tuple[int, int], focal_ratio) -> torch.Tensor:
@@ -80,25 +79,6 @@ def quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         ],
         dim=-1,
     )
-
-
-def rotation_to_quat(rot: torch.Tensor) -> torch.Tensor:
-    """Rotation matrices (..., 3, 3) -> wxyz quaternions (..., 4) (largest-pivot formula)."""
-    m = rot.unbind(-1)
-    (m00, m10, m20), (m01, m11, m21), (m02, m12, m22) = (c.unbind(-1) for c in m)
-    pivot = torch.stack([1 + m00 + m11 + m22, 1 + m00 - m11 - m22, 1 - m00 + m11 - m22, 1 - m00 - m11 + m22], -1)
-    two_abs = pivot.clamp_min(1e-8).sqrt()  # 2 |w|, 2 |x|, 2 |y|, 2 |z|
-    candidates = torch.stack(
-        [
-            torch.stack([pivot[..., 0], m21 - m12, m02 - m20, m10 - m01], -1),
-            torch.stack([m21 - m12, pivot[..., 1], m10 + m01, m02 + m20], -1),
-            torch.stack([m02 - m20, m10 + m01, pivot[..., 2], m12 + m21], -1),
-            torch.stack([m10 - m01, m20 + m02, m21 + m12, pivot[..., 3]], -1),
-        ],
-        -2,
-    ) / (2 * two_abs[..., None])
-    best = pivot.argmax(-1)[..., None, None].expand(*pivot.shape[:-1], 1, 4)
-    return F.normalize(candidates.gather(-2, best)[..., 0, :], dim=-1)
 
 
 def rotate_sh1(sh1: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
