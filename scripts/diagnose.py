@@ -54,9 +54,28 @@ def psnr(a: torch.Tensor, b: torch.Tensor) -> list[float]:
     return (10 * torch.log10(1 / mse)).tolist()
 
 
-def gaussian_stats(model, outputs, cam2world: torch.Tensor) -> list[dict]:
+def run(model, images: torch.Tensor, cams: torch.Tensor) -> tuple[dict, dict]:
+    """One scene -> the model's outputs and the final world Gaussians {"objects", "background"}
+    (caught on their way into model.render; the model is not changed)."""
+    caught = {}
+    render = model.render
+
+    def catch(objects, background, cam2world):
+        caught.update(objects=objects, background=background)
+        return render(objects, background, cam2world)
+
+    model.render = catch
+    try:
+        with torch.no_grad():
+            outputs = model(images[None], cams[None])
+    finally:
+        del model.render  # back to the class method
+    return outputs, caught
+
+
+def gaussian_stats(model, outputs, gaussians, cam2world: torch.Tensor) -> list[dict]:
     """One scene -> per drawing object slot: active Gaussians, their view-0 size (px), area (px)."""
-    objects = outputs["gaussians"]["objects"]  # world, (1, K-1, G, ...)
+    objects = gaussians["objects"]  # world, (1, K-1, G, ...)
     w = model.image_size[1]
     world2cam = torch.linalg.inv(cam2world[0])  # view 0
     cam = objects["mu"][0] @ world2cam[:3, :3].T + world2cam[:3, 3]  # (K-1, G, 3)
@@ -143,8 +162,7 @@ def main() -> None:
     for i in range(min(args.scenes, len(dataset))):
         item = dataset[i]
         images, cams = item["images"].to(device), item["cam2world"].to(device)
-        with torch.no_grad():
-            rows += gaussian_stats(model, model(images[None], cams[None]), cams)
+        rows += gaussian_stats(model, *run(model, images, cams), cams)
     active = np.array([r["active"] for r in rows])
     size = np.array([r["size_px"] for r in rows])
     area = np.array([r["area_px"] for r in rows])
@@ -161,9 +179,7 @@ def main() -> None:
     for i in range(min(args.optimize_scenes, len(dataset))):
         item = dataset[i]
         images, cams = item["images"].to(device), item["cam2world"].to(device)
-        with torch.no_grad():
-            outputs = model(images[None], cams[None])
-        g = outputs["gaussians"]
+        outputs, g = run(model, images, cams)
         if args.objects_only:  # objects optimised, background fixed
             free = {k: v.flatten(1, 2) for k, v in g["objects"].items()}
             fixed = g["background"]

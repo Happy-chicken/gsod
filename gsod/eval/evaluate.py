@@ -94,8 +94,7 @@ def evaluate(model: GSODModel, dataset, device: torch.device, n_images: int = 0)
 def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
     """One forward pass, as numpy."""
     images = item["images"].to(device)
-    outputs = model(images[None], item["cam2world"].to(device)[None])
-    result = {name: value[0] for name, value in outputs.items() if torch.is_tensor(value)}
+    result = {name: value[0] for name, value in model(images[None], item["cam2world"].to(device)[None]).items()}
     rgb = result["rgb"].clamp(0, 1)
     n_views = images.shape[0]
     novel_ssim = [float(ssim(rgb[v : v + 1], images[v : v + 1])) for v in range(1, n_views)]
@@ -116,7 +115,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "target": np_(images),
         "rgb": np_(rgb),
         "fg_rgb": np_(result["fg_rgb"].clamp(0, 1)),
-        "rgb_pre": np_(result["rgb_pre"].clamp(0, 1)) if "rgb_pre" in result else None,  # before refinement
+        "rgb_pre": np_(result["rgb_steps"][0].clamp(0, 1)) if "rgb_steps" in result else None,  # the sketch
         "bg_rgb": np_(result["bg_rgb"].clamp(0, 1)),
         "slot_rgb": np_(result["slot_rgb"].clamp(0, 1)),  # (V, K-1, 3, H, W)
         "alpha": np_(result["slot_alpha"]),  # (V, K, H, W), 0 = uncovered

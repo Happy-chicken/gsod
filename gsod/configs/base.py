@@ -15,7 +15,7 @@ class LossConfig:
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
     lpips_box_start: float = 0.3  # LPIPS and box from this fraction of training on
-    refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
+    refine_aux: float = 0.5  # MSE + SSIM before each refine round, weighted refine_aux ** (rounds still to go)
     box: float = 0.005  # mean box half size (keeps boxes tight)
 
 
@@ -28,7 +28,7 @@ class BaseConfig:
     attn_iter: int = 3
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
-    refine_steps: int = 1  # refine rounds (object Gaussians decoded on from what they see in view 0); 0 = off
+    refine_steps: int = 3  # refine rounds (object Gaussians decoded on from what they see in view 0); 0 = off
     near: float = 0.1
 
     # --- optimisation (ramps as fractions of training)
