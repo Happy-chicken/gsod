@@ -114,6 +114,8 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
         return {"images": images, "slots": slots}
 
     out = {"view0": view(0)}
+    if "bg_depth" in rec:  # 1 = on the plane, darker = closer
+        out["view0"]["images"].append((_gray(upsample_labels(rec["bg_depth"], size)), "bg depth"))
     attn_up = np.stack([upsample_labels(a, size) for a in rec["attn"]])
     out["view0"]["attention"] = [(colorize(attn_up.argmax(0)), "attention mask")] + [
         (_gray(a), f"{'bg' if k == 0 else f's{k}'} {float(a.mean()):.0%}") for k, a in enumerate(attn_up)

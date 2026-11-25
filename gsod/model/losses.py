@@ -2,6 +2,7 @@
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
         + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
+        + bg_smooth * L1 differences of neighbouring background depth shares
         + lpips * LPIPS (VGG) + box * mean object box half size, both from lpips_box_start of training on
 """
 
@@ -67,6 +68,10 @@ class GSODLoss(nn.Module):
                 1.0 - ssim(pre, images)
             )
             weights["refine_aux"] = cfg.refine_aux
+        if cfg.bg_smooth > 0:
+            share = outputs["bg_depth"]
+            terms["bg_smooth"] = share.diff(dim=-1).abs().mean() + share.diff(dim=-2).abs().mean()
+            weights["bg_smooth"] = cfg.bg_smooth
         if progress >= cfg.lpips_box_start:  # late terms, once objects exist
             if self.lpips is not None:
                 terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]
