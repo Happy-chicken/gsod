@@ -1,7 +1,7 @@
 """Reconstruction loss (no masks), every view:
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
-        + sum over earlier refine rounds t of refine_aux ** (rounds after t) * (recon * MSE + ssim * (1 - SSIM))
+        + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
         + lpips * LPIPS (VGG) + box * mean object box half size, both from lpips_box_start of training on
 """
 
@@ -61,15 +61,12 @@ class GSODLoss(nn.Module):
             "ssim": 1.0 - ssim(rendered, images),
         }
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
-        if "rgb_steps" in outputs and cfg.refine_aux > 0:  # every round must improve: weights grow to 1
-            steps = outputs["rgb_steps"]  # (B, T, V, 3, H, W)
-            n = steps.shape[1]
-            terms["refine_aux"] = 0.0
-            for t in range(n):
-                x = steps[:, t].flatten(0, -4)
-                term = cfg.recon * F.mse_loss(2.0 * x - 1.0, 2.0 * images - 1.0) + cfg.ssim * (1.0 - ssim(x, images))
-                terms["refine_aux"] = terms["refine_aux"] + cfg.refine_aux ** (n - t) * term
-            weights["refine_aux"] = 1.0
+        if "rgb_pre" in outputs and cfg.refine_aux > 0:
+            pre = outputs["rgb_pre"].flatten(0, -4)
+            terms["refine_aux"] = cfg.recon * F.mse_loss(2.0 * pre - 1.0, 2.0 * images - 1.0) + cfg.ssim * (
+                1.0 - ssim(pre, images)
+            )
+            weights["refine_aux"] = cfg.refine_aux
         if progress >= cfg.lpips_box_start:  # late terms, once objects exist
             if self.lpips is not None:
                 terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]

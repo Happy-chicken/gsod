@@ -188,15 +188,15 @@ class GSODModel(nn.Module):
         side = (self.input_size, self.input_size)
         enc = tokens.transpose(1, 2).unflatten(2, side)  # (B, C, s, s)
         obj_attn = attn[:, 1:].unflatten(2, side)  # (B, K-1, s, s)
-        earlier = []  # object Gaussians before each round: the sketch, then after round 1, ...
+        sketch = objects
         for i in range(self.refine_steps):
-            earlier.append(objects)
             grads = self.view0_gradients(state["gaussians"], floor, images[:, 0], cam2world[:, 0], frame)
             objects, state = self.refine_objects(state, images[:, 0], enc, obj_attn, frame, grads, detach=i > 0)
 
         out = self.render(objects, floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
-        if earlier:  # all views before each round (B, refine_steps, V, 3, H, W): auxiliary losses, panels
-            cams = (cam2world, self.image_size, self.focal_ratio, self.near)
-            out["rgb_steps"] = torch.stack([splat(self.merge(g, floor), *cams)["rgb"] for g in earlier], 1)
+        if self.refine_steps:  # the sketch in all views: auxiliary loss, panels
+            out["rgb_pre"] = splat(self.merge(sketch, floor), cam2world, self.image_size, self.focal_ratio, self.near)[
+                "rgb"
+            ]
         return out

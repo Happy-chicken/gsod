@@ -115,7 +115,7 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "target": np_(images),
         "rgb": np_(rgb),
         "fg_rgb": np_(result["fg_rgb"].clamp(0, 1)),
-        "rgb_pre": np_(result["rgb_steps"][0].clamp(0, 1)) if "rgb_steps" in result else None,  # the sketch
+        "rgb_pre": np_(result["rgb_pre"].clamp(0, 1)) if "rgb_pre" in result else None,  # before refinement
         "bg_rgb": np_(result["bg_rgb"].clamp(0, 1)),
         "slot_rgb": np_(result["slot_rgb"].clamp(0, 1)),  # (V, K-1, 3, H, W)
         "alpha": np_(result["slot_alpha"]),  # (V, K, H, W), 0 = uncovered

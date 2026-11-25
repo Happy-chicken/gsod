@@ -15,7 +15,7 @@ class LossConfig:
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
     lpips_box_start: float = 0.3  # LPIPS and box from this fraction of training on
-    refine_aux: float = 0.5  # MSE + SSIM before each refine round, weighted refine_aux ** (rounds still to go)
+    refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
     box: float = 0.005  # mean box half size (keeps boxes tight)
 
 
