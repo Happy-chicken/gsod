@@ -222,17 +222,12 @@ class ObjectDecoder(nn.Module):
         nn.init.zeros_(self.hint_in.bias)
 
     def forward(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame,
-        prev: dict[str, torch.Tensor] | None = None, enc: torch.Tensor | None = None,
-        render: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
+        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
         """Object slots (B, K, C), their attention (B, K, N), token colours
         (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...), the box
-        {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)} and
-        q (B*K, G, d); scene frame.
-        Refine: prev {"q" (B*K, G, d), "mu" (B, K, G, 3)} of the last decode, the
-        encoder map (B, C, s, s) [, a view-0 render for occlusion] -> decoding
-        continues from prev q + its hint instead of the learned queries."""
+        {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)} and the
+        state for refine(); scene frame."""
         b, n_slots = slots.shape[:2]
         anchor_init, colour = init_attention_anchor(attn, colours, frame, self.image_size, self.focal_ratio)
         ray = F.normalize(anchor_init - frame.origin[:, None], dim=-1)  # camera -> anchor_init
@@ -240,21 +235,41 @@ class ObjectDecoder(nn.Module):
         slots, anchor_init, ray, colour = (x.flatten(0, 1) for x in (slots, anchor_init, ray, colour))
         K = slots.shape[0]
         anchor, extent = self.region(slots, anchor_init, ray)
-        if prev is None:
-            q = self.queries.expand(K, -1, -1)
-        else:  # what each Gaussian sees at its view-0 pixel
-            hint = sample_at_gaussians(enc, prev["mu"], frame, self.image_size, self.focal_ratio, render)
-            q = prev["q"] + self.hint_in(hint.flatten(0, 1))
-        k = self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d))
-        v = self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d))
-        for layer in self.layers:
-            q = layer(q, k, v)
-        gaussians = self.head(q, anchor, extent, colour)
-        # Each slot's brightest Gaussian at its presence.
-        presence = (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0)
-        opacity = gaussians["opacity"]
-        gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * presence[:, None]
-        unflat = {name: value.unflatten(0, (b, n_slots)) for name, value in gaussians.items()}
+        state = {
+            "k": self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d)),  # slot tokens
+            "v": self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d)),
+            "anchor": anchor,
+            "extent": extent,
+            "colour": colour,
+            "presence": (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0),
+            "shape": (b, n_slots),
+        }
+        state["q"] = self._layers(self.queries.expand(K, -1, -1), state)
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        return unflat, box, q
+        return self._gaussians(state["q"], state), box, state
+
+    def refine(
+        self, state: dict, mu: torch.Tensor, enc: torch.Tensor, frame: SceneFrame,
+        render: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """State, current Gaussian centres mu (B, K, G, 3), encoder map (B, C, s, s)
+        [, a view-0 render for occlusion] -> Gaussians decoded on from q + the hint
+        at each Gaussian's pixel, new state; same box and slot tokens."""
+        hint = sample_at_gaussians(enc, mu, frame, self.image_size, self.focal_ratio, render)
+        q = self._layers(state["q"] + self.hint_in(hint.flatten(0, 1)), state)
+        return self._gaussians(q, state), {**state, "q": q}
+
+    def _layers(self, q: torch.Tensor, state: dict) -> torch.Tensor:
+        """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens)."""
+        for layer in self.layers:
+            q = layer(q, state["k"], state["v"])
+        return q
+
+    def _gaussians(self, q: torch.Tensor, state: dict) -> dict[str, torch.Tensor]:
+        """q (B*K, G, d) -> Gaussians (B, K, G, ...) in the box."""
+        gaussians = self.head(q, state["anchor"], state["extent"], state["colour"])
+        # Each slot's brightest Gaussian at its presence.
+        opacity = gaussians["opacity"]
+        gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * state["presence"][:, None]
+        return {name: value.unflatten(0, state["shape"]) for name, value in gaussians.items()}

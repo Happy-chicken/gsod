@@ -315,6 +315,7 @@ def main() -> None:
     torch._dynamo.config.cache_size_limit = 64
     for net in (model.slot_attention, model.obj_decoder, model.bg_decoder):
         net.compile()
+    model.obj_decoder.refine = torch.compile(model.obj_decoder.refine)  # a method, not forward
     train(model, cfg, resume=args.resume)
 
 
