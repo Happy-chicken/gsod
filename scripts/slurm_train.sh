@@ -24,8 +24,12 @@ export WANDB_MODE=offline  # compute nodes have no internet; `wandb sync` from a
 export WANDB_DIR=$HPCWORK/wandb
 export TMPDIR=$TMP
 
+RUN=$HPCWORK/runs/room_diverse_$SLURM_JOB_ID
 python -u train.py --dataset room_diverse \
     --val-scenes 50 --monitor-scenes 20 --epochs 100 --eval-every 5 --save-every 10 \
-    --out $HPCWORK/runs/room_diverse_$SLURM_JOB_ID "$@"
+    --out $RUN "$@" || exit 1
+
+# Gaussians of the first 5 test scenes from the final checkpoint -> $RUN/ply/test_latest/sc####/*.ply
+python -u -m gsod.utils.io --dataset room_diverse --checkpoint $RUN --suffix latest --scenes 5
 
 
