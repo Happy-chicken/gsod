@@ -72,7 +72,8 @@ class GSODTraining(L.LightningModule):
         # Training only: does a 64 x 64 crop of a view look real? (cfg.loss.gan = 0: no GAN.)
         self.discriminator = Discriminator() if cfg.loss.gan > 0 else None
         self.d_steps = 0
-        self.automatic_optimization = False  # model step, then discriminator step
+        # Without GAN: Lightning's own loop. With GAN: model step, then discriminator step, by hand.
+        self.automatic_optimization = self.discriminator is None
 
     @property
     def epoch(self) -> int:
@@ -89,7 +90,7 @@ class GSODTraining(L.LightningModule):
         opts = [opt]
         if self.discriminator is not None:
             opts.append(torch.optim.Adam(self.discriminator.parameters(), lr=LR, betas=BETAS))
-        return opts, [schedule]
+        return opts, [{"scheduler": schedule, "interval": "step"}]
 
     def on_fit_start(self) -> None:
         if self.resume is not None:
@@ -101,7 +102,7 @@ class GSODTraining(L.LightningModule):
         if self.resume is None:
             self._validate(0)  # the untrained model, as a baseline
 
-    def training_step(self, item: dict, batch_idx: int) -> torch.Tensor:
+    def training_step(self, item: dict, batch_idx: int) -> torch.Tensor | None:
         images, cams = item["images"], item["cam2world"]  # (B, V, ...)
         n_views = images.shape[1]
         orders = []
@@ -117,24 +118,41 @@ class GSODTraining(L.LightningModule):
         outputs = self.model(images, cams)
         progress = step / (self.cfg.epochs * self.steps_per_epoch)
         loss, terms = self.criterion(outputs, images, progress)
+        if self.discriminator is None:
+            self._log(terms)
+            return loss  # Lightning steps (clipping in on_before_optimizer_step)
+        self._gan_step(loss, terms, outputs["rgb"], images, progress)
+        self._log(terms)
 
-        # GAN on crops of every view: the discriminator from late_start, the model's term gan_delay later.
-        gan_on = self.discriminator is not None and progress >= self.cfg.loss.late_start
+    def on_before_optimizer_step(self, optimizer) -> None:
+        if self.automatic_optimization:
+            self.log("train/grad_norm", self._clip_grads(), batch_size=1)
+
+    def _clip_grads(self) -> torch.Tensor:
+        """Clip the model's gradients; the norm before clipping (one GPU op, no sync)."""
+        max_norm = self.cfg.grad_clip if self.cfg.grad_clip > 0 else float("inf")
+        return torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+
+    def _log(self, terms: dict) -> None:
+        for name, value in terms.items():
+            self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
+
+    def _gan_step(self, loss, terms: dict, renders, images, progress: float) -> None:
+        """Model step (+ GAN term), then discriminator step, on crops of every view: the
+        discriminator from late_start, the model's term gan_delay later."""
+        gan_on = progress >= self.cfg.loss.late_start
         if gan_on:
-            fake, real = crops(outputs["rgb"], images)
+            fake, real = crops(renders, images)
             if progress >= self.cfg.loss.late_start + self.cfg.loss.gan_delay:
                 terms["gan_g"] = g_loss(self.discriminator, fake)
                 loss = loss + self.cfg.loss.gan * terms["gan_g"]
                 terms["gan_g"] = terms["gan_g"].detach()
 
-        # Model step: clip and log the norm before clipping (one GPU op, no sync).
         opts = self.optimizers()
-        opt = opts[0] if isinstance(opts, list) else opts
-        opt.zero_grad(set_to_none=True)
+        opts[0].zero_grad(set_to_none=True)
         self.manual_backward(loss)
-        max_norm = self.cfg.grad_clip if self.cfg.grad_clip > 0 else float("inf")
-        terms["grad_norm"] = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-        opt.step()
+        terms["grad_norm"] = self._clip_grads()
+        opts[0].step()
         self.lr_schedulers().step()
 
         # Discriminator step on the detached renders; every R1_EVERY steps an extra R1 step.
@@ -151,9 +169,6 @@ class GSODTraining(L.LightningModule):
                 opts[1].step()
                 terms["gan_r1"] = penalty.detach()
             self.d_steps += 1
-
-        for name, value in terms.items():
-            self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
 
     def _extra_networks(self) -> dict:
         """Training-only networks saved next to the model's."""
@@ -336,6 +351,7 @@ def main() -> None:
         raise RuntimeError("CUDA training requested but torch.cuda.is_available() is False")
 
     torch.manual_seed(cfg.seed)
+    torch.set_float32_matmul_precision("high")  # TF32 matmuls
     model = build_model(cfg)
     # Not the encoder (Inductor bug with replicate padding); random numbers as without compiling.
     torch._inductor.config.fallback_random = True
