@@ -50,13 +50,13 @@ def diff_augment(x: torch.Tensor) -> torch.Tensor:
 
 
 def d_loss(disc: PatchDiscriminator, real: torch.Tensor, fake: torch.Tensor, r1: float) -> dict[str, torch.Tensor]:
-    """Hinge loss on real / fake pairs (fake detached) + r1 / 2 * |grad D(real)|^2."""
+    """Hinge loss on real / fake pairs (fake detached) + r1 / 2 * |grad of each sample's mean logit|^2."""
     real = real.detach().requires_grad_(r1 > 0)
-    real_logits = disc(real)
-    loss = F.relu(1 - real_logits).mean() + F.relu(1 + disc(fake.detach())).mean()
-    terms = {"gan_d": loss.detach()}
-    if r1 > 0:
-        (grad,) = torch.autograd.grad(real_logits.sum(), real, create_graph=True)
+    real_logits, fake_logits = disc(real), disc(fake.detach())
+    loss = F.relu(1 - real_logits).mean() + F.relu(1 + fake_logits).mean()
+    terms = {"gan_d": loss.detach(), "gan_real": real_logits.mean().detach(), "gan_fake": fake_logits.mean().detach()}
+    if r1 > 0:  # one score per sample (the patch mean), not the patch sum
+        (grad,) = torch.autograd.grad(real_logits.mean(dim=(1, 2, 3)).sum(), real, create_graph=True)
         penalty = grad.pow(2).flatten(1).sum(1).mean()
         loss = loss + 0.5 * r1 * penalty
         terms["gan_r1"] = penalty.detach()
