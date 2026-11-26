@@ -298,9 +298,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--late-start", type=float, default=None, help="LPIPS, box and GAN from this fraction on")
     parser.add_argument("--gan", type=float, default=None, help="GAN loss weight; 0 = off")
     parser.add_argument("--gan-r1", type=float, default=None, help="R1 penalty of the discriminator")
-    parser.add_argument(
-        "--view0", type=float, default=None, help="share of view 0 in the main loss terms (1 / V: all views equal)"
-    )
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
@@ -323,9 +320,7 @@ def main() -> None:
         values["data_root"] = args.data
     if args.out is not None:
         values["out_dir"] = args.out
-    loss = {
-        k: getattr(args, k) for k in ("box", "late_start", "gan", "gan_r1", "view0") if getattr(args, k) is not None
-    }
+    loss = {k: getattr(args, k) for k in ("box", "late_start", "gan", "gan_r1") if getattr(args, k) is not None}
     values["loss"] = replace(cfg.loss, **loss)
     cfg = replace(cfg, **values)
 
