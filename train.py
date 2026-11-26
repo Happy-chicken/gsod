@@ -33,7 +33,7 @@ from gsod.eval.evaluate import (
 )
 from gsod.eval.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
 from gsod.model import build_model
-from gsod.model.discriminator import BETAS, LR, PatchDiscriminator, d_loss, g_loss, novel_views
+from gsod.model.discriminator import BETAS, LR, R1_EVERY, Discriminator, crops, d_loss, g_loss, r1_penalty
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
@@ -69,8 +69,9 @@ class GSODTraining(L.LightningModule):
         self.start_epoch = start_epoch
         self.best_psnr = best_psnr
         self.rng = random.Random(cfg.seed)
-        # Training only: does a novel view look real? (cfg.loss.gan = 0: no GAN.)
-        self.discriminator = PatchDiscriminator() if cfg.loss.gan > 0 else None
+        # Training only, as uORF: does a 64 x 64 crop of a view look real? (cfg.loss.gan = 0: no GAN.)
+        self.discriminator = Discriminator() if cfg.loss.gan > 0 else None
+        self.d_steps = 0
         self.automatic_optimization = False  # model step, then discriminator step
 
     @property
@@ -117,13 +118,14 @@ class GSODTraining(L.LightningModule):
         progress = step / (self.cfg.epochs * self.steps_per_epoch)
         loss, terms = self.criterion(outputs, images, progress)
 
-        # GAN on the novel views (from late_start).
+        # GAN on crops of every view: the discriminator from late_start, the model's term gan_delay later.
         gan_on = self.discriminator is not None and progress >= self.cfg.loss.late_start
         if gan_on:
-            fake = novel_views(outputs["rgb"][:, 1:])
-            terms["gan_g"] = g_loss(self.discriminator, fake)
-            loss = loss + self.cfg.loss.gan * terms["gan_g"]
-            terms["gan_g"] = terms["gan_g"].detach()
+            fake, real = crops(outputs["rgb"], images)
+            if progress >= self.cfg.loss.late_start + self.cfg.loss.gan_delay:
+                terms["gan_g"] = g_loss(self.discriminator, fake)
+                loss = loss + self.cfg.loss.gan * terms["gan_g"]
+                terms["gan_g"] = terms["gan_g"].detach()
 
         # Model step: clip and log the norm before clipping (one GPU op, no sync).
         opts = self.optimizers()
@@ -135,14 +137,20 @@ class GSODTraining(L.LightningModule):
         opt.step()
         self.lr_schedulers().step()
 
-        # Discriminator step on the detached renders.
+        # Discriminator step on the detached renders; every R1_EVERY steps an extra R1 step.
         if gan_on:
-            real = novel_views(images[:, 1:])
-            d = d_loss(self.discriminator, real, fake, self.cfg.loss.gan_r1)
+            d = d_loss(self.discriminator, real, fake)
             opts[1].zero_grad(set_to_none=True)
             self.manual_backward(d.pop("loss"))
             opts[1].step()
             terms.update(d)
+            if self.d_steps % R1_EVERY == 0:
+                penalty = r1_penalty(self.discriminator, real)
+                opts[1].zero_grad(set_to_none=True)
+                self.manual_backward(self.cfg.loss.gan_r1 * penalty)
+                opts[1].step()
+                terms["gan_r1"] = penalty.detach()
+            self.d_steps += 1
 
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
@@ -297,7 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box", type=float, default=None, help="box size penalty weight; 0 = off")
     parser.add_argument("--late-start", type=float, default=None, help="LPIPS, box and GAN from this fraction on")
     parser.add_argument("--gan", type=float, default=None, help="GAN loss weight; 0 = off")
-    parser.add_argument("--gan-r1", type=float, default=None, help="R1 penalty of the discriminator")
+    parser.add_argument("--gan-r1", type=float, default=None, help="lazy R1 weight of the discriminator")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")

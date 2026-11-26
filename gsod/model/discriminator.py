@@ -1,82 +1,121 @@
-"""Unconditional PatchGAN on novel views: does this image look real? Training only."""
+"""GAN as in uORF: a StyleGAN2-style discriminator on 64 x 64 crops of every view, logistic
+(non-saturating) losses, lazy R1. Training only."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-# DiffAugment: largest shift (fraction of the side), brightness / contrast jitter.
-SHIFT = 0.125
-JITTER = 0.2
-# Side of the random square crop the discriminator sees (as uORF, 64 px).
-CROP = 64
-# Discriminator optimiser, as uORF: Adam, lr 1e-3, betas (0, 0.9), no schedule.
-LR, BETAS = 1e-3, (0.0, 0.9)
+CROP = 64  # side of the random crop (same place for a view's render and GT)
+R1_EVERY = 32  # lazy R1: one extra discriminator step every this many
+LR, BETAS = 1e-3, (0.0, 0.9)  # discriminator optimiser (no schedule)
 
 
-class PatchDiscriminator(nn.Module):
-    """Images (N, 3, H, W) in [0, 1] -> patch logits (N, 1, h, w)."""
+class EqualConv2d(nn.Module):
+    """Conv with weights scaled at run time by 1 / sqrt(fan in) (equalised learning rate)."""
 
-    def __init__(self, width: int = 64):
+    def __init__(self, c_in: int, c_out: int, kernel: int, padding: int = 0):
         super().__init__()
-        layers, c = [], 3
-        for out in (width, 2 * width, 4 * width):
-            layers += [nn.Conv2d(c, out, 4, stride=2, padding=1), nn.LeakyReLU(0.2)]
-            c = out
-        layers.append(nn.Conv2d(c, 1, 4, padding=1))
-        self.net = nn.Sequential(*layers)
+        self.weight = nn.Parameter(torch.randn(c_out, c_in, kernel, kernel))
+        self.bias = nn.Parameter(torch.zeros(c_out))
+        self.scale, self.padding = 1 / math.sqrt(c_in * kernel**2), padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(x, self.weight * self.scale, self.bias, padding=self.padding)
+
+
+class EqualLinear(nn.Module):
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(d_out, d_in))
+        self.bias = nn.Parameter(torch.zeros(d_out))
+        self.scale = 1 / math.sqrt(d_in)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight * self.scale, self.bias)
+
+
+def act(x: torch.Tensor) -> torch.Tensor:
+    """StyleGAN2's leaky ReLU, scaled to keep the variance."""
+    return F.leaky_relu(x, 0.2) * math.sqrt(2)
+
+
+class ResBlock(nn.Module):
+    """Two 3 x 3 convs and a 1 x 1 skip, both halving the resolution."""
+
+    def __init__(self, c_in: int, c_out: int):
+        super().__init__()
+        self.conv1 = EqualConv2d(c_in, c_in, 3, padding=1)
+        self.conv2 = EqualConv2d(c_in, c_out, 3, padding=1)
+        self.skip = EqualConv2d(c_in, c_out, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.avg_pool2d(act(self.conv2(act(self.conv1(x)))), 2)
+        return (out + self.skip(F.avg_pool2d(x, 2))) / math.sqrt(2)
+
+
+class Discriminator(nn.Module):
+    """Images (N, 3, 64, 64) in [0, 1] -> one logit each (N, 1). Channels as uORF with ndf = 64."""
+
+    def __init__(self, ndf: int = 64):
+        super().__init__()
+        self.stem = EqualConv2d(3, ndf // 2, 1)
+        chans = [ndf // 2, ndf, ndf, 2 * ndf, 2 * ndf]  # 64 -> 32 -> 16 -> 8 -> 4 px
+        self.blocks = nn.Sequential(*(ResBlock(a, b) for a, b in zip(chans[:-1], chans[1:])))
+        self.final = EqualConv2d(2 * ndf + 1, 2 * ndf, 3, padding=1)
+        self.head1 = EqualLinear(2 * ndf * 4 * 4, 2 * ndf)
+        self.head2 = EqualLinear(2 * ndf, 1)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return self.net(2.0 * images - 1.0)
+        x = self.blocks(act(self.stem(2.0 * images - 1.0)))
+        x = act(self.final(torch.cat([x, minibatch_stddev(x)], 1)))
+        return self.head2(act(self.head1(x.flatten(1))))
 
 
-def novel_views(views: torch.Tensor) -> torch.Tensor:
-    """Novel views (B, V', 3, H, W) -> random CROP x CROP crops, augmented (B * V', 3, CROP, CROP)."""
-    return diff_augment(random_crop(views.flatten(0, 1), CROP))
+def minibatch_stddev(x: torch.Tensor, group: int = 4) -> torch.Tensor:
+    """One channel: the std over groups of samples, averaged (StyleGAN2)."""
+    n, c, h, w = x.shape
+    g = math.gcd(min(n, group), n)
+    std = x.view(g, -1, c, h, w).var(0, unbiased=False).add(1e-8).sqrt().mean(dim=(1, 2, 3))  # (n / g,)
+    return std.view(-1, 1, 1, 1).repeat(g, 1, h, w)
 
 
-def random_crop(x: torch.Tensor, size: int) -> torch.Tensor:
-    """Images (N, C, H, W) -> one random size x size crop each (N, C, size, size)."""
-    n, _, h, w = x.shape
-    top = torch.randint(0, h - size + 1, (n,), device=x.device)
-    left = torch.randint(0, w - size + 1, (n,), device=x.device)
-    rows = (top[:, None] + torch.arange(size, device=x.device))[:, :, None]  # (N, size, 1)
-    cols = (left[:, None] + torch.arange(size, device=x.device))[:, None, :]  # (N, 1, size)
-    return x[torch.arange(n, device=x.device)[:, None, None], :, rows, cols].permute(0, 3, 1, 2)
+def crops(renders: torch.Tensor, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every view of the renders and GT (B, V, 3, H, W) -> one random CROP x CROP crop per view,
+    the same place in both: fake, real (B * V, 3, CROP, CROP)."""
+    renders, images = renders.flatten(0, 1), images.flatten(0, 1)
+    n, _, h, w = images.shape
+    top = torch.randint(0, h - CROP + 1, (n,), device=images.device)
+    left = torch.randint(0, w - CROP + 1, (n,), device=images.device)
+    rows = (top[:, None] + torch.arange(CROP, device=images.device))[:, :, None]
+    cols = (left[:, None] + torch.arange(CROP, device=images.device))[:, None, :]
+    idx = torch.arange(n, device=images.device)[:, None, None]
+    fake, real = (x[idx, :, rows, cols].permute(0, 3, 1, 2) for x in (renders, images))
+    return fake, real
 
 
-def diff_augment(x: torch.Tensor) -> torch.Tensor:
-    """Same random shift and brightness / contrast change for every channel of a sample."""
-    n, _, h, w = x.shape
-    gain = 1 + JITTER * (2 * torch.rand(n, 1, 1, 1, device=x.device) - 1)
-    bias = JITTER * (2 * torch.rand(n, 1, 1, 1, device=x.device) - 1)
-    mean = x.mean(dim=(1, 2, 3), keepdim=True)
-    x = (x - mean) * gain + mean + bias
-    # Shift: pad, then crop at a random offset per sample (as a translation grid).
-    shift = SHIFT * (2 * torch.rand(n, 1, 1, 2, device=x.device) - 1) * 2  # normalised coordinates
-    ys, xs = torch.meshgrid(
-        torch.linspace(-1, 1, h, device=x.device), torch.linspace(-1, 1, w, device=x.device), indexing="ij"
-    )
-    grid = torch.stack([xs, ys], -1)[None] + shift
-    return F.grid_sample(x, grid, padding_mode="zeros", align_corners=True)
-
-
-def d_loss(disc: PatchDiscriminator, real: torch.Tensor, fake: torch.Tensor, r1: float) -> dict[str, torch.Tensor]:
-    """Hinge loss on real / fake images (fake detached) + r1 / 2 * |grad of each sample's mean logit|^2."""
-    real = real.detach().requires_grad_(r1 > 0)
+def d_loss(disc: Discriminator, real: torch.Tensor, fake: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Logistic loss: softplus(-D(real)) + softplus(D(fake)), fake detached."""
     real_logits, fake_logits = disc(real), disc(fake.detach())
-    loss = F.relu(1 - real_logits).mean() + F.relu(1 + fake_logits).mean()
-    terms = {"gan_d": loss.detach(), "gan_real": real_logits.mean().detach(), "gan_fake": fake_logits.mean().detach()}
-    if r1 > 0:  # one score per sample (the patch mean), not the patch sum
-        (grad,) = torch.autograd.grad(real_logits.mean(dim=(1, 2, 3)).sum(), real, create_graph=True)
-        penalty = grad.pow(2).flatten(1).sum(1).mean()
-        loss = loss + 0.5 * r1 * penalty
-        terms["gan_r1"] = penalty.detach()
-    terms["loss"] = loss
-    return terms
+    loss = F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
+    return {
+        "loss": loss,
+        "gan_d": loss.detach(),
+        "gan_real": real_logits.mean().detach(),
+        "gan_fake": fake_logits.mean().detach(),
+    }
 
 
-def g_loss(disc: PatchDiscriminator, fake: torch.Tensor) -> torch.Tensor:
-    """Generator hinge loss: -D(fake)."""
-    return -disc(fake).mean()
+def r1_penalty(disc: Discriminator, real: torch.Tensor) -> torch.Tensor:
+    """|grad D(real)|^2 per image, averaged."""
+    real = real.detach().requires_grad_()
+    (grad,) = torch.autograd.grad(disc(real).sum(), real, create_graph=True)
+    return grad.pow(2).flatten(1).sum(1).mean()
+
+
+def g_loss(disc: Discriminator, fake: torch.Tensor) -> torch.Tensor:
+    """Non-saturating generator loss: softplus(-D(fake))."""
+    return F.softplus(-disc(fake)).mean()
