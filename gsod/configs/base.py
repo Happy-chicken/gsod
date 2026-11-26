@@ -9,9 +9,10 @@ from gsod.utils.io import default_out_dir
 
 @dataclass
 class LossConfig:
-    """Every view."""
+    """Every view; in the main terms (recon, ssim, lpips) view 0, the input, weighs view0."""
 
     recon: float = 1.0  # MSE, images in [-1, 1]
+    view0: float = 0.1  # weight of view 0 (the input) in the main terms; novel views weigh 1
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
     late_start: float = 0.3  # LPIPS, box and GAN from this fraction of training on

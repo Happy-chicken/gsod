@@ -1,4 +1,5 @@
-"""Reconstruction loss (no masks), every view:
+"""Reconstruction loss (no masks), every view; view 0 (the input) weighs view0 in the main terms
+(MSE, SSIM, LPIPS), so copying the input is no shortcut:
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
         + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
@@ -55,21 +56,31 @@ class GSODLoss(nn.Module):
         """progress: fraction of training done -> (total, per-term values for
         logging; tensors, so no GPU sync)."""
         cfg = self.cfg
-        rendered, images = outputs["rgb"].flatten(0, -4), images.flatten(0, -4)  # every view of every scene
-        terms = {
-            "recon": F.mse_loss(2.0 * rendered - 1.0, 2.0 * images - 1.0),
-            "ssim": 1.0 - ssim(rendered, images),
-        }
+        n_novel = images.shape[1] - 1
+
+        def views(fn, rendered: torch.Tensor) -> torch.Tensor:  # (B, V, 3, H, W): view 0 weighs cfg.view0
+            first = fn(rendered[:, 0], images[:, 0])
+            novel = fn(rendered[:, 1:].flatten(0, 1), images[:, 1:].flatten(0, 1))
+            return (cfg.view0 * first + n_novel * novel) / (cfg.view0 + n_novel)
+
+        def mse(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return F.mse_loss(2.0 * x - 1.0, 2.0 * y - 1.0)
+
+        rendered = outputs["rgb"]
+        terms = {"recon": views(mse, rendered), "ssim": 1.0 - views(ssim, rendered)}
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
         if "rgb_pre" in outputs and cfg.refine_aux > 0:
-            pre = outputs["rgb_pre"].flatten(0, -4)
-            terms["refine_aux"] = cfg.recon * F.mse_loss(2.0 * pre - 1.0, 2.0 * images - 1.0) + cfg.ssim * (
-                1.0 - ssim(pre, images)
-            )
+            pre, every = outputs["rgb_pre"].flatten(0, -4), images.flatten(0, -4)  # every view alike
+            terms["refine_aux"] = cfg.recon * mse(pre, every) + cfg.ssim * (1.0 - ssim(pre, every))
             weights["refine_aux"] = cfg.refine_aux
         if progress >= cfg.late_start:  # late terms, once objects exist
             if self.lpips is not None:
-                terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]
+                lpips = self.lpips
+
+                def perceptual(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                    return lpips(x, y, normalize=True).mean()  # inputs in [0, 1]
+
+                terms["lpips"] = views(perceptual, rendered)
                 weights["lpips"] = cfg.lpips
             if cfg.box > 0:  # object box half sizes, scene units
                 terms["box"] = outputs["extent"].mean()
