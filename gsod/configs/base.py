@@ -14,7 +14,9 @@ class LossConfig:
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
-    lpips_box_start: float = 0.3  # LPIPS and box from this fraction of training on
+    late_start: float = 0.3  # LPIPS, box and GAN from this fraction of training on
+    gan: float = 0.02  # conditional PatchGAN on novel views (ramped in over 5 %); 0 = off
+    gan_r1: float = 1.0  # R1 penalty of the discriminator
     refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
     box: float = 0.005  # mean box half size (keeps boxes tight)
 

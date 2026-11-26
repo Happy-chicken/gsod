@@ -2,7 +2,7 @@
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
         + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
-        + lpips * LPIPS (VGG) + box * mean object box half size, both from lpips_box_start of training on
+        + lpips * LPIPS (VGG) + box * mean object box half size, both from late_start of training on
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ class GSODLoss(nn.Module):
                 1.0 - ssim(pre, images)
             )
             weights["refine_aux"] = cfg.refine_aux
-        if progress >= cfg.lpips_box_start:  # late terms, once objects exist
+        if progress >= cfg.late_start:  # late terms, once objects exist
             if self.lpips is not None:
                 terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]
                 weights["lpips"] = cfg.lpips
