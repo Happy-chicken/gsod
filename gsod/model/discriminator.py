@@ -1,4 +1,4 @@
-"""Conditional PatchGAN on novel views: is view i real, given view 0? Training only."""
+"""Unconditional PatchGAN on novel views: does this image look real? Training only."""
 
 from __future__ import annotations
 
@@ -14,25 +14,24 @@ LR, BETAS = 1e-3, (0.0, 0.9)
 
 
 class PatchDiscriminator(nn.Module):
-    """[view 0, view i] (N, 6, H, W) in [0, 1] -> patch logits (N, 1, h, w)."""
+    """Images (N, 3, H, W) in [0, 1] -> patch logits (N, 1, h, w)."""
 
     def __init__(self, width: int = 64):
         super().__init__()
-        layers, c = [], 6
+        layers, c = [], 3
         for out in (width, 2 * width, 4 * width):
             layers += [nn.Conv2d(c, out, 4, stride=2, padding=1), nn.LeakyReLU(0.2)]
             c = out
         layers.append(nn.Conv2d(c, 1, 4, padding=1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, pairs: torch.Tensor) -> torch.Tensor:
-        return self.net(2.0 * pairs - 1.0)
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.net(2.0 * images - 1.0)
 
 
-def pairs(images: torch.Tensor, views: torch.Tensor) -> torch.Tensor:
-    """View 0 (B, 3, H, W), views (B, V', 3, H, W) -> augmented pairs (B * V', 6, H, W)."""
-    cond = images[:, None].expand_as(views)
-    return diff_augment(torch.cat([cond, views], 2).flatten(0, 1))
+def novel_views(views: torch.Tensor) -> torch.Tensor:
+    """Novel views (B, V', 3, H, W) -> augmented images (B * V', 3, H, W)."""
+    return diff_augment(views.flatten(0, 1))
 
 
 def diff_augment(x: torch.Tensor) -> torch.Tensor:
@@ -52,7 +51,7 @@ def diff_augment(x: torch.Tensor) -> torch.Tensor:
 
 
 def d_loss(disc: PatchDiscriminator, real: torch.Tensor, fake: torch.Tensor, r1: float) -> dict[str, torch.Tensor]:
-    """Hinge loss on real / fake pairs (fake detached) + r1 / 2 * |grad of each sample's mean logit|^2."""
+    """Hinge loss on real / fake images (fake detached) + r1 / 2 * |grad of each sample's mean logit|^2."""
     real = real.detach().requires_grad_(r1 > 0)
     real_logits, fake_logits = disc(real), disc(fake.detach())
     loss = F.relu(1 - real_logits).mean() + F.relu(1 + fake_logits).mean()

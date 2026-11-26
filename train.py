@@ -33,7 +33,7 @@ from gsod.eval.evaluate import (
 )
 from gsod.eval.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
 from gsod.model import build_model
-from gsod.model.discriminator import BETAS, LR, PatchDiscriminator, d_loss, g_loss, pairs
+from gsod.model.discriminator import BETAS, LR, PatchDiscriminator, d_loss, g_loss, novel_views
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
@@ -69,7 +69,7 @@ class GSODTraining(L.LightningModule):
         self.start_epoch = start_epoch
         self.best_psnr = best_psnr
         self.rng = random.Random(cfg.seed)
-        # Training only: is a novel view real, given view 0? (cfg.loss.gan = 0: no GAN.)
+        # Training only: does a novel view look real? (cfg.loss.gan = 0: no GAN.)
         self.discriminator = PatchDiscriminator() if cfg.loss.gan > 0 else None
         self.automatic_optimization = False  # model step, then discriminator step
 
@@ -117,10 +117,10 @@ class GSODTraining(L.LightningModule):
         progress = step / (self.cfg.epochs * self.steps_per_epoch)
         loss, terms = self.criterion(outputs, images, progress)
 
-        # GAN on the novel views, given view 0 (from late_start).
+        # GAN on the novel views (from late_start).
         gan_on = self.discriminator is not None and progress >= self.cfg.loss.late_start
         if gan_on:
-            fake = pairs(images[:, 0], outputs["rgb"][:, 1:])
+            fake = novel_views(outputs["rgb"][:, 1:])
             terms["gan_g"] = g_loss(self.discriminator, fake)
             loss = loss + self.cfg.loss.gan * terms["gan_g"]
             terms["gan_g"] = terms["gan_g"].detach()
@@ -137,7 +137,7 @@ class GSODTraining(L.LightningModule):
 
         # Discriminator step on the detached renders.
         if gan_on:
-            real = pairs(images[:, 0], images[:, 1:])
+            real = novel_views(images[:, 1:])
             d = d_loss(self.discriminator, real, fake, self.cfg.loss.gan_r1)
             opts[1].zero_grad(set_to_none=True)
             self.manual_backward(d.pop("loss"))
