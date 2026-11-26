@@ -152,3 +152,28 @@ def write_ply(path: str | Path, gaussians: dict[str, torch.Tensor]) -> Path:
         out.write(header.encode("ascii"))
         out.write(data.tobytes())
     return path
+
+
+def export_gaussians(
+    out_dir: str | Path,
+    objects: dict[str, torch.Tensor],
+    background: dict[str, torch.Tensor],
+    scene: int = 0,
+    min_opacity: float = 0.0,
+) -> list[Path]:
+    """World object (B, K-1, G, ...) and background (B, M, ...) Gaussians of one scene of the batch ->
+    3DGS .ply files (SuperSplat and other 3DGS viewers): scene.ply (all), background.ply,
+    slot{k}.ply per object slot. Gaussians with opacity <= min_opacity are left out."""
+    obj = {k: v[scene] for k, v in objects.items()}  # (K-1, G, ...)
+    bg = {k: v[scene] for k, v in background.items()}  # (M, ...)
+
+    def keep(g: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        mask = g["opacity"] > min_opacity
+        return {k: v[mask] for k, v in g.items()}
+
+    every = {k: torch.cat([obj[k].flatten(0, 1), bg[k]], 0) for k in obj}
+    out_dir = Path(out_dir)
+    paths = [write_ply(out_dir / "scene.ply", keep(every)), write_ply(out_dir / "background.ply", keep(bg))]
+    for k in range(obj["mu"].shape[0]):
+        paths.append(write_ply(out_dir / f"slot{k + 1}.ply", keep({name: v[k] for name, v in obj.items()})))
+    return paths
