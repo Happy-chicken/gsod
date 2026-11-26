@@ -8,7 +8,7 @@ from torch import nn
 from gsod.model.layers import conv_block
 
 
-class Encoder(nn.Module):
+class UNetEncoder(nn.Module):
     """Bx3xHxW image -> BxCxHxW feature map (C = z_dim)."""
 
     def __init__(self, z_dim: int):
