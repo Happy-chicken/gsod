@@ -40,7 +40,6 @@ from gsod.utils.io import latest_run_dir, load_networks, save_networks
 from gsod.utils.schedule import cosine
 
 IMAGE_SCENES = 4
-GAN_RAMP = 0.05  # fraction of training over which the GAN weight grows to cfg.loss.gan
 
 
 class GSODTraining(L.LightningModule):
@@ -118,13 +117,12 @@ class GSODTraining(L.LightningModule):
         progress = step / (self.cfg.epochs * self.steps_per_epoch)
         loss, terms = self.criterion(outputs, images, progress)
 
-        # GAN on the novel views, given view 0 (from late_start, ramped in).
+        # GAN on the novel views, given view 0 (from late_start).
         gan_on = self.discriminator is not None and progress >= self.cfg.loss.late_start
         if gan_on:
             fake = pairs(images[:, 0], outputs["rgb"][:, 1:])
             terms["gan_g"] = g_loss(self.discriminator, fake)
-            ramp = min(1.0, (progress - self.cfg.loss.late_start) / GAN_RAMP)
-            loss = loss + ramp * self.cfg.loss.gan * terms["gan_g"]
+            loss = loss + self.cfg.loss.gan * terms["gan_g"]
             terms["gan_g"] = terms["gan_g"].detach()
 
         # Model step: clip and log the norm before clipping (one GPU op, no sync).
