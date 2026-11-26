@@ -15,8 +15,8 @@ class LossConfig:
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
     late_start: float = 0.3  # LPIPS, box and GAN from this fraction of training on
-    gan: float = 0.01  # GAN loss weight (as uORF); 0 = off
-    gan_r1: float = 10.0  # lazy R1 weight of the discriminator (as uORF)
+    gan: float = 0.01  # GAN loss weight; 0 = off
+    gan_r1: float = 10.0  # lazy R1 weight of the discriminator
     gan_delay: float = 0.05  # the discriminator trains from late_start, the model's GAN term this much later
     refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
     box: float = 0.005  # mean box half size (keeps boxes tight)

@@ -2,7 +2,7 @@
 
 Metrics (nan without GT masks), averaged per scene:
     seg     ari, fg_ari (2D, input view), nv_ari (3D, novel views)  [uORF]
-    recon   psnr, ssim, lpips (novel views; lpips: AlexNet, as uORF)
+    recon   psnr, ssim, lpips (novel views; lpips: AlexNet)
     diag    attn_fg_ari        attention argmax (background included) vs GT
             obj_recall         GT objects with an owning slot
             n_duplicate        objects split over slots

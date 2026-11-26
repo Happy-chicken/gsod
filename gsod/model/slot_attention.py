@@ -1,4 +1,4 @@
-"""Slot attention: background as in uORF (own query, GRU, residual MLP); the
+"""Slot attention: background with its own query, GRU and residual MLP; the
 rest as in BO-QSA: tokens + position embedding through a feature MLP, learned
 per-slot queries with annealed noise, weighted mean with eps = 1, DropPath on
 the residual MLP, bi-level (only the last iteration is differentiated, straight

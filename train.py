@@ -69,7 +69,7 @@ class GSODTraining(L.LightningModule):
         self.start_epoch = start_epoch
         self.best_psnr = best_psnr
         self.rng = random.Random(cfg.seed)
-        # Training only, as uORF: does a 64 x 64 crop of a view look real? (cfg.loss.gan = 0: no GAN.)
+        # Training only: does a 64 x 64 crop of a view look real? (cfg.loss.gan = 0: no GAN.)
         self.discriminator = Discriminator() if cfg.loss.gan > 0 else None
         self.d_steps = 0
         self.automatic_optimization = False  # model step, then discriminator step

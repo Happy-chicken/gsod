@@ -1,7 +1,7 @@
 """Camera rays, the scene frame and moving Gaussians between frames.
 
 World: +z up, floor at z = 0; cameras OpenCV, cam2world 4x4; pixel centres
-at integers. Scene frame (like uORF's nss2cam0): world turned so view 0
+at integers. Scene frame: world turned so view 0
 looks along +x, centred where its optical axis meets the floor, scaled by
 1 / R (R: radius of the largest floor disc view 0 sees about that point).
 """

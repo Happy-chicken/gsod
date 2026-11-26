@@ -1,4 +1,4 @@
-"""GAN as in uORF: a StyleGAN2-style discriminator on 64 x 64 crops of every view, logistic
+"""GAN: a StyleGAN2-style discriminator on 64 x 64 crops of every view, logistic
 (non-saturating) losses, lazy R1. Training only."""
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class ResBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    """Images (N, 3, 64, 64) in [0, 1] -> one logit each (N, 1). Channels as uORF with ndf = 64."""
+    """Images (N, 3, 64, 64) in [0, 1] -> one logit each (N, 1)."""
 
     def __init__(self, ndf: int = 64):
         super().__init__()
