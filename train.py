@@ -261,7 +261,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-iter", type=int, default=None)
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
-    parser.add_argument("--refine-steps", type=int, default=None, help="0 = no refinement")
     parser.add_argument("--box", type=float, default=None, help="box size penalty weight; 0 = off")
     parser.add_argument("--lpips-box-start", type=float, default=None, help="LPIPS and box from this fraction on")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")

@@ -28,7 +28,6 @@ class BaseConfig:
     attn_iter: int = 3
     gaussians_per_slot: int = 512
     decoder_hidden_dim: int = 128
-    refine_steps: int = 3  # refine rounds (object Gaussians decoded on from what they see in view 0); 0 = off
     near: float = 0.1
 
     # --- optimisation (ramps as fractions of training)

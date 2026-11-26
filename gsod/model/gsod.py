@@ -5,7 +5,7 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    objects decoded on from each Gaussian's view-0 pixel and view-0 loss gradient
+    refine                    objects decoded on once from each Gaussian's view-0 pixel
     render                    all Gaussians blended together; masks from the
                               same blending
 
@@ -40,7 +40,6 @@ class GSODModel(nn.Module):
         decoder_hidden_dim: int,
         focal_ratio: tuple[float, float],
         near: float,
-        refine_steps: int = 1,
     ):
         """num_slots: K, the background slot included."""
         super().__init__()
@@ -54,7 +53,6 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
-        self.refine_steps = refine_steps
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -76,7 +74,7 @@ class GSODModel(nn.Module):
         """slots (B, K-1, C), their attention (B, K-1, s*s), token colours (B, s*s, 3)
         -> world Gaussians (B, K-1, G, ...), the box {"extent" (B, K-1, 3, scene
         frame), "box" (B, K-1, 8, 3) world corners, "anchor_init" (B, K-1, 3) world},
-        the decoder state for refine_objects."""
+        the decoder state for the refine."""
         local, box, state = self.obj_decoder(slots, attn, colours, frame)
         box = {
             "extent": box["extent"],
@@ -91,43 +89,6 @@ class GSODModel(nn.Module):
         """Background slots (B, C), attention (B, s*s), token colours
         (B, s*s, 3) -> world floor Gaussians (B, M, ...)."""
         return to_world(self.bg_decoder(bg_slot, attn, colours, frame), frame, rotate=False)
-
-    def refine_objects(
-        self,
-        state: dict,
-        image: torch.Tensor,
-        enc: torch.Tensor,
-        attn: torch.Tensor,
-        frame: SceneFrame,
-        grads: torch.Tensor,
-        detach: bool = False,
-    ) -> tuple[dict[str, torch.Tensor], dict]:
-        """One refine round -> world object Gaussians, new state."""
-        if detach:
-            state = {**state, "q": state["q"].detach()}
-        local, state = self.obj_decoder.refine(state, image, enc, attn, frame, grads)
-        return to_world(local, frame), state
-
-    def view0_gradients(
-        self,
-        local: dict[str, torch.Tensor],
-        background: dict[str, torch.Tensor],
-        image: torch.Tensor,
-        cam2world: torch.Tensor,
-        frame: SceneFrame,
-    ) -> torch.Tensor:
-        """Object Gaussians (B, K-1, G, ..., scene frame), world background, view 0's image (B, 3, H, W)
-        and cam2world (B, 4, 4) -> gradient of view 0's MSE on each Gaussian's mu, scale, opacity, rgb
-        (B, K-1, G, 10), each channel divided by its RMS over the scene; an input, no gradient."""
-        names = ("mu", "scale", "opacity", "rgb")
-        with torch.enable_grad():  # also in evaluation
-            leaves = {name: local[name].detach().requires_grad_() for name in names}
-            objects = to_world({**{k: v.detach() for k, v in local.items()}, **leaves}, frame)
-            every = self.merge(objects, {k: v.detach() for k, v in background.items()})
-            render = splat(every, cam2world[:, None], self.image_size, self.focal_ratio, self.near)["rgb"][:, 0]
-            grads = torch.autograd.grad(F.mse_loss(render, image, reduction="sum"), list(leaves.values()))
-        g = torch.cat([grads[0], grads[1], grads[2][..., None], grads[3]], -1)
-        return g / g.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-12)
 
     @staticmethod
     def merge(objects: dict[str, torch.Tensor], floor: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -183,20 +144,14 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine, refine_steps rounds with shared weights: each object Gaussian reads its view-0
-        # pixel and the view-0 loss gradient on it (recomputed every round).
+        # Refine: each object Gaussian reads its view-0 pixel; decoding continues from its q.
         side = (self.input_size, self.input_size)
         enc = tokens.transpose(1, 2).unflatten(2, side)  # (B, C, s, s)
         obj_attn = attn[:, 1:].unflatten(2, side)  # (B, K-1, s, s)
-        sketch = objects
-        for i in range(self.refine_steps):
-            grads = self.view0_gradients(state["gaussians"], floor, images[:, 0], cam2world[:, 0], frame)
-            objects, state = self.refine_objects(state, images[:, 0], enc, obj_attn, frame, grads, detach=i > 0)
+        refined = self.obj_decoder.refine(state, images[:, 0], enc, obj_attn, frame)
 
-        out = self.render(objects, floor, cam2world)
+        out = self.render(to_world(refined, frame), floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
-        if self.refine_steps:  # the sketch in all views: auxiliary loss, panels
-            out["rgb_pre"] = splat(self.merge(sketch, floor), cam2world, self.image_size, self.focal_ratio, self.near)[
-                "rgb"
-            ]
+        cams = (cam2world, self.image_size, self.focal_ratio, self.near)
+        out["rgb_pre"] = splat(self.merge(objects, floor), *cams)["rgb"]  # the sketch: auxiliary loss, panels
         return out
