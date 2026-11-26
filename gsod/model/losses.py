@@ -1,4 +1,4 @@
-"""Reconstruction loss (no masks), every view; view 0 (the input) weighs view0 in the main terms
+"""Reconstruction loss (no masks), every view; view 0 (the input) is a view0 share of the main terms
 (MSE, SSIM, LPIPS), so copying the input is no shortcut:
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
@@ -56,12 +56,11 @@ class GSODLoss(nn.Module):
         """progress: fraction of training done -> (total, per-term values for
         logging; tensors, so no GPU sync)."""
         cfg = self.cfg
-        n_novel = images.shape[1] - 1
 
-        def views(fn, rendered: torch.Tensor) -> torch.Tensor:  # (B, V, 3, H, W): view 0 weighs cfg.view0
+        def views(fn, rendered: torch.Tensor) -> torch.Tensor:  # (B, V, 3, H, W): view 0 is cfg.view0 of the term
             first = fn(rendered[:, 0], images[:, 0])
-            novel = fn(rendered[:, 1:].flatten(0, 1), images[:, 1:].flatten(0, 1))
-            return (cfg.view0 * first + n_novel * novel) / (cfg.view0 + n_novel)
+            novel = fn(rendered[:, 1:].flatten(0, 1), images[:, 1:].flatten(0, 1))  # mean over the novel views
+            return cfg.view0 * first + (1.0 - cfg.view0) * novel
 
         def mse(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             return F.mse_loss(2.0 * x - 1.0, 2.0 * y - 1.0)
