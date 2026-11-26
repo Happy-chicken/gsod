@@ -33,7 +33,7 @@ from gsod.eval.evaluate import (
 )
 from gsod.eval.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
 from gsod.model import build_model
-from gsod.model.discriminator import PatchDiscriminator, d_loss, g_loss, pairs
+from gsod.model.discriminator import BETAS, LR, PatchDiscriminator, d_loss, g_loss, pairs
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
@@ -87,7 +87,7 @@ class GSODTraining(L.LightningModule):
         )
         opts = [opt]
         if self.discriminator is not None:
-            opts.append(torch.optim.Adam(self.discriminator.parameters(), lr=self.cfg.lr, betas=(0.0, 0.99)))
+            opts.append(torch.optim.Adam(self.discriminator.parameters(), lr=LR, betas=BETAS))
         return opts, [schedule]
 
     def on_fit_start(self) -> None:

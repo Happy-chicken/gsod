@@ -9,6 +9,8 @@ from torch import nn
 # DiffAugment: largest shift (fraction of the side), brightness / contrast jitter.
 SHIFT = 0.125
 JITTER = 0.2
+# Discriminator optimiser, as uORF: Adam, lr 1e-3, betas (0, 0.9), no schedule.
+LR, BETAS = 1e-3, (0.0, 0.9)
 
 
 class PatchDiscriminator(nn.Module):
