@@ -9,6 +9,8 @@ from torch import nn
 # DiffAugment: largest shift (fraction of the side), brightness / contrast jitter.
 SHIFT = 0.125
 JITTER = 0.2
+# Side of the random square crop the discriminator sees (as uORF, 64 px).
+CROP = 64
 # Discriminator optimiser, as uORF: Adam, lr 1e-3, betas (0, 0.9), no schedule.
 LR, BETAS = 1e-3, (0.0, 0.9)
 
@@ -30,8 +32,18 @@ class PatchDiscriminator(nn.Module):
 
 
 def novel_views(views: torch.Tensor) -> torch.Tensor:
-    """Novel views (B, V', 3, H, W) -> augmented images (B * V', 3, H, W)."""
-    return diff_augment(views.flatten(0, 1))
+    """Novel views (B, V', 3, H, W) -> random CROP x CROP crops, augmented (B * V', 3, CROP, CROP)."""
+    return diff_augment(random_crop(views.flatten(0, 1), CROP))
+
+
+def random_crop(x: torch.Tensor, size: int) -> torch.Tensor:
+    """Images (N, C, H, W) -> one random size x size crop each (N, C, size, size)."""
+    n, _, h, w = x.shape
+    top = torch.randint(0, h - size + 1, (n,), device=x.device)
+    left = torch.randint(0, w - size + 1, (n,), device=x.device)
+    rows = (top[:, None] + torch.arange(size, device=x.device))[:, :, None]  # (N, size, 1)
+    cols = (left[:, None] + torch.arange(size, device=x.device))[:, None, :]  # (N, 1, size)
+    return x[torch.arange(n, device=x.device)[:, None, None], :, rows, cols].permute(0, 3, 1, 2)
 
 
 def diff_augment(x: torch.Tensor) -> torch.Tensor:
