@@ -1,5 +1,9 @@
 """Run directories, checkpoints (uORF layout: {suffix}_net_{name}.pth),
-PNG writer and 3DGS .ply export."""
+PNG writer and 3DGS .ply export.
+
+Export a checkpoint's Gaussians (SuperSplat etc.):
+    python -m gsod.utils.io --dataset room_diverse --checkpoint checkpoints/<run> --scenes 5
+"""
 
 from __future__ import annotations
 
@@ -177,3 +181,50 @@ def export_gaussians(
     for k in range(obj["mu"].shape[0]):
         paths.append(write_ply(out_dir / f"slot{k + 1}.ply", keep({name: v[k] for name, v in obj.items()})))
     return paths
+
+
+def main() -> None:
+    """Gaussians of the first scenes of a split -> <checkpoint>/ply/<split>_<suffix>/sc####/*.ply."""
+    import argparse
+
+    from gsod.configs import DATASETS, config_for, run_config
+    from gsod.data_loader import make_dataset
+    from gsod.model import load_model
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--dataset", choices=list(DATASETS), required=True)
+    parser.add_argument("--checkpoint", required=True, help="run directory")
+    parser.add_argument("--suffix", default="best")
+    parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    parser.add_argument("--data", default=None, help="dataset root")
+    parser.add_argument("--scenes", type=int, default=5)
+    parser.add_argument("--min-opacity", type=float, default=0.1)
+    args = parser.parse_args()
+
+    device = torch.device("cuda")
+    cfg = run_config(config_for(args.dataset), Path(args.checkpoint))
+    root = args.data or (cfg.test_root if args.split == "test" and cfg.test_root else cfg.data_root)
+    model = load_model(cfg, args.checkpoint, args.suffix, device).eval()
+    dataset = make_dataset(cfg, root, args.split)
+
+    # The final Gaussians, caught on their way into model.render.
+    caught = {}
+    render = model.render
+
+    def catch(objects, background, cam2world):
+        caught.update(objects=objects, background=background)
+        return render(objects, background, cam2world)
+
+    model.render = catch
+    out = Path(args.checkpoint) / "ply" / f"{args.split}_{args.suffix}"
+    for i in range(min(args.scenes, len(dataset))):
+        item = dataset[i]
+        with torch.no_grad():
+            model(item["images"].to(device)[None], item["cam2world"].to(device)[None])
+        scene = int(item.get("scene", i))
+        export_gaussians(out / f"sc{scene:04d}", caught["objects"], caught["background"], min_opacity=args.min_opacity)
+    print(f"wrote {out}/sc####/{{scene,background,slot*}}.ply")
+
+
+if __name__ == "__main__":
+    main()
