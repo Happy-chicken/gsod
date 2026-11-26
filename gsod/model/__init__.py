@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from gsod.configs import BaseConfig
 from gsod.model.encoder import Encoder
+from gsod.model.encoders import DinoEncoder
 from gsod.model.gsod import GSODModel
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.io import load_networks
@@ -33,6 +34,7 @@ def load_model(cfg: BaseConfig, checkpoint, suffix: str, device) -> GSODModel:
 
 
 __all__ = [
+    "DinoEncoder",
     "Encoder",
     "SlotAttention",
     "GSODModel",

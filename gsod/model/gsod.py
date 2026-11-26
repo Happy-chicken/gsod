@@ -21,7 +21,7 @@ from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.encoder import Encoder
+from gsod.model.encoders import DinoEncoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -49,7 +49,7 @@ class GSODModel(nn.Module):
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
 
-        self.encoder = Encoder(z_dim)
+        self.encoder = DinoEncoder(z_dim, input_size)
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
@@ -65,8 +65,7 @@ class GSODModel(nn.Module):
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         """images (B, 3, H, W) -> encoder tokens (B, s*s, C), s = input_size."""
-        small = F.interpolate(images, size=self.input_size, mode="bilinear", align_corners=False)
-        return self.encoder(small).flatten(start_dim=2).permute(0, 2, 1)
+        return self.encoder(images).flatten(start_dim=2).permute(0, 2, 1)
 
     def decode_objects(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
