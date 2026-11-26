@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -16,7 +18,13 @@ class DinoEncoder(nn.Module):
 
     def __init__(self, z_dim: int, out_size: int):
         super().__init__()
-        self.dino = torch.hub.load("facebookresearch/dinov2", DINO_NAME).eval().requires_grad_(False)
+        # The hub cache if there (no network, e.g. compute nodes); else downloaded into it.
+        local = Path(torch.hub.get_dir()) / "facebookresearch_dinov2_main"
+        if local.is_dir():
+            dino = torch.hub.load(str(local), DINO_NAME, source="local")
+        else:
+            dino = torch.hub.load("facebookresearch/dinov2", DINO_NAME)
+        self.dino = dino.eval().requires_grad_(False)
         self.out_size, self.grid = out_size, out_size // GRID_DIVISOR
         self.proj = nn.Sequential(nn.Linear(DINO_DIM, z_dim), nn.ReLU(True), nn.Linear(z_dim, z_dim))
 
