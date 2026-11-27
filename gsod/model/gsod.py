@@ -3,8 +3,8 @@ batch of scenes at once.
 
     encode          view 0 -> DINO tokens (s x s)
     slot_attention  tokens -> background slot + K-1 object slots, their attention
-    pixel_decoder   every view-0 pixel: M Gaussians along its ray, each slot's take mixed by
-                    the attention there (also the Gaussians' soft owner)
+    pixel_decoder   one splatter image per slot: M Gaussians on every view-0 pixel along its
+                    ray, transparent where the slot is not
     render          all Gaussians blended together; masks from the same blending
 
 Gaussians are decoded in view 0's scene frame (utils/geometry.py; floor z = 0). Slot 0 is the
@@ -88,12 +88,12 @@ class GSODModel(nn.Module):
         }
 
     def decode(self, images: torch.Tensor, cam2world: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor]:
-        """View 0 -> world Gaussians (B, N, ...), owners (B, N, K), attention (B, K, s*s)."""
+        """View 0 -> world Gaussians (B, N, ...), their slot one-hot (B, N, K), attention (B, K, s*s)."""
         tokens = self.encoder(images[:, 0]).flatten(2).transpose(1, 2)  # (B, s*s, C)
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
         slots = torch.cat([bg_slot[:, None], slots], 1)
-        gaussians, owner = self.pixel_decoder(slots, attn, images[:, 0], frame)
+        gaussians, owner = self.pixel_decoder(slots, images[:, 0], frame)
         return to_world(gaussians, frame), owner, attn
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
