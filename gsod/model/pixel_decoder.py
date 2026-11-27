@@ -32,8 +32,8 @@ PE_BANDS = 8
 N_GEOMETRY, N_APPEARANCE = 5, 19
 
 
-def _head(d_in: int, hidden: int, d_out: int) -> nn.Sequential:
-    return nn.Sequential(nn.ReLU(True), nn.Linear(d_in, hidden), nn.ReLU(True), nn.Linear(hidden, d_out))
+def _hidden(d: int) -> nn.Sequential:
+    return nn.Sequential(nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True))
 
 
 class PixelDecoder(nn.Module):
@@ -53,21 +53,23 @@ class PixelDecoder(nn.Module):
         # Geometry: slot + pixel position.
         self.slot_to_geometry = nn.Linear(z_dim, hidden_dim)
         self.position_to_geometry = nn.Linear(2 + 4 * PE_BANDS, hidden_dim)
-        self.geometry = _head(hidden_dim, hidden_dim, m * N_GEOMETRY)
+        self.geometry_hidden = _hidden(hidden_dim)
+        self.to_geometry = nn.Linear(hidden_dim, m * N_GEOMETRY)
         # Appearance: slot + pixel features.
         self.encoder = UNetEncoder(z_dim)  # pixel features, full resolution
         self.slot_to_appearance = nn.Linear(z_dim, hidden_dim)
         self.pixel_to_appearance = nn.Linear(z_dim, hidden_dim)
-        self.appearance = _head(hidden_dim, hidden_dim, m * N_APPEARANCE)
+        self.appearance_hidden = _hidden(hidden_dim)
+        self.to_appearance = nn.Linear(hidden_dim, m * N_APPEARANCE)
         with torch.no_grad():  # at first: on the ray, pixel-sized, the pixel's colour
-            out = self.geometry[-1]
+            out = self.to_geometry
             out.weight.zero_()
             bias = out.bias.view(m, N_GEOMETRY)
             bias.zero_()
             for j in range(m):
                 bias[j, 0] = logit(min(DEPTH_START + j * DEPTH_STEP, 0.97))
                 bias[j, 4] = logit(OPACITY_START[min(j, 1)])
-            out = self.appearance[-1]
+            out = self.to_appearance
             out.weight.zero_()
             out.bias.zero_()
             out.bias.view(m, N_APPEARANCE)[:, 3] = 1.0  # quat w
@@ -83,24 +85,27 @@ class PixelDecoder(nn.Module):
         share = share.flatten(2)
         share = share / share.sum(1, keepdim=True).clamp_min(1e-6)  # (B, K, P)
 
-        # Each slot's take on each pixel, mixed by the slots' share of it (before the last, linear layer).
-        def mixed(head: nn.Sequential, per_slot: torch.Tensor, per_pixel: torch.Tensor) -> torch.Tensor:
-            hidden = head[:-1](per_slot[:, :, None] + per_pixel[:, None])  # (B, K, P, h)
-            return head[-1]((share[..., None] * hidden).sum(1)).unflatten(-1, (self.m, -1))  # (B, P, M, n)
-
         v, u = torch.meshgrid(
             torch.arange(h, device=image.device, dtype=image.dtype),
             torch.arange(w, device=image.device, dtype=image.dtype),
             indexing="ij",
         )
         position = torch.stack([u / (w - 1), v / (h - 1)], -1).reshape(-1, 2) * 2 - 1  # (P, 2) in [-1, 1]
-        geometry = mixed(
-            self.geometry,
+        geometry = self._mixed(
+            self.geometry_hidden,
+            self.to_geometry,
             self.slot_to_geometry(slots),
             self.position_to_geometry(positional_encoding(position, PE_BANDS)),
+            share,
         )
         pixel = self.encoder(image).flatten(2).transpose(1, 2)  # (B, P, C)
-        appearance = mixed(self.appearance, self.slot_to_appearance(slots), self.pixel_to_appearance(pixel))
+        appearance = self._mixed(
+            self.appearance_hidden,
+            self.to_appearance,
+            self.slot_to_appearance(slots),
+            self.pixel_to_appearance(pixel),
+            share,
+        )
 
         # Depth along the pixel's ray, up to the floor; camera z = 1 rays, so depth is camera depth.
         rays = camera_directions(u, v, self.image_size, self.focal_ratio).reshape(-1, 3) @ frame.rot.mT  # (B, P, 3)
@@ -118,3 +123,16 @@ class PixelDecoder(nn.Module):
         }
         owner = share.transpose(1, 2)[:, :, None].expand(-1, -1, self.m, -1)  # (B, P, M, K)
         return {name: value.flatten(1, 2) for name, value in gaussians.items()}, owner.flatten(1, 2)
+
+    def _mixed(
+        self,
+        hidden: nn.Module,
+        out: nn.Linear,
+        per_slot: torch.Tensor,
+        per_pixel: torch.Tensor,
+        share: torch.Tensor,
+    ) -> torch.Tensor:
+        """Each slot's take on each pixel (B, K, P, h), mixed by the slots' share (B, K, P) before
+        the last, linear layer -> (B, P, M, n)."""
+        h = hidden(per_slot[:, :, None] + per_pixel[:, None])
+        return out((share[..., None] * h).sum(1)).unflatten(-1, (self.m, -1))
