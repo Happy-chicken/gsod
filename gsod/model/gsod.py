@@ -21,7 +21,7 @@ from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.encoders import DinoEncoder
+from gsod.model.encoders import DinoCNNEncoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -49,7 +49,7 @@ class GSODModel(nn.Module):
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
 
-        self.encoder = DinoEncoder(z_dim, input_size)
+        self.encoder = DinoCNNEncoder(z_dim, input_size)
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
