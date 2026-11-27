@@ -5,7 +5,7 @@ batch of scenes at once.
     decode_objects            object slot -> box on the floor at its anchor ->
                               Gaussians in it, fainter as its attention shrinks
     decode_background         background slot -> flat Gaussians on the floor
-    refine                    objects decoded on once from each Gaussian's view-0 pixel
+    refine                    objects decoded on once from points around each Gaussian's view-0 pixel
     render                    all Gaussians blended together; masks from the
                               same blending
 
