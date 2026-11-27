@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Where does the blur come from? Two checks on a trained checkpoint, no training.
 
-1. Gaussian statistics: per object slot, Gaussians with opacity > 0.1, their size in view-0
-   pixels, the object's area in view 0.
+1. Gaussian statistics: per object slot, the Gaussians it owns most with opacity > 0.1, their
+   size in view-0 pixels, the object's area in view 0.
 2. Optimisation ceiling: the decoded Gaussians optimised directly per scene (no network) on all
    views, and on view 0 only; PSNR per view before / after, images saved.
 
@@ -44,7 +44,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", default=None, help="dataset root")
     parser.add_argument("--scenes", type=int, default=50, help="scenes for the statistics")
     parser.add_argument("--optimize-scenes", type=int, default=5, help="scenes for the optimisation")
-    parser.add_argument("--objects-only", action="store_true", help="optimise the object Gaussians, background fixed")
+    parser.add_argument(
+        "--objects-only", action="store_true", help="optimise the objects' Gaussians, the background's fixed"
+    )
     return parser.parse_args()
 
 
@@ -54,43 +56,31 @@ def psnr(a: torch.Tensor, b: torch.Tensor) -> list[float]:
     return (10 * torch.log10(1 / mse)).tolist()
 
 
-def run(model, images: torch.Tensor, cams: torch.Tensor) -> tuple[dict, dict]:
-    """One scene -> the model's outputs and the final world Gaussians {"objects", "background"}
-    (caught on their way into model.render; the model is not changed)."""
-    caught = {}
-    render = model.render
-
-    def catch(objects, background, cam2world):
-        caught.update(objects=objects, background=background)
-        return render(objects, background, cam2world)
-
-    model.render = catch
-    try:
-        with torch.no_grad():
-            outputs = model(images[None], cams[None])
-    finally:
-        del model.render  # back to the class method
-    return outputs, caught
+def run(model, images: torch.Tensor, cams: torch.Tensor) -> tuple[dict, dict, torch.Tensor]:
+    """One scene -> the model's render outputs, its world Gaussians (1, N, ...) and owners (1, N, K)."""
+    with torch.no_grad():
+        gaussians, owner, _ = model.decode(images[None], cams[None])
+        return model.render(gaussians, owner, cams[None]), gaussians, owner
 
 
-def gaussian_stats(model, outputs, gaussians, cam2world: torch.Tensor) -> list[dict]:
+def gaussian_stats(model, outputs, gaussians, owner, cam2world: torch.Tensor) -> list[dict]:
     """One scene -> per drawing object slot: active Gaussians, their view-0 size (px), area (px)."""
-    objects = gaussians["objects"]  # world, (1, K-1, G, ...)
     w = model.image_size[1]
     world2cam = torch.linalg.inv(cam2world[0])  # view 0
-    cam = objects["mu"][0] @ world2cam[:3, :3].T + world2cam[:3, 3]  # (K-1, G, 3)
-    size = model.focal_ratio[0] * w * objects["scale"][0].mean(-1) / cam[..., 2].clamp_min(1e-4)
+    cam = gaussians["mu"][0] @ world2cam[:3, :3].T + world2cam[:3, 3]  # (N, 3)
+    size = model.focal_ratio[0] * w * gaussians["scale"][0].mean(-1) / cam[..., 2].clamp_min(1e-4)
+    slot = owner[0].argmax(-1)  # (N,)
     mask = outputs["mask_idx"][0, 0]  # view 0, 0 = background
     rows = []
-    for k in range(objects["mu"].shape[1]):
-        area = int((mask == k + 1).sum())
+    for k in range(1, owner.shape[-1]):
+        area = int((mask == k).sum())
         if area < MIN_AREA:
             continue
-        active = objects["opacity"][0, k] > ACTIVE
+        active = (slot == k) & (gaussians["opacity"][0] > ACTIVE)
         rows.append(
             {
                 "active": int(active.sum()),
-                "size_px": float(size[k][active].mean()) if active.any() else float("nan"),
+                "size_px": float(size[active].mean()) if active.any() else float("nan"),
                 "area_px": area,
             }
         )
@@ -173,18 +163,19 @@ def main() -> None:
     print(f"   area per active Gaussian:   median {np.median(area / np.maximum(active, 1)):.1f} px")
 
     # 2. Optimisation ceiling.
-    mode = "object Gaussians only, background fixed" if args.objects_only else "every Gaussian"
+    mode = "the objects' Gaussians only, the background's fixed" if args.objects_only else "every Gaussian"
     tag = "_objects" if args.objects_only else ""
     print(f"2. Optimised directly ({mode}, {STEPS} steps); PSNR per view [view 0, novel views...]")
     for i in range(min(args.optimize_scenes, len(dataset))):
         item = dataset[i]
         images, cams = item["images"].to(device), item["cam2world"].to(device)
-        outputs, g = run(model, images, cams)
-        if args.objects_only:  # objects optimised, background fixed
-            free = {k: v.flatten(1, 2) for k, v in g["objects"].items()}
-            fixed = g["background"]
+        outputs, g, owner = run(model, images, cams)
+        if args.objects_only:  # the objects' Gaussians optimised, the background's fixed
+            objects = owner[0].argmax(-1) > 0
+            free = {k: v[:, objects] for k, v in g.items()}
+            fixed = {k: v[:, ~objects] for k, v in g.items()}
         else:  # everything optimised
-            free, fixed = model.merge(g["objects"], g["background"]), None
+            free, fixed = g, None
         before = outputs["rgb"][0].clamp(0, 1)
         all_views = optimise(model, free, fixed, images, cams, list(range(images.shape[0])))
         view0 = optimise(model, free, fixed, images, cams, [0])

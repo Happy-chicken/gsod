@@ -60,7 +60,7 @@ MODEL_FIELDS = (
     "z_dim",
     "num_slots",
     "attn_iter",
-    "gaussians_per_slot",
+    "gaussians_per_pixel",
     "decoder_hidden_dim",
     "near",
 )

@@ -255,10 +255,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-dim", type=int, default=None)
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
-    parser.add_argument("--gaussians-per-slot", type=int, default=None)
+    parser.add_argument("--gaussians-per-pixel", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
-    parser.add_argument("--box", type=float, default=None, help="box size penalty weight; 0 = off")
-    parser.add_argument("--late-start", type=float, default=None, help="LPIPS and box from this fraction on")
+    parser.add_argument("--late-start", type=float, default=None, help="LPIPS from this fraction on")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
@@ -281,7 +280,7 @@ def main() -> None:
         values["data_root"] = args.data
     if args.out is not None:
         values["out_dir"] = args.out
-    loss = {k: getattr(args, k) for k in ("box", "late_start") if getattr(args, k) is not None}
+    loss = {k: getattr(args, k) for k in ("late_start",) if getattr(args, k) is not None}
     values["loss"] = replace(cfg.loss, **loss)
     cfg = replace(cfg, **values)
 
@@ -295,10 +294,9 @@ def main() -> None:
     torch._inductor.config.fallback_random = True
     # Room for every compiled variant (bg / object slots, train / eval, grad / no grad, batch sizes).
     torch._dynamo.config.cache_size_limit = 64
-    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder, model.lifter):
+    for net in (model.slot_attention, model.pixel_decoder):
         net.compile()
-    model.lifter.encoder.forward = torch.compiler.disable(model.lifter.encoder.forward)  # its U-Net
-    model.obj_decoder.decode = torch.compile(model.obj_decoder.decode)  # a method, not forward
+    model.pixel_decoder.encoder.forward = torch.compiler.disable(model.pixel_decoder.encoder.forward)  # U-Net
     train(model, cfg, resume=args.resume)
 
 

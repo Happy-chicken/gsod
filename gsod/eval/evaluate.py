@@ -40,9 +40,6 @@ SLOT_COLUMNS = (
     "gt_object",
     "iou",
     "occupancy",
-    "extent_x",
-    "extent_y",
-    "extent_z",
 )
 # Share of a GT object's pixels one object slot must own for it to be found.
 OBJECT_FOUND = 0.5
@@ -115,18 +112,12 @@ def collect(model: GSODModel, item: dict, device: torch.device) -> dict:
         "target": np_(images),
         "rgb": np_(rgb),
         "fg_rgb": np_(result["fg_rgb"].clamp(0, 1)),
-        "rgb_pre": np_(result["rgb_pre"].clamp(0, 1)) if "rgb_pre" in result else None,  # before refinement
         "bg_rgb": np_(result["bg_rgb"].clamp(0, 1)),
         "slot_rgb": np_(result["slot_rgb"].clamp(0, 1)),  # (V, K-1, 3, H, W)
         "alpha": np_(result["slot_alpha"]),  # (V, K, H, W), 0 = uncovered
         "mask_idx": result["mask_idx"].cpu().numpy(),  # (V, H, W)
         "attn": attn.reshape(-1, side, side),  # (K, s, s), row 0 = background
         "occupancy": occupancy,
-        "extent": np_(result["extent"]),  # (K-1, 3)
-        "box": np_(result["box"]),  # (K-1, 8, 3) world
-        "anchor_init": np_(result["anchor_init"]),  # (K-1, 3) world
-        "cam2world": item["cam2world"].float().numpy(),  # (V, 4, 4)
-        "focal_ratio": tuple(model.focal_ratio),
         "ssim": _nanmean(novel_ssim),
         "lpips": novel_lpips,
         "gt": None if gt is None else gt.cpu().numpy().astype(np.int64),
@@ -177,9 +168,6 @@ def slot_table(rec: dict) -> list[dict]:
             "gt_object": -1,
             "iou": NAN,
             "occupancy": float(rec["occupancy"][k - 1]),
-            "extent_x": float(rec["extent"][k - 1, 0]),
-            "extent_y": float(rec["extent"][k - 1, 1]),
-            "extent_z": float(rec["extent"][k - 1, 2]),
         }
         if pixels.sum() >= MIN_SLOT_PIXELS:
             row["role"] = "draws"

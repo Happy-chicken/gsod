@@ -160,26 +160,25 @@ def write_ply(path: str | Path, gaussians: dict[str, torch.Tensor]) -> Path:
 
 def export_gaussians(
     out_dir: str | Path,
-    objects: dict[str, torch.Tensor],
-    background: dict[str, torch.Tensor],
+    gaussians: dict[str, torch.Tensor],
+    owner: torch.Tensor,
     scene: int = 0,
     min_opacity: float = 0.0,
 ) -> list[Path]:
-    """World object (B, K-1, G, ...) and background (B, M, ...) Gaussians of one scene of the batch ->
-    3DGS .ply files (SuperSplat and other 3DGS viewers): scene.ply (all), background.ply,
-    slot{k}.ply per object slot. Gaussians with opacity <= min_opacity are left out."""
-    obj = {k: v[scene] for k, v in objects.items()}  # (K-1, G, ...)
-    bg = {k: v[scene] for k, v in background.items()}  # (M, ...)
+    """World Gaussians (B, N, ...) with owners (B, N, K) of one scene of the batch -> 3DGS .ply
+    files (SuperSplat and other 3DGS viewers): scene.ply (all), background.ply and slot{k}.ply,
+    each Gaussian with the slot that owns it most. Gaussians with opacity <= min_opacity are left out."""
+    every = {k: v[scene] for k, v in gaussians.items()}  # (N, ...)
+    slot = owner[scene].argmax(-1)  # (N,)
 
-    def keep(g: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        mask = g["opacity"] > min_opacity
-        return {k: v[mask] for k, v in g.items()}
+    def keep(mask: torch.Tensor) -> dict[str, torch.Tensor]:
+        mask = mask & (every["opacity"] > min_opacity)
+        return {k: v[mask] for k, v in every.items()}
 
-    every = {k: torch.cat([obj[k].flatten(0, 1), bg[k]], 0) for k in obj}
     out_dir = Path(out_dir)
-    paths = [write_ply(out_dir / "scene.ply", keep(every)), write_ply(out_dir / "background.ply", keep(bg))]
-    for k in range(obj["mu"].shape[0]):
-        paths.append(write_ply(out_dir / f"slot{k + 1}.ply", keep({name: v[k] for name, v in obj.items()})))
+    paths = [write_ply(out_dir / "scene.ply", keep(slot >= 0)), write_ply(out_dir / "background.ply", keep(slot == 0))]
+    for k in range(1, owner.shape[-1]):
+        paths.append(write_ply(out_dir / f"slot{k}.ply", keep(slot == k)))
     return paths
 
 
@@ -207,22 +206,13 @@ def main() -> None:
     model = load_model(cfg, args.checkpoint, args.suffix, device).eval()
     dataset = make_dataset(cfg, root, args.split)
 
-    # The final Gaussians, caught on their way into model.render.
-    caught = {}
-    render = model.render
-
-    def catch(objects, background, cam2world):
-        caught.update(objects=objects, background=background)
-        return render(objects, background, cam2world)
-
-    model.render = catch
     out = Path(args.checkpoint) / "ply" / f"{args.split}_{args.suffix}"
     for i in range(min(args.scenes, len(dataset))):
         item = dataset[i]
         with torch.no_grad():
-            model(item["images"].to(device)[None], item["cam2world"].to(device)[None])
+            gaussians, owner, _ = model.decode(item["images"].to(device)[None], item["cam2world"].to(device)[None])
         scene = int(item.get("scene", i))
-        export_gaussians(out / f"sc{scene:04d}", caught["objects"], caught["background"], min_opacity=args.min_opacity)
+        export_gaussians(out / f"sc{scene:04d}", gaussians, owner, min_opacity=args.min_opacity)
     print(f"wrote {out}/sc####/{{scene,background,slot*}}.ply")
 
 

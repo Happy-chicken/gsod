@@ -1,8 +1,6 @@
 """Reconstruction loss (no masks), every view:
 
-total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
-        + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
-        + lpips * LPIPS (VGG) + box * mean object box half size, both from late_start of training on
+total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM) + lpips * LPIPS (VGG) from late_start on
 """
 
 from __future__ import annotations
@@ -61,19 +59,9 @@ class GSODLoss(nn.Module):
             "ssim": 1.0 - ssim(rendered, images),
         }
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
-        if "rgb_pre" in outputs and cfg.refine_aux > 0:
-            pre = outputs["rgb_pre"].flatten(0, -4)
-            terms["refine_aux"] = cfg.recon * F.mse_loss(2.0 * pre - 1.0, 2.0 * images - 1.0) + cfg.ssim * (
-                1.0 - ssim(pre, images)
-            )
-            weights["refine_aux"] = cfg.refine_aux
-        if progress >= cfg.late_start:  # late terms, once objects exist
-            if self.lpips is not None:
-                terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]
-                weights["lpips"] = cfg.lpips
-            if cfg.box > 0:  # object box half sizes, scene units
-                terms["box"] = outputs["extent"].mean()
-                weights["box"] = cfg.box
+        if progress >= cfg.late_start and self.lpips is not None:  # once objects exist
+            terms["lpips"] = self.lpips(rendered, images, normalize=True).mean()  # inputs in [0, 1]
+            weights["lpips"] = cfg.lpips
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: value.detach() for name, value in terms.items()}
         logged["total"] = total.detach()

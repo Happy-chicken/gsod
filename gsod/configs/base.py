@@ -14,9 +14,7 @@ class LossConfig:
     recon: float = 1.0  # MSE, images in [-1, 1]
     ssim: float = 0.2  # 1 - SSIM
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
-    late_start: float = 0.3  # LPIPS and box from this fraction of training on
-    refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
-    box: float = 0.005  # mean box half size (keeps boxes tight)
+    late_start: float = 0.3  # LPIPS from this fraction of training on
 
 
 @dataclass
@@ -26,7 +24,7 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    gaussians_per_slot: int = 512
+    gaussians_per_pixel: int = 2  # the first on the visible surface, the others free to reach the hidden side
     decoder_hidden_dim: int = 128
     near: float = 0.1
 
