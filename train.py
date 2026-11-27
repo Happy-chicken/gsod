@@ -295,9 +295,9 @@ def main() -> None:
     torch._inductor.config.fallback_random = True
     # Room for every compiled variant (bg / object slots, train / eval, grad / no grad, batch sizes).
     torch._dynamo.config.cache_size_limit = 64
-    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder):
+    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder, model.refiner):
         net.compile()
-    model.obj_decoder.refine = torch.compile(model.obj_decoder.refine)  # a method, not forward
+    model.obj_decoder.decode = torch.compile(model.obj_decoder.decode)  # a method, not forward
     train(model, cfg, resume=args.resume)
 
 

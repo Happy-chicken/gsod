@@ -22,6 +22,7 @@ from torch import nn
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
 from gsod.model.encoders import DinoEncoder, UNetEncoder
+from gsod.model.refiner import Refiner
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -54,6 +55,7 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
+        self.refiner = Refiner(z_dim, decoder_hidden_dim, image_size, focal_ratio)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -63,6 +65,7 @@ class GSODModel(nn.Module):
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
+            "Refiner": self.refiner,
         }
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -150,7 +153,8 @@ class GSODModel(nn.Module):
         view0 = F.interpolate(images[:, 0], size=side, mode="bilinear", align_corners=False)
         enc = self.refine_encoder(view0)  # (B, C, s, s)
         obj_attn = attn[:, 1:].unflatten(2, side)  # (B, K-1, s, s)
-        refined = self.obj_decoder.refine(state, images[:, 0], enc, obj_attn, frame)
+        q = self.refiner(state["q"], state["mu"], images[:, 0], enc, obj_attn, frame)
+        refined = self.obj_decoder.decode(q, state)
 
         out = self.render(to_world(refined, frame), floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init

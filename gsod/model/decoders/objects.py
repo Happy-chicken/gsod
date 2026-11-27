@@ -16,8 +16,6 @@ AREA_FULL, at most 1): the attention decides whether a slot shows, never 0.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -37,8 +35,6 @@ QUERY_STD = 2.0
 # Transformer: heads, slot tokens, layers; RegionHead MLP width.
 N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
 REGION_HIDDEN = 64
-# Refine: points each Gaussian samples around its view-0 pixel (deformable sampling).
-N_POINTS = 4
 
 
 # anchor_init weights tokens by attn ** this (lean to the stronger core).
@@ -70,37 +66,6 @@ def init_attention_anchor(
     # Attention-weighted mean, weights attn ** _ANCHOR_SHARPNESS normalised.
     p = (_ANCHOR_SHARPNESS * attn.clamp_min(1e-8).log()).softmax(dim=-1)
     return p @ points, p @ colours
-
-
-def sample_own_pixels(
-    mu: torch.Tensor,
-    offsets: torch.Tensor,
-    attn: torch.Tensor,
-    enc: torch.Tensor,
-    image: torch.Tensor,
-    frame: SceneFrame,
-    image_size: tuple[int, int],
-    focal_ratio: tuple[float, float],
-) -> torch.Tensor:
-    """Gaussian centres mu (B, K, G, 3), offsets (B, K, G, M, 2) in pixels, slot attention maps
-    (B, K, s, s), encoder map (B, C, s, s), view-0 image (B, 3, H, W) -> at each centre's view-0
-    pixel + offsets: [features, rgb, its slot's ownership] (B, K, G, M, C + 4); 0 outside the image."""
-    b, k, g, m = offsets.shape[:4]
-    h, w = image_size
-    f = mu.new_tensor([focal_ratio[0] * w, focal_ratio[1] * h])
-    size = mu.new_tensor([w, h])
-    # Project the centres into view 0 (pixel centres at integers).
-    cam = (mu.flatten(1, 2).detach() - frame.origin[:, None]) @ frame.rot  # (B, N, 3)
-    uv = f * cam[..., :2] / cam[..., 2:].clamp_min(1e-4) + (size - 1) / 2
-    points = uv[:, :, None] + offsets.flatten(1, 2)  # (B, N, M, 2)
-    grid = (points + 0.5) / size * 2 - 1
-
-    def sample(x: torch.Tensor) -> torch.Tensor:  # (B, C, h, w) -> (B, N, M, C)
-        return F.grid_sample(x, grid, align_corners=False).permute(0, 2, 3, 1)
-
-    own_slot = torch.arange(k, device=mu.device).repeat_interleave(g)  # slot of each Gaussian
-    ownership = sample(attn).gather(-1, own_slot.view(1, -1, 1, 1).expand(b, -1, m, 1))
-    return torch.cat([sample(enc), sample(image), ownership], -1).unflatten(1, (k, g))
 
 
 def box_corners(anchor: torch.Tensor, extent: torch.Tensor) -> torch.Tensor:
@@ -222,19 +187,6 @@ class ObjectDecoder(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
         self.head = ObjectHead(d)
-        # Refine: view-0 features -> q (zero at first); the feature of a hidden Gaussian.
-        self.pixel_to_q = nn.Linear(z_dim + 4, d)  # [features, rgb, ownership]
-        nn.init.zeros_(self.pixel_to_q.weight)
-        nn.init.zeros_(self.pixel_to_q.bias)
-        # Deformable sampling: q -> N_POINTS offsets (px) and their weights.
-        self.to_offsets = nn.Linear(d, N_POINTS * 2)
-        self.to_weights = nn.Linear(d, N_POINTS)
-        angle = torch.arange(N_POINTS) * 2 * math.pi / N_POINTS
-        with torch.no_grad():  # a 1 px ring at first: points that start equal would stay equal
-            self.to_offsets.weight.zero_()
-            self.to_offsets.bias.copy_(torch.stack([angle.cos(), angle.sin()], -1).flatten())
-            self.to_weights.weight.zero_()
-            self.to_weights.bias.zero_()
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
@@ -242,7 +194,7 @@ class ObjectDecoder(nn.Module):
         """Object slots (B, K, C), their attention (B, K, N), token colours
         (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...), the box
         {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)} and the
-        state for refine(); scene frame."""
+        state for decode(); scene frame."""
         b, n_slots = slots.shape[:2]
         anchor_init, colour = init_attention_anchor(attn, colours, frame, self.image_size, self.focal_ratio)
         ray = F.normalize(anchor_init - frame.origin[:, None], dim=-1)  # camera -> anchor_init
@@ -263,25 +215,12 @@ class ObjectDecoder(nn.Module):
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
         gaussians = self._gaussians(state["q"], state)
-        state["mu"] = gaussians["mu"]  # where refine() samples
+        state["mu"] = gaussians["mu"]  # where the refiner samples
         return gaussians, box, state
 
-    def refine(
-        self,
-        state: dict,
-        image: torch.Tensor,
-        enc: torch.Tensor,
-        attn: torch.Tensor,
-        frame: SceneFrame,
-    ) -> dict[str, torch.Tensor]:
-        """Decode on from q, adding what each Gaussian sees around its view-0 pixel (N_POINTS
-        points, offsets and weights from q) and its slot's ownership there -> Gaussians (B, K, G, ...)."""
-        q = state["q"]  # (B*K, G, d)
-        offsets = self.to_offsets(q).unflatten(-1, (N_POINTS, 2)).unflatten(0, state["shape"])
-        weights = self.to_weights(q).softmax(-1).unflatten(0, state["shape"])  # (B, K, G, M)
-        samples = sample_own_pixels(state["mu"], offsets, attn, enc, image, frame, self.image_size, self.focal_ratio)
-        pixel_info = (weights[..., None] * samples).sum(-2).flatten(0, 1)  # (B*K, G, C + 4)
-        return self._gaussians(self._layers(state["q"] + self.pixel_to_q(pixel_info), state), state)
+    def decode(self, q: torch.Tensor, state: dict) -> dict[str, torch.Tensor]:
+        """Decode on from q (B*K, G, d), e.g. a refined q -> Gaussians (B, K, G, ...)."""
+        return self._gaussians(self._layers(q, state), state)
 
     def _layers(self, q: torch.Tensor, state: dict) -> torch.Tensor:
         """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens)."""
