@@ -95,7 +95,7 @@ class PixelDecoder(nn.Module):
             self.geometry_hidden,
             self.to_geometry,
             self.slot_to_geometry(slots),
-            self.position_to_geometry(positional_encoding(position, PE_BANDS)),
+            self.position_to_geometry(positional_encoding(position, PE_BANDS))[None],  # (1, P, h)
             share,
         )
         pixel = self.encoder(image).flatten(2).transpose(1, 2)  # (B, P, C)
@@ -132,7 +132,7 @@ class PixelDecoder(nn.Module):
         per_pixel: torch.Tensor,
         share: torch.Tensor,
     ) -> torch.Tensor:
-        """Each slot's take on each pixel (B, K, P, h), mixed by the slots' share (B, K, P) before
-        the last, linear layer -> (B, P, M, n)."""
+        """Per slot (B, K, h) + per pixel (B or 1, P, h) -> each slot's take on each pixel, mixed by
+        the slots' share (B, K, P) before the last, linear layer -> (B, P, M, n)."""
         h = hidden(per_slot[:, :, None] + per_pixel[:, None])
         return out((share[..., None] * h).sum(1)).unflatten(-1, (self.m, -1))
