@@ -1,4 +1,4 @@
-"""Image encoder: pretrained DINOv2 (frozen), its patch features projected to z_dim."""
+"""Image encoder for slot attention: pretrained DINOv2 (frozen), then convs on its patch grid."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from gsod.model.layers import conv_block
 
 DINO_NAME, DINO_DIM, PATCH = "dinov2_vits14", 384, 14
 GRID_DIVISOR = 4  # DINO's patch grid is s / 4: 16 x 16 patches (224 px in) for s = 64
@@ -26,7 +28,7 @@ class DinoEncoder(nn.Module):
             dino = torch.hub.load("facebookresearch/dinov2", DINO_NAME)
         self.dino = dino.eval().requires_grad_(False)
         self.out_size, self.grid = out_size, out_size // GRID_DIVISOR
-        self.proj = nn.Sequential(nn.Linear(DINO_DIM, z_dim), nn.ReLU(True), nn.Linear(z_dim, z_dim))
+        self.conv = nn.Sequential(conv_block(DINO_DIM, z_dim), conv_block(z_dim, z_dim))
 
     def train(self, mode: bool = True) -> DinoEncoder:
         super().train(mode)
@@ -38,5 +40,5 @@ class DinoEncoder(nn.Module):
         x = (x - x.new_tensor(MEAN)[:, None, None]) / x.new_tensor(STD)[:, None, None]
         with torch.no_grad():
             tokens = self.dino.forward_features(x)["x_norm_patchtokens"]  # (B, g*g, DINO_DIM)
-        feat = self.proj(tokens).transpose(1, 2).unflatten(2, (self.grid, self.grid))  # (B, C, g, g)
+        feat = self.conv(tokens.transpose(1, 2).unflatten(2, (self.grid, self.grid)))  # (B, C, g, g)
         return F.interpolate(feat, size=self.out_size, mode="bilinear", align_corners=False)

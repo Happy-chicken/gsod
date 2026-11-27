@@ -21,7 +21,7 @@ from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.encoders import DinoCNNEncoder
+from gsod.model.encoders import DinoEncoder, UNetEncoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -49,7 +49,8 @@ class GSODModel(nn.Module):
         self.focal_ratio = tuple(focal_ratio)
         self.near = near
 
-        self.encoder = DinoCNNEncoder(z_dim, input_size)
+        self.encoder = DinoEncoder(z_dim, input_size)  # for slot attention
+        self.refine_encoder = UNetEncoder(z_dim)  # pixel features read by refine
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
@@ -58,6 +59,7 @@ class GSODModel(nn.Module):
         """Named networks (checkpoint files)."""
         return {
             "Encoder": self.encoder,
+            "RefineEncoder": self.refine_encoder,
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
@@ -135,7 +137,7 @@ class GSODModel(nn.Module):
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
         """images (B, V, 3, H, W) in [0, 1], cam2world (B, V, 4, 4) -> render
         outputs (B, ...), attention and boxes."""
-        tokens = self.encode(images[:, 0])
+        tokens = self.encode(images[:, 0])  # DINO
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
@@ -143,9 +145,10 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine: each object Gaussian reads its view-0 pixel; decoding continues from its q.
+        # Refine: each object Gaussian reads its view-0 pixel (U-Net features); decoding continues from its q.
         side = (self.input_size, self.input_size)
-        enc = tokens.transpose(1, 2).unflatten(2, side)  # (B, C, s, s)
+        view0 = F.interpolate(images[:, 0], size=side, mode="bilinear", align_corners=False)
+        enc = self.refine_encoder(view0)  # (B, C, s, s)
         obj_attn = attn[:, 1:].unflatten(2, side)  # (B, K-1, s, s)
         refined = self.obj_decoder.refine(state, images[:, 0], enc, obj_attn, frame)
 
