@@ -211,27 +211,19 @@ class ObjectDecoder(nn.Module):
             "presence": (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0),
             "shape": (b, n_slots),
         }
-        state["q"] = self._layers(self.queries.expand(K, -1, -1), state)
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        gaussians = self._gaussians(state["q"], state)
-        state["mu"] = gaussians["mu"]  # where the refiner samples
+        gaussians, state["q"] = self.decode(self.queries.expand(K, -1, -1), state)
+        state["mu"] = gaussians["mu"]  # where the lifter samples
         return gaussians, box, state
 
-    def decode(self, q: torch.Tensor, state: dict) -> dict[str, torch.Tensor]:
-        """Decode on from q (B*K, G, d), e.g. a refined q -> Gaussians (B, K, G, ...)."""
-        return self._gaussians(self._layers(q, state), state)
-
-    def _layers(self, q: torch.Tensor, state: dict) -> torch.Tensor:
-        """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens)."""
+    def decode(self, q: torch.Tensor, state: dict) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens) ->
+        Gaussians (B, K, G, ...) in the box, and q after the layers."""
         for layer in self.layers:
             q = layer(q, state["k"], state["v"])
-        return q
-
-    def _gaussians(self, q: torch.Tensor, state: dict) -> dict[str, torch.Tensor]:
-        """q (B*K, G, d) -> Gaussians (B, K, G, ...) in the box."""
         gaussians = self.head(q, state["anchor"], state["extent"], state["colour"])
         # Each slot's brightest Gaussian at its presence.
         opacity = gaussians["opacity"]
         gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * state["presence"][:, None]
-        return {name: value.unflatten(0, state["shape"]) for name, value in gaussians.items()}
+        return {name: value.unflatten(0, state["shape"]) for name, value in gaussians.items()}, q

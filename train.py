@@ -291,11 +291,12 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     torch.set_float32_matmul_precision("high")  # TF32 matmuls
     model = build_model(cfg)
-    # Not the encoder (Inductor bug with replicate padding); random numbers as without compiling.
+    # Not the encoders (Inductor bug with replicate padding; the lifter holds a U-Net);
+    # random numbers as without compiling.
     torch._inductor.config.fallback_random = True
     # Room for every compiled variant (bg / object slots, train / eval, grad / no grad, batch sizes).
     torch._dynamo.config.cache_size_limit = 64
-    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder, model.refiner):
+    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder):
         net.compile()
     model.obj_decoder.decode = torch.compile(model.obj_decoder.decode)  # a method, not forward
     train(model, cfg, resume=args.resume)

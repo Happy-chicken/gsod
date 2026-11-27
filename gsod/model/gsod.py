@@ -21,8 +21,8 @@ from torch import nn
 
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.encoders import DinoEncoder, UNetEncoder
-from gsod.model.refiner import Refiner
+from gsod.model.encoders import DinoEncoder
+from gsod.model.lifter import PixelLifter
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import SceneFrame, points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -51,21 +51,19 @@ class GSODModel(nn.Module):
         self.near = near
 
         self.encoder = DinoEncoder(z_dim, input_size)  # for slot attention
-        self.refine_encoder = UNetEncoder(z_dim)  # pixel features read by refine
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, gaussians_per_slot, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
-        self.refiner = Refiner(z_dim, decoder_hidden_dim, image_size, focal_ratio)
+        self.lifter = PixelLifter(z_dim, decoder_hidden_dim, input_size, image_size, focal_ratio)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
         return {
             "Encoder": self.encoder,
-            "RefineEncoder": self.refine_encoder,
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
-            "Refiner": self.refiner,
+            "PixelLifter": self.lifter,
         }
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -148,13 +146,9 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine: each object Gaussian reads its view-0 pixel (U-Net features); decoding continues from its q.
-        side = (self.input_size, self.input_size)
-        view0 = F.interpolate(images[:, 0], size=side, mode="bilinear", align_corners=False)
-        enc = self.refine_encoder(view0)  # (B, C, s, s)
-        obj_attn = attn[:, 1:].unflatten(2, side)  # (B, K-1, s, s)
-        q = self.refiner(state["q"], state["mu"], images[:, 0], enc, obj_attn, frame)
-        refined = self.obj_decoder.decode(q, state)
+        # Refine: each object Gaussian reads view 0 around its pixel; decoding continues from its q.
+        q = self.lifter(state["q"], state["mu"], images[:, 0], attn[:, 1:], frame)
+        refined, _ = self.obj_decoder.decode(q, state)
 
         out = self.render(to_world(refined, frame), floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init

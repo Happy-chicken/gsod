@@ -1,5 +1,5 @@
-"""Refiner: each object Gaussian reads view 0 around its pixel (deformable sampling) -> a refined
-q, decoded on by the object decoder."""
+"""PixelLifter: each object Gaussian reads view 0 around its pixel (U-Net features, rgb, its slot's
+ownership; deformable sampling) -> a refined q, decoded on by the object decoder."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from gsod.model.encoders import UNetEncoder
 from gsod.utils.geometry import SceneFrame
 
 N_POINTS = 4  # points each Gaussian samples around its view-0 pixel
@@ -45,12 +46,21 @@ def sample_own_pixels(
     return torch.cat([sample(enc), sample(image), ownership], -1).unflatten(1, (k, g))
 
 
-class Refiner(nn.Module):
+class PixelLifter(nn.Module):
     """q (B*K, G, d) + what each Gaussian sees in view 0 -> refined q (B*K, G, d)."""
 
-    def __init__(self, z_dim: int, d: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]):
+    def __init__(
+        self,
+        z_dim: int,
+        d: int,
+        input_size: int,
+        image_size: tuple[int, int],
+        focal_ratio: tuple[float, float],
+    ):
         super().__init__()
+        self.input_size = input_size
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
+        self.encoder = UNetEncoder(z_dim)  # pixel features, s x s
         # Sampled [features, rgb, ownership] -> q (zero at first).
         self.pixel_to_q = nn.Linear(z_dim + 4, d)
         nn.init.zeros_(self.pixel_to_q.weight)
@@ -70,12 +80,14 @@ class Refiner(nn.Module):
         q: torch.Tensor,
         mu: torch.Tensor,
         image: torch.Tensor,
-        enc: torch.Tensor,
         attn: torch.Tensor,
         frame: SceneFrame,
     ) -> torch.Tensor:
-        """q (B*K, G, d), Gaussian centres mu (B, K, G, 3), view-0 image (B, 3, H, W), pixel features
-        (B, C, s, s), slot attention maps (B, K, s, s) -> q + what each Gaussian sees (B*K, G, d)."""
+        """q (B*K, G, d), Gaussian centres mu (B, K, G, 3), view-0 image (B, 3, H, W), the object
+        slots' attention (B, K, s*s) -> q + what each Gaussian sees (B*K, G, d)."""
+        side = (self.input_size, self.input_size)
+        enc = self.encoder(F.interpolate(image, size=side, mode="bilinear", align_corners=False))  # (B, C, s, s)
+        attn = attn.unflatten(2, side)  # (B, K, s, s)
         shape = mu.shape[:2]
         offsets = self.to_offsets(q).unflatten(-1, (N_POINTS, 2)).unflatten(0, shape)  # (B, K, G, M, 2)
         weights = self.to_weights(q).softmax(-1).unflatten(0, shape)  # (B, K, G, M)
