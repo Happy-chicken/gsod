@@ -3,8 +3,9 @@ batch of scenes at once.
 
     encode          view 0 -> DINO tokens (s x s)
     slot_attention  tokens -> background slot + K-1 object slots, their attention
-    pixel_decoder   one splatter image per slot: M Gaussians on every view-0 pixel along its
-                    ray, transparent where the slot is not
+    obj_decoder     one local Splatter Image per object slot, in a window around its attention:
+                    M Gaussians per window point along its ray, transparent where the slot is not
+    bg_decoder      background slot -> flat Gaussians on the floor (cannot draw objects)
     render          all Gaussians blended together; masks from the same blending
 
 Gaussians are decoded in view 0's scene frame (utils/geometry.py; floor z = 0). Slot 0 is the
@@ -14,10 +15,11 @@ background.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.encoders import DinoEncoder
-from gsod.model.pixel_decoder import PixelDecoder
+from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -32,7 +34,7 @@ class GSODModel(nn.Module):
         z_dim: int,
         num_slots: int,
         attn_iter: int,
-        gaussians_per_pixel: int,
+        gaussians_per_point: int,
         decoder_hidden_dim: int,
         focal_ratio: tuple[float, float],
         near: float,
@@ -47,14 +49,16 @@ class GSODModel(nn.Module):
 
         self.encoder = DinoEncoder(z_dim, input_size)
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
-        self.pixel_decoder = PixelDecoder(z_dim, decoder_hidden_dim, gaussians_per_pixel, image_size, focal_ratio)
+        self.obj_decoder = ObjectDecoder(z_dim, decoder_hidden_dim, gaussians_per_point, image_size, focal_ratio)
+        self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
         return {
             "Encoder": self.encoder,
             "SlotAttention": self.slot_attention,
-            "PixelDecoder": self.pixel_decoder,
+            "ObjDecoder": self.obj_decoder,
+            "BgDecoder": self.bg_decoder,
         }
 
     def render(
@@ -92,9 +96,18 @@ class GSODModel(nn.Module):
         tokens = self.encoder(images[:, 0]).flatten(2).transpose(1, 2)  # (B, s*s, C)
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
-        slots = torch.cat([bg_slot[:, None], slots], 1)
-        gaussians, owner = self.pixel_decoder(slots, images[:, 0], frame)
-        return to_world(gaussians, frame), owner, attn
+        small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
+        colours = small.flatten(2).transpose(1, 2)  # token colours
+        floor = to_world(self.bg_decoder(bg_slot, attn[:, 0], colours, frame), frame, rotate=False)  # (B, M, ...)
+        objects = to_world(self.obj_decoder(slots, attn[:, 1:], images[:, 0], frame), frame)  # (B, K-1, G, ...)
+
+        # Every Gaussian, objects first, and its slot (0 = background).
+        b, n_obj, n_gauss = objects["mu"].shape[:3]
+        gaussians = {name: torch.cat([objects[name].flatten(1, 2), floor[name]], 1) for name in floor}
+        slot = torch.arange(1, n_obj + 1, device=images.device).repeat_interleave(n_gauss)
+        slot = F.pad(slot, (0, floor["mu"].shape[1]))
+        owner = F.one_hot(slot, n_obj + 1).to(images.dtype).expand(b, -1, -1)  # (B, N, K)
+        return gaussians, owner, attn
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
         """images (B, V, 3, H, W) in [0, 1], cam2world (B, V, 4, 4) -> render outputs (B, ...) and attention."""

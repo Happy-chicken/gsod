@@ -255,7 +255,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-dim", type=int, default=None)
     parser.add_argument("--num-slots", type=int, default=None)
     parser.add_argument("--attn-iter", type=int, default=None)
-    parser.add_argument("--gaussians-per-pixel", type=int, default=None)
+    parser.add_argument("--gaussians-per-point", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--late-start", type=float, default=None, help="LPIPS from this fraction on")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
@@ -294,9 +294,9 @@ def main() -> None:
     torch._inductor.config.fallback_random = True
     # Room for every compiled variant (bg / object slots, train / eval, grad / no grad, batch sizes).
     torch._dynamo.config.cache_size_limit = 64
-    for net in (model.slot_attention, model.pixel_decoder):
+    for net in (model.slot_attention, model.obj_decoder, model.bg_decoder):
         net.compile()
-    model.pixel_decoder.encoder.forward = torch.compiler.disable(model.pixel_decoder.encoder.forward)  # U-Net
+    model.obj_decoder.encoder.forward = torch.compiler.disable(model.obj_decoder.encoder.forward)  # U-Net
     train(model, cfg, resume=args.resume)
 
 

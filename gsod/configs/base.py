@@ -24,7 +24,7 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    gaussians_per_pixel: int = 2  # the first on the visible surface, the others free to reach the hidden side
+    gaussians_per_point: int = 2  # per object window point: the first on the surface, the others free
     decoder_hidden_dim: int = 128
     near: float = 0.1
 
