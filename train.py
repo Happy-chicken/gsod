@@ -33,7 +33,6 @@ from gsod.eval.evaluate import (
 )
 from gsod.eval.visualize import WANDB_PROJECT, wandb_images, wandb_slot_table
 from gsod.model import build_model
-from gsod.model.discriminator import BETAS, LR, R1_EVERY, Discriminator, crops, d_loss, g_loss, r1_penalty
 from gsod.model.gsod import GSODModel
 from gsod.model.losses import GSODLoss
 from gsod.utils.io import latest_run_dir, load_networks, save_networks
@@ -69,11 +68,6 @@ class GSODTraining(L.LightningModule):
         self.start_epoch = start_epoch
         self.best_psnr = best_psnr
         self.rng = random.Random(cfg.seed)
-        # Training only: does a 64 x 64 crop of a view look real? (cfg.loss.gan = 0: no GAN.)
-        self.discriminator = Discriminator() if cfg.loss.gan > 0 else None
-        self.d_steps = 0
-        # Without GAN: Lightning's own loop. With GAN: model step, then discriminator step, by hand.
-        self.automatic_optimization = self.discriminator is None
 
     @property
     def epoch(self) -> int:
@@ -87,22 +81,17 @@ class GSODTraining(L.LightningModule):
             opt,
             lambda i: _lr_factor(self.cfg, (start + i + 1) / self.steps_per_epoch),
         )
-        opts = [opt]
-        if self.discriminator is not None:
-            opts.append(torch.optim.Adam(self.discriminator.parameters(), lr=LR, betas=BETAS))
-        return opts, [{"scheduler": schedule, "interval": "step"}]
+        return [opt], [{"scheduler": schedule, "interval": "step"}]
 
     def on_fit_start(self) -> None:
         if self.resume is not None:
-            load_networks(
-                str(self.out), self.resume, self._extra_networks(), self.trainer.optimizers, device=self.device
-            )
+            load_networks(str(self.out), self.resume, {}, self.trainer.optimizers, device=self.device)
 
     def on_train_start(self) -> None:
         if self.resume is None:
             self._validate(0)  # the untrained model, as a baseline
 
-    def training_step(self, item: dict, batch_idx: int) -> torch.Tensor | None:
+    def training_step(self, item: dict, batch_idx: int) -> torch.Tensor:
         images, cams = item["images"], item["cam2world"]  # (B, V, ...)
         n_views = images.shape[1]
         orders = []
@@ -112,67 +101,20 @@ class GSODTraining(L.LightningModule):
         orders = torch.tensor(orders, device=images.device)
         images = torch.stack([x[o] for x, o in zip(images, orders)])
         cams = torch.stack([x[o] for x, o in zip(cams, orders)])
-        # Batches seen (global_step counts both optimisers' steps). Noise annealed by scenes seen.
+        # Batches seen. Noise annealed by scenes seen.
         step = (self.start_epoch + self.current_epoch) * self.steps_per_epoch + batch_idx
         self.model.slot_attention.anneal(step * self.cfg.batch_scenes)
         outputs = self.model(images, cams)
         progress = step / (self.cfg.epochs * self.steps_per_epoch)
         loss, terms = self.criterion(outputs, images, progress)
-        if self.discriminator is None:
-            self._log(terms)
-            return loss  # Lightning steps (clipping in on_before_optimizer_step)
-        self._gan_step(loss, terms, outputs["rgb"], images, progress)
-        self._log(terms)
-
-    def on_before_optimizer_step(self, optimizer) -> None:
-        if self.automatic_optimization:
-            self.log("train/grad_norm", self._clip_grads(), batch_size=1)
-
-    def _clip_grads(self) -> torch.Tensor:
-        """Clip the model's gradients; the norm before clipping (one GPU op, no sync)."""
-        max_norm = self.cfg.grad_clip if self.cfg.grad_clip > 0 else float("inf")
-        return torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-
-    def _log(self, terms: dict) -> None:
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
+        return loss
 
-    def _gan_step(self, loss, terms: dict, renders, images, progress: float) -> None:
-        """Model step (+ GAN term), then discriminator step, on crops of every view: the
-        discriminator from late_start, the model's term gan_delay later."""
-        gan_on = progress >= self.cfg.loss.late_start
-        if gan_on:
-            fake, real = crops(renders, images)
-            if progress >= self.cfg.loss.late_start + self.cfg.loss.gan_delay:
-                terms["gan_g"] = g_loss(self.discriminator, fake)
-                loss = loss + self.cfg.loss.gan * terms["gan_g"]
-                terms["gan_g"] = terms["gan_g"].detach()
-
-        opts = self.optimizers()
-        opts[0].zero_grad(set_to_none=True)
-        self.manual_backward(loss)
-        terms["grad_norm"] = self._clip_grads()
-        opts[0].step()
-        self.lr_schedulers().step()
-
-        # Discriminator step on the detached renders; every R1_EVERY steps an extra R1 step.
-        if gan_on:
-            d = d_loss(self.discriminator, real, fake)
-            opts[1].zero_grad(set_to_none=True)
-            self.manual_backward(d.pop("loss"))
-            opts[1].step()
-            terms.update(d)
-            if self.d_steps % R1_EVERY == 0:
-                penalty = r1_penalty(self.discriminator, real)
-                opts[1].zero_grad(set_to_none=True)
-                self.manual_backward(self.cfg.loss.gan_r1 * penalty)
-                opts[1].step()
-                terms["gan_r1"] = penalty.detach()
-            self.d_steps += 1
-
-    def _extra_networks(self) -> dict:
-        """Training-only networks saved next to the model's."""
-        return {} if self.discriminator is None else {"Discriminator": self.discriminator}
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Clip the model's gradients; log the norm before clipping (one GPU op, no sync)."""
+        max_norm = self.cfg.grad_clip if self.cfg.grad_clip > 0 else float("inf")
+        self.log("train/grad_norm", torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm), batch_size=1)
 
     def on_train_epoch_end(self) -> None:
         epoch = self.epoch + 1  # this epoch is done
@@ -212,9 +154,7 @@ class GSODTraining(L.LightningModule):
 
     def _save(self, suffix: str, epoch: int) -> None:
         """epoch: epochs done (where --resume starts)."""
-        save_networks(
-            str(self.out), suffix, {**self.model.networks(), **self._extra_networks()}, self.trainer.optimizers
-        )
+        save_networks(str(self.out), suffix, self.model.networks(), self.trainer.optimizers)
         (self.out / f"{suffix}_state.json").write_text(json.dumps({"epoch": epoch, "best_psnr": self.best_psnr}))
 
 
@@ -318,9 +258,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--box", type=float, default=None, help="box size penalty weight; 0 = off")
-    parser.add_argument("--late-start", type=float, default=None, help="LPIPS, box and GAN from this fraction on")
-    parser.add_argument("--gan", type=float, default=None, help="GAN loss weight; 0 = off")
-    parser.add_argument("--gan-r1", type=float, default=None, help="lazy R1 weight of the discriminator")
+    parser.add_argument("--late-start", type=float, default=None, help="LPIPS and box from this fraction on")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
@@ -343,7 +281,7 @@ def main() -> None:
         values["data_root"] = args.data
     if args.out is not None:
         values["out_dir"] = args.out
-    loss = {k: getattr(args, k) for k in ("box", "late_start", "gan", "gan_r1") if getattr(args, k) is not None}
+    loss = {k: getattr(args, k) for k in ("box", "late_start") if getattr(args, k) is not None}
     values["loss"] = replace(cfg.loss, **loss)
     cfg = replace(cfg, **values)
 
