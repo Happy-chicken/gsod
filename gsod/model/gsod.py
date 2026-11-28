@@ -102,12 +102,11 @@ class GSODModel(nn.Module):
         self, objects: dict[str, torch.Tensor], floor: dict[str, torch.Tensor], cam2world: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         """World object and floor Gaussians rendered into cam2world (B, V, 4, 4):
-        all sorted and blended together (2DGS); per-slot masks from the same blending; the 2DGS
-        geometry terms per scene: normal error (rendered vs depth normals) and depth distortion."""
+        all sorted and blended together; per-slot masks from the same blending."""
         b, n_obj, n_gauss = objects["mu"].shape[:3]
         every = self.merge(objects, floor)
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
-        out = splat(every, *cams, geometry=True)
+        out = splat(every, *cams)
         image = out["rgb"]
 
         # Decomposition from the same blending (no gradient): per-slot weights
@@ -135,8 +134,6 @@ class GSODModel(nn.Module):
             "bg_rgb": bg_rgb,  # the floor alone
             "slot_alpha": weights,  # (B, V, K, H, W), 0 = background
             "mask_idx": weights.argmax(dim=2),  # (B, V, H, W)
-            "normal_error": (1.0 - (out["normal"] * out["depth_normal"]).sum(2)).mean((1, 2, 3)),  # (B,)
-            "distortion": out["distortion"].mean((1, 2, 3, 4)),  # (B,)
         }
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
