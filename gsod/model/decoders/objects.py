@@ -7,7 +7,8 @@ from the slot alone (no image, so the grouping matters); the lifter (lifter.py) 
              Gaussians from BACKGROUND_THICKNESS up, above the floor's
 2. window    the box's view-0 projection (a square around it), WINDOW x WINDOW pixels; no
              gradient (only where to look)
-3. q         per window pixel: MLP(slot, PE(the pixel in the window)), no image
+3. q         per window pixel: a U-Net (SongUNet-like, as Splatter Image's) on the window's
+             positional encoding, FiLM-conditioned on the slot; no image
 4. decode    q -> one Gaussian per window pixel, as in Splatter Image:
                depth    sigmoid over the ray's stretch inside the box [t_in, t_out] (Splatter
                         Image: [znear, zfar]); rays missing the box draw nothing
@@ -21,6 +22,8 @@ Box sizes and shifts unbounded; BOX_INIT only sets where they start. Scene frame
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +41,8 @@ WINDOW = 48  # window pixels per side
 WINDOW_MARGIN, MIN_HALF = 1.1, 0.04  # window half side: this x the box's, at least this x the image
 NEAR = 1e-3  # box stretches start at least this far along the ray
 PE_BANDS = 8
+# U-Net: channels per level, blocks per level, attention level (12 x 12), dropout.
+UNET_CHANNELS, UNET_BLOCKS, UNET_ATTENTION, DROPOUT = (64, 128, 128, 128), 2, 2, 0.1
 SCALE_POINT = 0.5  # initial size: this fraction of a window pixel's footprint
 # Per Gaussian: depth, offset (3), opacity, log scale (3), quat (4), rgb residual (3), sh1 (9).
 N_OUT = 24
@@ -99,6 +104,74 @@ class RegionHead(nn.Module):
         return anchor, BOX_INIT * torch.exp(raw[..., 2:])
 
 
+def _norm(c: int) -> nn.GroupNorm:
+    return nn.GroupNorm(min(32, c // 4), c)
+
+
+class Block(nn.Module):
+    """Residual block: norm, SiLU, conv; FiLM from the slot; norm, SiLU, dropout, conv; optional
+    self-attention."""
+
+    def __init__(self, c_in: int, c_out: int, d_emb: int, attention: bool):
+        super().__init__()
+        self.norm0, self.conv0 = _norm(c_in), nn.Conv2d(c_in, c_out, 3, padding=1)
+        self.film = nn.Linear(d_emb, 2 * c_out)
+        self.norm1, self.conv1 = _norm(c_out), nn.Conv2d(c_out, c_out, 3, padding=1)
+        self.skip = nn.Conv2d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
+        self.attention = nn.MultiheadAttention(c_out, 1, batch_first=True) if attention else None
+        self.norm2 = _norm(c_out) if attention else None
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv0(F.silu(self.norm0(x)))
+        scale, shift = self.film(emb)[..., None, None].chunk(2, 1)
+        h = F.silu(self.norm1(h) * (scale + 1) + shift)
+        h = self.conv1(F.dropout(h, DROPOUT, self.training))
+        x = (h + self.skip(x)) / math.sqrt(2)
+        if self.attention is not None:
+            t = self.norm2(x).flatten(2).transpose(1, 2)  # (N, HW, C)
+            x = (x + self.attention(t, t, t, need_weights=False)[0].transpose(1, 2).reshape_as(x)) / math.sqrt(2)
+        return x
+
+
+class UNet(nn.Module):
+    """Input map (N, c_in, S, S) + embedding (N, d_emb) -> per-pixel features (N, c_out, S, S)."""
+
+    def __init__(self, c_in: int, c_out: int, d_emb: int):
+        super().__init__()
+        c = UNET_CHANNELS
+        self.stem = nn.Conv2d(c_in, c[0], 3, padding=1)
+        self.down, self.up = nn.ModuleList(), nn.ModuleList()
+        c_prev, skips = c[0], []
+        for level, ch in enumerate(c):
+            for _ in range(UNET_BLOCKS):
+                self.down.append(Block(c_prev, ch, d_emb, level == UNET_ATTENTION))
+                c_prev = ch
+                skips.append(ch)
+        for level, ch in reversed(list(enumerate(c))):
+            for _ in range(UNET_BLOCKS):
+                self.up.append(Block(c_prev + skips.pop(), ch, d_emb, level == UNET_ATTENTION))
+                c_prev = ch
+        self.out = nn.Sequential(_norm(c_prev), nn.SiLU(), nn.Conv2d(c_prev, c_out, 1))
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        x, skips, i = self.stem(x), [], 0
+        for level in range(len(UNET_CHANNELS)):
+            if level > 0:
+                x = F.avg_pool2d(x, 2)
+            for _ in range(UNET_BLOCKS):
+                x = self.down[i](x, emb)
+                skips.append(x)
+                i += 1
+        i = 0
+        for level in reversed(range(len(UNET_CHANNELS))):
+            for _ in range(UNET_BLOCKS):
+                x = self.up[i](torch.cat([x, skips.pop()], 1), emb)
+                i += 1
+            if level > 0:
+                x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.out(x)
+
+
 class ObjectDecoder(nn.Module):
     """Object slots + their attention -> sketch Gaussians (B, K, WINDOW*WINDOW, ...), boxes and the
     state for decode() (a refined q)."""
@@ -108,9 +181,8 @@ class ObjectDecoder(nn.Module):
         d = hidden_dim
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
         self.region = RegionHead(z_dim)
-        self.from_slot = nn.Linear(z_dim, d)
-        self.from_point = nn.Linear(2 + 4 * PE_BANDS, d)
-        self.hidden = nn.Sequential(nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True), nn.Linear(d, d))
+        self.embed = nn.Sequential(nn.Linear(z_dim, d), nn.SiLU(), nn.Linear(d, d))
+        self.unet = UNet(2 + 4 * PE_BANDS, d, d)  # positional encoding in, q out
         self.head = nn.Sequential(nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True), nn.Linear(d, N_OUT))
         with torch.no_grad():
             out = self.head[-1]
@@ -155,8 +227,10 @@ class ObjectDecoder(nn.Module):
         rays = self.rays(points.flatten(1, 2), frame).unflatten(1, (k, n_points))  # (B, K, P, 3)
         t_in, t_out, hit = self.box_stretch(rays, anchor, extent, frame)  # (B, K, P)
 
-        # 3. q per window pixel, from the slot alone.
-        q = self.hidden(self.from_slot(slots)[:, :, None] + self.from_point(positional_encoding(local, PE_BANDS)))
+        # 3. q per window pixel, from the slot alone: a U-Net on the window's positions.
+        pe = positional_encoding(local, PE_BANDS).T.unflatten(1, (WINDOW, WINDOW))  # (D, WINDOW, WINDOW)
+        emb = self.embed(slots).flatten(0, 1)  # (B*K, d)
+        q = self.unet(pe.expand(emb.shape[0], -1, -1, -1), emb).flatten(2).transpose(1, 2)  # (B*K, P, d)
         state = {
             "rays": rays,
             "t_in": t_in,
@@ -165,7 +239,7 @@ class ObjectDecoder(nn.Module):
             "spacing": 2 * half / WINDOW,  # (B, K) window pixel width, image pixels
             "colour": colour,
             "presence": (attn.mean(-1) / AREA_FULL).clamp(max=1.0),  # (B, K)
-            "q": q.flatten(0, 1),  # (B*K, P, d)
+            "q": q,  # (B*K, P, d)
             "frame": frame,
         }
         gaussians = self.decode(state["q"], state)
