@@ -11,9 +11,12 @@
                depth    sigmoid over the ray's stretch inside the box [t_in, t_out] (Splatter
                         Image: [znear, zfar]); rays missing the box draw nothing
                offset   raw, camera frame
-               opacity  sigmoid;  scale  exp;  rotation  unit quaternion in the camera frame
-               colour   SH: DC raw, degree 1 in the camera frame
-             so every Gaussian centre (before the offset) lies in the box.
+               opacity  sigmoid;  scale  exp x the pixel's footprint
+               rotation unit quaternion in the camera frame
+               colour   the window pixel's colour + a residual; SH degree 1 in the camera frame
+             so every Gaussian centre (before the offset) lies in the box. Unlike Splatter Image,
+             colour, opacity and scale start visible (pixel colour, 0.5, pixel-sized), so the
+             objects are not outdone by the floor at first.
 Box sizes and shifts unbounded; BOX_INIT only sets where they start. Scene frame.
 """
 
@@ -26,9 +29,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.background import BACKGROUND_THICKNESS, FLOOR_HALF
-from gsod.model.layers import mlp
+from gsod.model.layers import mlp, shift_colour
 from gsod.utils.geometry import SceneFrame, camera_directions, matrix_to_quat, quat_mul, rotate_sh1
-from gsod.utils.splatter import SH_C0
 
 BOX_INIT = 0.25  # initial box half side (scene units)
 REGION_HIDDEN = 64
@@ -38,17 +40,18 @@ WINDOW_MARGIN, MIN_HALF = 1.1, 0.04  # window half side: this x the box's, at le
 NEAR = 1e-3  # box stretches start at least this far along the ray
 # U-Net (SongUNet-like, Splatter Image's backbone): channels per level, blocks per level, attention level.
 UNET_CHANNELS, UNET_BLOCKS, UNET_ATTENTION, DROPOUT = (64, 128, 128, 128), 2, 2, 0.1
-# Per Gaussian, as in Splatter Image: depth, offset (3), opacity, log scale (3), quat (4), SH DC (3), sh1 (9).
+SCALE_POINT = 0.5  # initial size: this fraction of a window pixel's footprint
+# Per Gaussian: depth, offset (3), opacity, log scale (3), quat (4), rgb residual (3), sh1 (9).
 N_OUT = 24
-# Output layer init per slice: (xavier gain, bias). Splatter Image's chairs config.
-SCALE_INIT = 0.01  # scene units
+# Output layer init per slice: (xavier gain, bias). Splatter Image's chairs config, but colour
+# (zero residual), opacity (0.5) and scale (pixel-sized) start visible.
 OUT_INIT = {
     "depth": (slice(0, 1), 1.0, 0.0),
     "offset": (slice(1, 4), 1e-3, 0.0),
-    "opacity": (slice(4, 5), 1e-3, -2.0),
-    "scale": (slice(5, 8), 1e-3, math.log(SCALE_INIT)),
+    "opacity": (slice(4, 5), 1e-3, 0.0),
+    "scale": (slice(5, 8), 1e-3, 0.0),
     "quat": (slice(8, 12), 1.0, 0.0),
-    "dc": (slice(12, 15), 5.0, 0.0),
+    "rgb": (slice(12, 15), 0.0, 0.0),
     "sh1": (slice(15, 24), 0.0, 0.0),
 }
 
@@ -231,7 +234,8 @@ class ObjectDecoder(nn.Module):
 
         maps = crop(attn.unflatten(2, (side, side)))  # (B, K windows, K maps, WINDOW, WINDOW)
         own = maps[:, torch.arange(k), torch.arange(k)][:, :, None]  # each slot's map in its window
-        window = torch.cat([crop(image), own], 2).flatten(0, 1)  # (B*K, 4, WINDOW, WINDOW)
+        rgb = crop(image)  # (B, K, 3, WINDOW, WINDOW)
+        window = torch.cat([rgb, own], 2).flatten(0, 1)  # (B*K, 4, WINDOW, WINDOW)
 
         # 3. Splatter Image on the window, conditioned on the slot.
         raw = self.unet(window, self.embed(slots).flatten(0, 1))  # (B*K, M*N_OUT, WINDOW, WINDOW)
@@ -245,12 +249,14 @@ class ObjectDecoder(nn.Module):
         rot = frame.rot[:, None, None, None]  # camera -> scene frame
         offset = (rot @ raw[..., 1:4, None])[..., 0]
         cam_quat = matrix_to_quat(frame.rot)[:, None, None, None].expand(*raw.shape[:4], 4)
+        footprint = depth * (2 * half / WINDOW)[..., None, None] / (w * self.focal_ratio[0])  # a window pixel's width
+        colour = rgb.flatten(3).transpose(2, 3)[..., None, :]  # (B, K, P, 1, 3)
         gaussians = {
             "mu": frame.origin[:, None, None, None] + depth[..., None] * rays[..., None, :] + offset,
-            "scale": torch.exp(raw[..., 5:8]),
+            "scale": SCALE_POINT * footprint[..., None] * torch.exp(raw[..., 5:8]),
             "quat": quat_mul(cam_quat, F.normalize(raw[..., 8:12], dim=-1)),
             "opacity": torch.sigmoid(raw[..., 4]) * hit[..., None],
-            "rgb": 0.5 + SH_C0 * raw[..., 12:15],  # DC
+            "rgb": shift_colour(colour, raw[..., 12:15]),
             "sh1": rotate_sh1(raw[..., 15:].unflatten(-1, (3, 3)).flatten(1, 3), frame.rot),
         }
         gaussians["sh1"] = gaussians["sh1"].unflatten(1, raw.shape[1:4])
