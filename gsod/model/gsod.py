@@ -3,8 +3,9 @@ batch of scenes at once.
 
     encode          view 0 -> DINO tokens (s x s)
     slot_attention  tokens -> background slot + K-1 object slots, their attention
-    obj_decoder     per object slot a box on the floor and a Splatter Image of view 0 inside it:
-                    Gaussians on the window pixels' rays, within the box
+    obj_decoder     per object slot a box on the floor and a sketch in it from the slot alone:
+                    one Gaussian per pixel of the box's view-0 window, on its ray, within the box
+    lifter          each sketch Gaussian reads view 0 around its pixel -> refined q, decoded again
     bg_decoder      background slot -> flat Gaussians on the floor (cannot draw objects)
     render          all Gaussians blended together; masks from the same blending
 
@@ -21,6 +22,7 @@ from torch import nn
 from gsod.model.encoders import DinoEncoder
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
+from gsod.model.lifter import PixelLifter
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -35,7 +37,6 @@ class GSODModel(nn.Module):
         z_dim: int,
         num_slots: int,
         attn_iter: int,
-        gaussians_per_point: int,
         decoder_hidden_dim: int,
         focal_ratio: tuple[float, float],
         near: float,
@@ -50,8 +51,9 @@ class GSODModel(nn.Module):
 
         self.encoder = DinoEncoder(z_dim, input_size)
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
-        self.obj_decoder = ObjectDecoder(z_dim, decoder_hidden_dim, gaussians_per_point, image_size, focal_ratio)
+        self.obj_decoder = ObjectDecoder(z_dim, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
+        self.lifter = PixelLifter(z_dim, decoder_hidden_dim, input_size, image_size, focal_ratio)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -60,7 +62,13 @@ class GSODModel(nn.Module):
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
+            "PixelLifter": self.lifter,
         }
+
+    @staticmethod
+    def merge(objects: dict[str, torch.Tensor], floor: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Object (B, K-1, G, ...) and floor (B, M, ...) Gaussians -> every Gaussian (B, N, ...), objects first."""
+        return {name: torch.cat([objects[name].flatten(1, 2), floor[name]], 1) for name in floor}
 
     def render(
         self, gaussians: dict[str, torch.Tensor], owner: torch.Tensor, cam2world: torch.Tensor
@@ -92,18 +100,21 @@ class GSODModel(nn.Module):
             "mask_idx": weights.argmax(dim=2),  # (B, V, H, W)
         }
 
-    def decode(self, images: torch.Tensor, cam2world: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, dict]:
-        """View 0 -> world Gaussians (B, N, ...), their slot one-hot (B, N, K), attention (B, K, s*s)
-        and the boxes {"extent" (B, K-1, 3, scene frame), "box" (B, K-1, 8, 3) world corners,
-        "anchor_init" (B, K-1, 3) world}."""
+    def decode(
+        self, images: torch.Tensor, cam2world: torch.Tensor
+    ) -> tuple[dict, torch.Tensor, torch.Tensor, dict, dict]:
+        """View 0 -> world Gaussians (B, N, ...), their slot one-hot (B, N, K), attention (B, K, s*s),
+        the boxes {"extent" (B, K-1, 3, scene frame), "box" (B, K-1, 8, 3) world corners,
+        "anchor_init" (B, K-1, 3) world} and the sketch (B, N, ...), before the lifter."""
         tokens = self.encoder(images[:, 0]).flatten(2).transpose(1, 2)  # (B, s*s, C)
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)  # token colours
         floor = to_world(self.bg_decoder(bg_slot, attn[:, 0], colours, frame), frame, rotate=False)  # (B, M, ...)
-        objects, box = self.obj_decoder(slots, attn[:, 1:], images[:, 0], frame)
-        objects = to_world(objects, frame)  # (B, K-1, G, ...)
+        sketch, box, state = self.obj_decoder(slots, attn[:, 1:], colours, frame)  # from the slots alone
+        q = self.lifter(state["q"], state["mu"], images[:, 0], attn[:, 1:], frame)  # + what each Gaussian sees
+        objects = to_world(self.obj_decoder.decode(q, state), frame)  # (B, K-1, G, ...)
         box = {
             "extent": box["extent"],
             "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
@@ -112,15 +123,17 @@ class GSODModel(nn.Module):
 
         # Every Gaussian, objects first, and its slot (0 = background).
         b, n_obj, n_gauss = objects["mu"].shape[:3]
-        gaussians = {name: torch.cat([objects[name].flatten(1, 2), floor[name]], 1) for name in floor}
+        gaussians = self.merge(objects, floor)
         slot = torch.arange(1, n_obj + 1, device=images.device).repeat_interleave(n_gauss)
         slot = F.pad(slot, (0, floor["mu"].shape[1]))
         owner = F.one_hot(slot, n_obj + 1).to(images.dtype).expand(b, -1, -1)  # (B, N, K)
-        return gaussians, owner, attn, box
+        return gaussians, owner, attn, box, self.merge(to_world(sketch, frame), floor)
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
         """images (B, V, 3, H, W) in [0, 1], cam2world (B, V, 4, 4) -> render outputs (B, ...) and attention."""
-        gaussians, owner, attn, box = self.decode(images, cam2world)
+        gaussians, owner, attn, box, sketch = self.decode(images, cam2world)
         out = self.render(gaussians, owner, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
+        cams = (cam2world, self.image_size, self.focal_ratio, self.near)
+        out["rgb_pre"] = splat(sketch, *cams)["rgb"]  # the sketch: auxiliary loss, panels
         return out

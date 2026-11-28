@@ -59,7 +59,7 @@ def psnr(a: torch.Tensor, b: torch.Tensor) -> list[float]:
 def run(model, images: torch.Tensor, cams: torch.Tensor) -> tuple[dict, dict, torch.Tensor]:
     """One scene -> the model's render outputs, its world Gaussians (1, N, ...) and owners (1, N, K)."""
     with torch.no_grad():
-        gaussians, owner, _, _ = model.decode(images[None], cams[None])
+        gaussians, owner, *_ = model.decode(images[None], cams[None])
         return model.render(gaussians, owner, cams[None]), gaussians, owner
 
 

@@ -210,7 +210,7 @@ def main() -> None:
     for i in range(min(args.scenes, len(dataset))):
         item = dataset[i]
         with torch.no_grad():
-            gaussians, owner, _, _ = model.decode(item["images"].to(device)[None], item["cam2world"].to(device)[None])
+            gaussians, owner, *_ = model.decode(item["images"].to(device)[None], item["cam2world"].to(device)[None])
         scene = int(item.get("scene", i))
         export_gaussians(out / f"sc{scene:04d}", gaussians, owner, min_opacity=args.min_opacity)
     print(f"wrote {out}/sc####/{{scene,background,slot*}}.ply")

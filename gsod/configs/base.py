@@ -16,6 +16,7 @@ class LossConfig:
     lpips: float = 0.05  # LPIPS (VGG); 0 = off
     late_start: float = 0.3  # LPIPS and box from this fraction of training on
     box: float = 0.005  # mean box half size (keeps boxes tight)
+    refine_aux: float = 0.5  # MSE + SSIM terms on the sketch (before the lifter)
 
 
 @dataclass
@@ -25,7 +26,6 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    gaussians_per_point: int = 1  # Gaussians per object window pixel (Splatter Image: 1)
     decoder_hidden_dim: int = 128
     near: float = 0.1
 
