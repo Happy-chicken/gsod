@@ -3,8 +3,8 @@ batch of scenes at once.
 
     encode          view 0 -> DINO tokens (s x s)
     slot_attention  tokens -> background slot + K-1 object slots, their attention
-    obj_decoder     one local Splatter Image per object slot, in a window around its attention:
-                    M Gaussians per window point along its ray, transparent where the slot is not
+    obj_decoder     per object slot a box on the floor and a Splatter Image of view 0 inside it:
+                    Gaussians on the window pixels' rays, within the box
     bg_decoder      background slot -> flat Gaussians on the floor (cannot draw objects)
     render          all Gaussians blended together; masks from the same blending
 
@@ -20,8 +20,9 @@ from torch import nn
 
 from gsod.model.encoders import DinoEncoder
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
+from gsod.model.decoders.objects import box_corners
 from gsod.model.slot_attention import SlotAttention
-from gsod.utils.geometry import scene_frame, to_world
+from gsod.utils.geometry import points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
 
 
@@ -91,15 +92,23 @@ class GSODModel(nn.Module):
             "mask_idx": weights.argmax(dim=2),  # (B, V, H, W)
         }
 
-    def decode(self, images: torch.Tensor, cam2world: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor]:
-        """View 0 -> world Gaussians (B, N, ...), their slot one-hot (B, N, K), attention (B, K, s*s)."""
+    def decode(self, images: torch.Tensor, cam2world: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, dict]:
+        """View 0 -> world Gaussians (B, N, ...), their slot one-hot (B, N, K), attention (B, K, s*s)
+        and the boxes {"extent" (B, K-1, 3, scene frame), "box" (B, K-1, 8, 3) world corners,
+        "anchor_init" (B, K-1, 3) world}."""
         tokens = self.encoder(images[:, 0]).flatten(2).transpose(1, 2)  # (B, s*s, C)
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)  # token colours
         floor = to_world(self.bg_decoder(bg_slot, attn[:, 0], colours, frame), frame, rotate=False)  # (B, M, ...)
-        objects = to_world(self.obj_decoder(slots, attn[:, 1:], images[:, 0], frame), frame)  # (B, K-1, G, ...)
+        objects, box = self.obj_decoder(slots, attn[:, 1:], images[:, 0], frame)
+        objects = to_world(objects, frame)  # (B, K-1, G, ...)
+        box = {
+            "extent": box["extent"],
+            "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
+            "anchor_init": points_to_world(box["anchor_init"], frame),
+        }
 
         # Every Gaussian, objects first, and its slot (0 = background).
         b, n_obj, n_gauss = objects["mu"].shape[:3]
@@ -107,11 +116,11 @@ class GSODModel(nn.Module):
         slot = torch.arange(1, n_obj + 1, device=images.device).repeat_interleave(n_gauss)
         slot = F.pad(slot, (0, floor["mu"].shape[1]))
         owner = F.one_hot(slot, n_obj + 1).to(images.dtype).expand(b, -1, -1)  # (B, N, K)
-        return gaussians, owner, attn
+        return gaussians, owner, attn, box
 
     def forward(self, images: torch.Tensor, cam2world: torch.Tensor) -> dict:
         """images (B, V, 3, H, W) in [0, 1], cam2world (B, V, 4, 4) -> render outputs (B, ...) and attention."""
-        gaussians, owner, attn = self.decode(images, cam2world)
+        gaussians, owner, attn, box = self.decode(images, cam2world)
         out = self.render(gaussians, owner, cam2world)
-        out["attn"] = attn  # (B, K, s*s)
+        out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
         return out

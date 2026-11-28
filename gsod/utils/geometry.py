@@ -81,6 +81,17 @@ def quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     )
 
 
+def matrix_to_quat(rot: torch.Tensor) -> torch.Tensor:
+    """Rotation matrices (..., 3, 3) -> wxyz quaternions (..., 4), w >= 0."""
+    m = rot.unbind(-1)  # columns
+    r = [[m[j][..., i] for j in range(3)] for i in range(3)]  # r[i][j] = rot[..., i, j]
+    w = 0.5 * (1.0 + r[0][0] + r[1][1] + r[2][2]).clamp_min(1e-8).sqrt()
+    x = 0.5 * (1.0 + r[0][0] - r[1][1] - r[2][2]).clamp_min(0).sqrt().copysign(r[2][1] - r[1][2])
+    y = 0.5 * (1.0 - r[0][0] + r[1][1] - r[2][2]).clamp_min(0).sqrt().copysign(r[0][2] - r[2][0])
+    z = 0.5 * (1.0 - r[0][0] - r[1][1] + r[2][2]).clamp_min(0).sqrt().copysign(r[1][0] - r[0][1])
+    return torch.stack([w, x, y, z], -1)
+
+
 def rotate_sh1(sh1: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
     """Degree-1 SH (..., M, 3, 3) rotated by rot (..., 3, 3) (coefficients as
     w = (-c3, -c1, c2))."""

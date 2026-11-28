@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw
 
 from gsod.eval.metrics import upsample_labels
 from gsod.utils.io import save_png
@@ -51,6 +52,37 @@ def _gray(hw: np.ndarray) -> np.ndarray:
     return np.repeat(g[..., None], 3, axis=-1)
 
 
+# Box corners: 0-3 bottom, 4-7 top.
+BOX_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+
+
+def draw_boxes(
+    image: np.ndarray, box: np.ndarray, anchor_init: np.ndarray, cam2world: np.ndarray, focal_ratio, slots: list[int]
+) -> np.ndarray:
+    """Image (H, W, 3), world box corners (K-1, 8, 3), anchor_init (K-1, 3) -> the
+    image with slot k's box in its mask colour, anchor_init (ring), anchor (dot)."""
+    h, w = image.shape[:2]
+    anchor = box[:, :4].mean(1, keepdims=True)  # bottom centre
+    points = np.concatenate([box, anchor_init[:, None], anchor], 1)  # (K-1, 10, 3)
+    # Project (pinhole, pixel centres at integers).
+    world2cam = np.linalg.inv(cam2world)
+    cam = points @ world2cam[:3, :3].T + world2cam[:3, 3]
+    uv = cam[..., :2] / cam[..., 2:] * [focal_ratio[0] * w, focal_ratio[1] * h] + [(w - 1) / 2, (h - 1) / 2]
+    canvas = Image.fromarray(image)
+    draw = ImageDraw.Draw(canvas)
+    for k in slots:
+        if (cam[k - 1, :, 2] <= 0).any():  # behind the camera
+            continue
+        p = [tuple(xy) for xy in uv[k - 1]]
+        colour = tuple(int(c) for c in PALETTE[(k - 1) % len(PALETTE)])
+        for i, j in BOX_EDGES:
+            draw.line([p[i], p[j]], fill=colour)
+        (x, y), (a, b) = p[8], p[9]
+        draw.ellipse([x - 3, y - 3, x + 3, y + 3], outline=colour)  # anchor_init
+        draw.ellipse([a - 2, b - 2, a + 2, b + 2], fill=colour, outline=(255, 255, 255))  # anchor
+    return np.asarray(canvas)
+
+
 def _slot_caption(row: dict) -> str:
     target = f" #{row['gt_object']}" if row["gt_object"] >= 0 else ""
     return f"s{row['slot']} {row['role']}{target} occ{row['occupancy']:.2f}"
@@ -62,10 +94,16 @@ def panels(rec: dict, rows: list[dict]) -> dict[str, dict[str, Tiles]]:
     gt = rec["gt"]
 
     def view(v: int) -> dict[str, Tiles]:
+        foreground = _rgb(rec["fg_rgb"][v])
+        if "box" in rec:  # boxes of the slots that draw something; ring = anchor_init, dot = anchor
+            shown = [row["slot"] for row in rows if row["role"] != "empty"]
+            foreground = draw_boxes(
+                foreground, rec["box"], rec["anchor_init"], rec["cam2world"][v], rec["focal_ratio"], shown
+            )
         images = [
             (_rgb(rec["target"][v]), "input"),
             (_rgb(rec["rgb"][v]), "render"),
-            (_rgb(rec["fg_rgb"][v]), "foreground"),
+            (foreground, "foreground"),
             (_rgb(rec["bg_rgb"][v]), "background"),
         ]
         if gt is not None:
