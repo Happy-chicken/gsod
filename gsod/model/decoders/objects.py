@@ -2,7 +2,8 @@
 
 1. box       anchor_init: the attention-weighted mean of where the view-0 token rays meet the
              floor. RegionHead(slot): anchor = anchor_init + a shift along / across the ray;
-             half sizes (ex, ey, ez); the box spans anchor +- (ex, ey), z in [0, 2 ez]
+             half sizes (ex, ey, ez); the box spans anchor +- (ex, ey), z in [0, 2 ez]; its
+             Gaussians from BACKGROUND_THICKNESS up, above the floor's
 2. window    the box's view-0 projection (a square around it), resampled to WINDOW x WINDOW;
              no gradient (only where to look)
 3. Gaussians a U-Net on the window [rgb, the slot's attention], FiLM-conditioned on the slot,
@@ -24,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gsod.model.decoders.background import FLOOR_HALF
+from gsod.model.decoders.background import BACKGROUND_THICKNESS, FLOOR_HALF
 from gsod.model.layers import mlp
 from gsod.utils.geometry import SceneFrame, camera_directions, matrix_to_quat, quat_mul, rotate_sh1
 from gsod.utils.splatter import SH_C0
@@ -266,7 +267,8 @@ class ObjectDecoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Rays (B, K, P, 3), each slot's box -> where each ray enters and leaves its box (camera
         depth, B, K, P) and whether it meets it at all (0 / 1)."""
-        lo = torch.cat([anchor - extent[..., :2], torch.zeros_like(extent[..., :1])], -1)[:, :, None]
+        bottom = torch.full_like(extent[..., :1], BACKGROUND_THICKNESS)  # above the floor's Gaussians
+        lo = torch.cat([anchor - extent[..., :2], bottom], -1)[:, :, None]
         hi = torch.cat([anchor + extent[..., :2], 2.0 * extent[..., 2:]], -1)[:, :, None]
         safe = torch.where(rays.abs() < 1e-6, torch.full_like(rays, 1e-6), rays)
         origin = frame.origin[:, None, None]
