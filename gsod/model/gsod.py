@@ -4,8 +4,8 @@ batch of scenes at once.
     encode          view 0 -> DINO tokens (s x s)
     slot_attention  tokens -> background slot + K-1 object slots, their attention
     obj_decoder     per object slot a box on the floor and a sketch in it from the slot alone:
-                    one Gaussian per pixel of the box's view-0 window, on its ray, within the box
-    lifter          each sketch Gaussian reads view 0 around its pixel -> refined q, decoded again
+                    one Gaussian per pixel of the box's view-0 window, on its ray, within the box;
+                    refined by a Splatter Image U-Net on the window
     bg_decoder      background slot -> flat Gaussians on the floor (cannot draw objects)
     render          all Gaussians blended together; masks from the same blending
 
@@ -22,7 +22,6 @@ from torch import nn
 from gsod.model.encoders import DinoEncoder
 from gsod.model.decoders import BackgroundDecoder, ObjectDecoder
 from gsod.model.decoders.objects import box_corners
-from gsod.model.lifter import PixelLifter
 from gsod.model.slot_attention import SlotAttention
 from gsod.utils.geometry import points_to_world, scene_frame, to_world
 from gsod.utils.splatter import splat
@@ -53,7 +52,6 @@ class GSODModel(nn.Module):
         self.slot_attention = SlotAttention(num_slots, z_dim, attn_iter)
         self.obj_decoder = ObjectDecoder(z_dim, decoder_hidden_dim, image_size, focal_ratio)
         self.bg_decoder = BackgroundDecoder(z_dim, decoder_hidden_dim)
-        self.lifter = PixelLifter(z_dim, decoder_hidden_dim, input_size, image_size, focal_ratio)
 
     def networks(self) -> dict[str, nn.Module]:
         """Named networks (checkpoint files)."""
@@ -62,7 +60,6 @@ class GSODModel(nn.Module):
             "SlotAttention": self.slot_attention,
             "ObjDecoder": self.obj_decoder,
             "BgDecoder": self.bg_decoder,
-            "PixelLifter": self.lifter,
         }
 
     @staticmethod
@@ -105,16 +102,15 @@ class GSODModel(nn.Module):
     ) -> tuple[dict, torch.Tensor, torch.Tensor, dict, dict]:
         """View 0 -> world Gaussians (B, N, ...), their slot one-hot (B, N, K), attention (B, K, s*s),
         the boxes {"extent" (B, K-1, 3, scene frame), "box" (B, K-1, 8, 3) world corners,
-        "anchor_init" (B, K-1, 3) world} and the sketch (B, N, ...), before the lifter."""
+        "anchor_init" (B, K-1, 3) world} and the sketch (B, N, ...), before refine."""
         tokens = self.encoder(images[:, 0]).flatten(2).transpose(1, 2)  # (B, s*s, C)
         frame = scene_frame(cam2world[:, 0], self.image_size, self.focal_ratio)
         bg_slot, slots, attn = self.slot_attention(tokens)
         small = F.interpolate(images[:, 0], size=self.input_size, mode="area")  # (B, 3, s, s)
         colours = small.flatten(2).transpose(1, 2)  # token colours
         floor = to_world(self.bg_decoder(bg_slot, attn[:, 0], colours, frame), frame, rotate=False)  # (B, M, ...)
-        sketch, box, state = self.obj_decoder(slots, attn[:, 1:], colours, frame)  # from the slots alone
-        q = self.lifter(state["q"], state["mu"], images[:, 0], attn[:, 1:], frame)  # + what each Gaussian sees
-        objects = to_world(self.obj_decoder.decode(q, state), frame)  # (B, K-1, G, ...)
+        objects, sketch, box = self.obj_decoder(slots, attn[:, 1:], colours, images[:, 0], frame)
+        objects = to_world(objects, frame)  # (B, K-1, G, ...)
         box = {
             "extent": box["extent"],
             "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),

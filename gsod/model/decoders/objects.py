@@ -1,5 +1,5 @@
-"""Object decoder: per object slot, a box on the floor and a Splatter-Image-style sketch inside it,
-from the slot alone (no image, so the grouping matters); the lifter (lifter.py) refines it.
+"""Object decoder: per object slot, a box on the floor, a Splatter-Image-style sketch inside it from
+the slot alone (no image, so the grouping matters), refined by a Splatter Image U-Net on view 0.
 
 1. box       anchor_init: the attention-weighted mean of where the view-0 token rays meet the
              floor. RegionHead(slot): anchor = anchor_init + a shift along / across the ray;
@@ -7,9 +7,9 @@ from the slot alone (no image, so the grouping matters); the lifter (lifter.py) 
              Gaussians from BACKGROUND_THICKNESS up, above the floor's
 2. window    the box's view-0 projection (a square around it), WINDOW x WINDOW pixels; no
              gradient (only where to look)
-3. q         per window pixel: a U-Net (SongUNet-like, as Splatter Image's) on the window's
-             positional encoding, FiLM-conditioned on the slot; no image
-4. decode    q -> one Gaussian per window pixel, as in Splatter Image:
+3. sketch    q per window pixel: a U-Net (SongUNet-like, as Splatter Image's) on the window's
+             positional encoding, FiLM-conditioned on the slot; no image. A head turns q into
+             one Gaussian per window pixel, as in Splatter Image:
                depth    sigmoid over the ray's stretch inside the box [t_in, t_out] (Splatter
                         Image: [znear, zfar]); rays missing the box draw nothing
                offset   camera frame;  rotation  unit quaternion in the camera frame
@@ -17,7 +17,9 @@ from the slot alone (no image, so the grouping matters); the lifter (lifter.py) 
                colour   the slot's colour + a residual; SH degree 1 in the camera frame
                opacity  sigmoid, per slot a share of its brightest x presence (attention area /
                         AREA_FULL, at most 1)
-             The lifter adds what each Gaussian sees in view 0 to its q; decode again.
+4. refine    Splatter Image proper: a U-Net on the window's [rgb, the slot's attention, q],
+             FiLM-conditioned on the slot, adds a residual to each Gaussian's parameters (zero at
+             first). The sketch keeps an auxiliary loss, so the slot must still draw its object.
 Box sizes and shifts unbounded; BOX_INIT only sets where they start. Scene frame.
 """
 
@@ -173,8 +175,8 @@ class UNet(nn.Module):
 
 
 class ObjectDecoder(nn.Module):
-    """Object slots + their attention -> sketch Gaussians (B, K, WINDOW*WINDOW, ...), boxes and the
-    state for decode() (a refined q)."""
+    """Object slots + their attention + view 0 -> sketch and refined Gaussians (B, K, WINDOW*WINDOW, ...)
+    and boxes."""
 
     def __init__(self, z_dim: int, hidden_dim: int, image_size: tuple[int, int], focal_ratio: tuple[float, float]):
         super().__init__()
@@ -182,8 +184,9 @@ class ObjectDecoder(nn.Module):
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
         self.region = RegionHead(z_dim)
         self.embed = nn.Sequential(nn.Linear(z_dim, d), nn.SiLU(), nn.Linear(d, d))
-        self.unet = UNet(2 + 4 * PE_BANDS, d, d)  # positional encoding in, q out
+        self.sketch = UNet(2 + 4 * PE_BANDS, d, d)  # the window's positions in, q out
         self.head = nn.Sequential(nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True), nn.Linear(d, N_OUT))
+        self.refine = UNet(3 + 1 + d, N_OUT, d)  # the window's [rgb, ownership, q] in, parameter residuals out
         with torch.no_grad():
             out = self.head[-1]
             for part, gain, value in OUT_INIT.values():
@@ -192,15 +195,17 @@ class ObjectDecoder(nn.Module):
                 else:
                     out.weight[part].zero_()
                 out.bias[part] = value
+            self.refine.out[-1].weight.zero_()  # refined = sketch at first
+            self.refine.out[-1].bias.zero_()
 
     def forward(
-        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
-        """Object slots (B, K, C), their attention (B, K, s*s), token colours (B, s*s, 3), view 0's
-        SceneFrames -> sketch Gaussians (B, K, WINDOW*WINDOW, ...), the box {"anchor_init" (B, K, 3),
-        "anchor" (B, K, 2), "extent" (B, K, 3)} and the state for decode(); scene frame."""
+        self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, image: torch.Tensor, frame: SceneFrame
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Object slots (B, K, C), their attention (B, K, s*s), token colours (B, s*s, 3), view-0
+        image (B, 3, H, W), view 0's SceneFrames -> refined and sketch Gaussians (B, K, WINDOW*WINDOW,
+        ...), the box {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)}; scene frame."""
         h, w = self.image_size
-        k = slots.shape[1]
+        b, k = slots.shape[:2]
         size = slots.new_tensor([w, h])
         f = slots.new_tensor([self.focal_ratio[0] * w, self.focal_ratio[1] * h])
         side = int(round(attn.shape[-1] ** 0.5))
@@ -226,11 +231,6 @@ class ObjectDecoder(nn.Module):
         n_points = points.shape[2]
         rays = self.rays(points.flatten(1, 2), frame).unflatten(1, (k, n_points))  # (B, K, P, 3)
         t_in, t_out, hit = self.box_stretch(rays, anchor, extent, frame)  # (B, K, P)
-
-        # 3. q per window pixel, from the slot alone: a U-Net on the window's positions.
-        pe = positional_encoding(local, PE_BANDS).T.unflatten(1, (WINDOW, WINDOW))  # (D, WINDOW, WINDOW)
-        emb = self.embed(slots).flatten(0, 1)  # (B*K, d)
-        q = self.unet(pe.expand(emb.shape[0], -1, -1, -1), emb).flatten(2).transpose(1, 2)  # (B*K, P, d)
         state = {
             "rays": rays,
             "t_in": t_in,
@@ -239,18 +239,32 @@ class ObjectDecoder(nn.Module):
             "spacing": 2 * half / WINDOW,  # (B, K) window pixel width, image pixels
             "colour": colour,
             "presence": (attn.mean(-1) / AREA_FULL).clamp(max=1.0),  # (B, K)
-            "q": q,  # (B*K, P, d)
-            "frame": frame,
         }
-        gaussians = self.decode(state["q"], state)
-        state["mu"] = gaussians["mu"]  # where the lifter samples
-        return gaussians, {"anchor_init": anchor_init, "anchor": anchor, "extent": extent}, state
 
-    def decode(self, q: torch.Tensor, state: dict) -> dict[str, torch.Tensor]:
-        """q (B*K, P, d), e.g. refined by the lifter -> Gaussians (B, K, P, ...), one per window pixel."""
-        frame = state["frame"]
-        b, k = state["presence"].shape
-        raw = self.head(q).unflatten(0, (b, k))  # (B, K, P, N_OUT)
+        # 3. Sketch, from the slot alone: a U-Net on the window's positions -> q -> the head.
+        pe = positional_encoding(local, PE_BANDS).T.unflatten(1, (WINDOW, WINDOW))  # (D, WINDOW, WINDOW)
+        emb = self.embed(slots).flatten(0, 1)  # (B*K, d)
+        q = self.sketch(pe.expand(emb.shape[0], -1, -1, -1), emb)  # (B*K, d, WINDOW, WINDOW)
+        raw = self.head(q.flatten(2).transpose(1, 2)).unflatten(0, (b, k))  # (B, K, P, N_OUT)
+
+        # 4. Refine, as Splatter Image: a U-Net on the window [rgb, ownership, q] -> residual parameters.
+        grid = ((points + 0.5) / size * 2 - 1).flatten(1, 2)[:, :, None]  # (B, K*P, 1, 2)
+
+        def crop(x: torch.Tensor) -> torch.Tensor:  # (B, C, H, W) -> (B, K, C, WINDOW, WINDOW)
+            out = F.grid_sample(x, grid, padding_mode="border", align_corners=False)[..., 0]  # (B, C, K*P)
+            return out.unflatten(2, (k, WINDOW, WINDOW)).transpose(1, 2)
+
+        maps = crop(attn.unflatten(2, (side, side)))  # (B, K windows, K maps, WINDOW, WINDOW)
+        own = maps[:, torch.arange(k), torch.arange(k)][:, :, None]  # each slot's map in its window
+        window = torch.cat([crop(image).flatten(0, 1), own.flatten(0, 1), q], 1)  # (B*K, 3 + 1 + d, ...)
+        residual = self.refine(window, emb).flatten(2).transpose(1, 2).unflatten(0, (b, k))  # (B, K, P, N_OUT)
+
+        box = {"anchor_init": anchor_init, "anchor": anchor, "extent": extent}
+        return self._gaussians(raw + residual, state, frame), self._gaussians(raw, state, frame), box
+
+    def _gaussians(self, raw: torch.Tensor, state: dict, frame: SceneFrame) -> dict[str, torch.Tensor]:
+        """Raw parameters (B, K, P, N_OUT) -> Gaussians (B, K, P, ...), one per window pixel."""
+        k = raw.shape[1]
         t_in, t_out = state["t_in"], state["t_out"]
         depth = t_in + torch.sigmoid(raw[..., 0]) * (t_out - t_in)  # (B, K, P)
         rot = frame.rot[:, None, None]  # camera -> scene frame

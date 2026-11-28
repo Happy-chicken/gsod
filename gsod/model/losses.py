@@ -1,7 +1,7 @@
 """Reconstruction loss (no masks), every view:
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
-        + refine_aux * (recon * MSE + ssim * (1 - SSIM)) of the sketch, before the lifter
+        + refine_aux * (recon * MSE + ssim * (1 - SSIM)) of the sketch, before refine
         + lpips * LPIPS (VGG) + box * mean object box half size, both from late_start on
 """
 
