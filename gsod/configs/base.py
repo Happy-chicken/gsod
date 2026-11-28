@@ -18,6 +18,8 @@ class LossConfig:
     refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
     box: float = 0.005  # mean box half size (keeps boxes tight)
     surface: float = 1.0  # roughness of the object surface patches (mean squared Laplacian)
+    normal: float = 0.05  # 2DGS normal consistency (rendered vs depth normals), from late_start
+    distortion: float = 0.01  # 2DGS depth distortion, from late_start
 
 
 @dataclass

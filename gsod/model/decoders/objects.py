@@ -39,7 +39,8 @@ AREA_FULL = 0.004
 BOX_INIT = 0.25
 # Surface patches per slot (a cube's faces), the sphere they start on (box units).
 N_PATCHES, TEMPLATE_RADIUS = 6, 0.7
-# Disc sizes: in-plane this x the neighbours' spacing, across the surface this x the in-plane size.
+# Disc sizes: in-plane this x the neighbours' spacing; across the surface this x the in-plane size
+# (rendered as 2DGS discs, which ignore it; kept for 3DGS viewers of exported .ply files).
 COVER, THIN = 0.6, 0.1
 # A Gaussian may leave its surface point by this x the box's mean half size (across the surface).
 NORMAL_OFFSET = 0.05

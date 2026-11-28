@@ -3,6 +3,7 @@
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
         + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
         + surface * the object surface patches' roughness
+        + normal * (1 - rendered . depth normal) + distortion * depth distortion (2DGS), from late_start
         + lpips * LPIPS (VGG) + box * mean object box half size, both from late_start of training on
 """
 
@@ -78,6 +79,10 @@ class GSODLoss(nn.Module):
             if cfg.box > 0:  # object box half sizes, scene units
                 terms["box"] = outputs["extent"].mean()
                 weights["box"] = cfg.box
+            for name in ("normal", "distortion"):  # 2DGS geometry
+                if getattr(cfg, name) > 0:
+                    terms[name] = outputs["normal_error" if name == "normal" else name].mean()
+                    weights[name] = getattr(cfg, name)
         total = sum(weights[name] * value for name, value in terms.items())
         logged = {name: value.detach() for name, value in terms.items()}
         logged["total"] = total.detach()

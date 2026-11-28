@@ -1,5 +1,7 @@
 """gsplat (https://github.com/nerfstudio-project/gsplat, >= 1.5.3 for batches of
-scenes): Gaussians -> rgb, alpha, depth in all views, any leading batch dims."""
+scenes): Gaussians rendered as 2D Gaussian surfels (2DGS: flat discs, the ray meets each disc
+exactly; the third scale is ignored) -> rgb, alpha, depth in all views, any leading batch dims;
+optionally the 2DGS geometry: rendered normals, normals from depth, depth distortion."""
 
 from __future__ import annotations
 
@@ -18,14 +20,17 @@ def splat(
     focal_ratio: tuple[float, float],
     near: float,
     features: torch.Tensor | None = None,
+    geometry: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Gaussians (..., N, .), cam2world (..., V, 4, 4) -> (..., V, C, H, W)
     "rgb", "depth" (premultiplied by alpha), "alpha"; with features
-    (..., N, D) instead of colours: "features" (..., V, D, H, W), "alpha"."""
+    (..., N, D) instead of colours: "features" (..., V, D, H, W), "alpha". With geometry also
+    "normal" (rendered, alpha-weighted), "depth_normal" (from the expected depth), both world,
+    (..., V, 3, H, W), and "distortion" (..., V, 1, H, W)."""
     if not gaussians["mu"].is_cuda:
         raise RuntimeError("splat needs CUDA tensors; this project requires CUDA")
 
-    from gsplat import rasterization
+    from gsplat import rasterization_2dgs
 
     h, w = image_size
     device = gaussians["mu"].device
@@ -43,7 +48,7 @@ def splat(
     viewmats = torch.linalg.inv(cam2world.double()).float().contiguous()
     Ks = _intrinsics(w, h, focal_ratio, device).expand(*viewmats.shape[:-2], 3, 3).contiguous()
 
-    rendered, alpha, _ = rasterization(
+    rendered, alpha, normal, depth_normal, distortion, _, _ = rasterization_2dgs(
         means=mu,
         quats=quat,
         scales=scale,
@@ -59,15 +64,19 @@ def splat(
         eps2d=EPS2D,
         sh_degree=sh_degree,
         packed=False,
-        render_mode="RGB+D" if features is None else "RGB",
-        rasterize_mode="classic",
-        camera_model="pinhole",
+        render_mode="RGB+ED" if features is None else "RGB",
+        distloss=geometry,
     )
 
     rendered, alpha = rendered.movedim(-1, -3), alpha.movedim(-1, -3)
     if features is not None:
         return {"features": rendered, "alpha": alpha}
-    return {"rgb": rendered[..., :3, :, :], "depth": rendered[..., 3:4, :, :], "alpha": alpha}
+    out = {"rgb": rendered[..., :3, :, :], "depth": rendered[..., 3:4, :, :] * alpha, "alpha": alpha}
+    if geometry:
+        out["normal"] = normal.movedim(-1, -3)
+        out["depth_normal"] = depth_normal.reshape(normal.shape).movedim(-1, -3)
+        out["distortion"] = distortion.movedim(-1, -3)
+    return out
 
 
 def sh_coefficients(gaussians: dict[str, torch.Tensor]) -> tuple[torch.Tensor, int | None]:
