@@ -26,7 +26,7 @@ class BaseConfig:
     z_dim: int = 64
     num_slots: int = 6  # background + K-1 objects
     attn_iter: int = 3
-    gaussians_per_slot: int = 512
+    gaussians_per_slot: int = 512  # rounded down to N_PATCHES * side^2 (6 * 9^2 = 486)
     decoder_hidden_dim: int = 128
     near: float = 0.1
 

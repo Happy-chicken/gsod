@@ -7,7 +7,11 @@
                 across the ray (on the floor); half sizes (ex, ey, ez). The
                 box spans x, y: anchor +- (ex, ey), z: [0, 2 ez], so its
                 centre is at height ez.
-3. Gaussians  ObjectHead: G Gaussians inside the box.
+3. Gaussians  on N_PATCHES surface patches per slot (AtlasNet-like): each query is a point
+              (u, v) of a patch; the decoder folds the patches into the object's surface in
+              the box, starting from a sphere (a cube's faces pushed onto it). Gaussians are
+              flat discs on the surface: rotation from the surface's tangents, in-plane sizes
+              from the neighbours' spacing; so they cover a surface, never fill a volume.
 
 Box sizes, shifts and Gaussian scales unbounded; BOX_INIT only sets where they start.
 Opacity = per-slot share of its brightest Gaussian x presence (attention area /
@@ -21,17 +25,17 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.background import BACKGROUND_THICKNESS, FLOOR_HALF
-from gsod.model.layers import mlp, shift_colour
-from gsod.utils.geometry import SceneFrame, camera_directions
+from gsod.model.layers import mlp, positional_encoding, shift_colour
+from gsod.utils.geometry import SceneFrame, camera_directions, matrix_to_quat
 
 # Attention area (fraction of tokens) at which a slot is fully present.
 AREA_FULL = 0.004
 # Initial box half side (units of R; an initial value, not a limit).
 BOX_INIT = 0.25
-# Initial Gaussian scale, as a fraction of the initial box (not the current one).
-SCALE_FRACTION = 0.1
-# Spread of the learned queries (how far apart Gaussians start).
-QUERY_STD = 2.0
+# Surface patches per slot (a cube's faces), the sphere they start on (box units), (u, v) PE bands.
+N_PATCHES, TEMPLATE_RADIUS, UV_PE_BANDS = 6, 0.7, 4
+# Disc sizes: in-plane this x the neighbours' spacing, across the surface this x the in-plane size.
+COVER, THIN = 0.6, 0.1
 # Transformer: heads, slot tokens, layers; RegionHead MLP width.
 N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
 REGION_HIDDEN = 64
@@ -105,18 +109,44 @@ class RegionHead(nn.Module):
         return anchor, extent
 
 
+def patch_grid(side: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """-> (u, v) of every patch point (N_PATCHES, side, side, 2) in [-1, 1] and where it starts:
+    the cube's face point pushed onto the unit sphere (N_PATCHES, side, side, 3)."""
+    g = (torch.arange(side, device=device, dtype=dtype) + 0.5) / side * 2 - 1
+    v, u = torch.meshgrid(g, g, indexing="ij")
+    uv = torch.stack([u, v], -1)
+    faces = []
+    for axis in range(3):
+        for sign in (-1.0, 1.0):
+            point = torch.empty(side, side, 3, device=device, dtype=dtype)
+            others = [i for i in range(3) if i != axis]
+            point[..., axis] = sign
+            point[..., others[0]], point[..., others[1]] = sign * u, v  # outward-facing (u, v)
+            faces.append(point)
+    return uv.expand(N_PATCHES, -1, -1, -1), F.normalize(torch.stack(faces), dim=-1)
+
+
+def _grid_diff(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """Differences between neighbours along a grid dimension (central inside, one-sided at the edges)."""
+    n = x.shape[dim]
+    first = x.narrow(dim, 1, 1) - x.narrow(dim, 0, 1)
+    inner = (x.narrow(dim, 2, n - 2) - x.narrow(dim, 0, n - 2)) / 2
+    last = x.narrow(dim, n - 1, 1) - x.narrow(dim, n - 2, 1)
+    return torch.cat([first, inner, last], dim)
+
+
 class ObjectHead(nn.Module):
-    """Gaussian feature -> one Gaussian."""
+    """Gaussian feature on a patch -> one disc of the surface."""
 
     def __init__(self, d_model: int):
         super().__init__()
-        self.mlp = mlp(d_model, d_model, 23)
+        # Position residual (3), in-plane log size residual (2), opacity, rgb residual (3), sh1 (9).
+        self.mlp = mlp(d_model, d_model, 18)
         with torch.no_grad():
             out = self.mlp[-1]
-            out.weight[3:].mul_(0.1)
-            out.weight[14:].zero_()  # view-independent at first
+            out.weight.mul_(0.1)
+            out.weight[9:].zero_()  # view-independent at first
             out.bias.zero_()
-            out.bias[6] = 1.0  # identity quaternion (wxyz)
 
     def forward(
         self,
@@ -125,22 +155,37 @@ class ObjectHead(nn.Module):
         extent: torch.Tensor,
         colour: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d), box anchor (K, 2), half sizes / slot colour (K, 3) -> Gaussians (K, G, ...)."""
+        """feat (K, G, d) on the patches' grids, box anchor (K, 2), half sizes / slot colour (K, 3)
+        -> Gaussians (K, G, ...)."""
         raw = self.mlp(feat)
-        t = torch.tanh(raw[..., 0:3])  # position in the box, [-1, 1]^3
+        k, g = raw.shape[:2]
+        side = int(round((g // N_PATCHES) ** 0.5))
+        _, start = patch_grid(side, raw.device, raw.dtype)
+        start = torch.atanh(TEMPLATE_RADIUS * start).reshape(-1, 3)  # the sphere, before tanh
+        t = torch.tanh(start + raw[..., 0:3])  # position in the box, [-1, 1]^3
         xy = anchor[:, None] + extent[:, None, :2] * t[..., :2]
         # Height: the box's [0, 2 ez], kept above the floor's Gaussians.
         lo = BACKGROUND_THICKNESS
         hi = (2.0 * extent[:, 2])[:, None, None]
         mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
 
+        # Discs on the surface: tangents from the neighbours on each patch's grid.
+        grid = mu.view(k, N_PATCHES, side, side, 3)
+        du, dv = _grid_diff(grid, 3), _grid_diff(grid, 2)
+        normal = F.normalize(torch.linalg.cross(du, dv), dim=-1)
+        t1 = F.normalize(du, dim=-1)
+        rot = torch.stack([t1, torch.linalg.cross(normal, t1), normal], -1)  # columns: tangents, normal
+        in_plane = COVER * torch.stack([du.norm(dim=-1), dv.norm(dim=-1)], -1).view(k, g, 2)
+        in_plane = in_plane * torch.exp(raw[..., 3:5])
+        scale = torch.cat([in_plane, THIN * in_plane.mean(-1, keepdim=True)], -1).clamp_min(1e-5)
+
         return {
             "mu": mu,
-            "scale": SCALE_FRACTION * BOX_INIT * torch.exp(raw[..., 3:6]),
-            "quat": F.normalize(raw[..., 6:10], dim=-1),
-            "opacity": torch.sigmoid(raw[..., 10]),
-            "rgb": shift_colour(colour[:, None], raw[..., 11:14]),  # slot colour + a residual
-            "sh1": raw[..., 14:23].unflatten(-1, (3, 3)),
+            "scale": scale,
+            "quat": F.normalize(matrix_to_quat(rot).view(k, g, 4), dim=-1),
+            "opacity": torch.sigmoid(raw[..., 5]),
+            "rgb": shift_colour(colour[:, None], raw[..., 6:9]),  # slot colour + a residual
+            "sh1": raw[..., 9:18].unflatten(-1, (3, 3)),
         }
 
 
@@ -180,7 +225,9 @@ class ObjectDecoder(nn.Module):
         self.image_size, self.focal_ratio = tuple(image_size), tuple(focal_ratio)
         d = int(hidden_dim)
         self.d = d
-        self.queries = nn.Parameter(torch.randn(int(gaussians_per_slot), d) * QUERY_STD)
+        self.side = int((gaussians_per_slot // N_PATCHES) ** 0.5)  # G = N_PATCHES * side^2
+        self.patch_embed = nn.Parameter(torch.randn(N_PATCHES, d))  # which patch
+        self.uv_to_q = nn.Linear(2 + 4 * UV_PE_BANDS, d)  # where on it
         self.to_k = nn.Linear(z_dim, N_TOKENS * d)
         self.to_v = nn.Linear(z_dim, N_TOKENS * d)
         self.norm_kv = nn.LayerNorm(d)
@@ -213,7 +260,11 @@ class ObjectDecoder(nn.Module):
         }
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        gaussians, state["q"] = self.decode(self.queries.expand(K, -1, -1), state)
+        uv, _ = patch_grid(self.side, slots.device, slots.dtype)
+        queries = self.patch_embed[:, None, None] + self.uv_to_q(
+            positional_encoding(uv.reshape(-1, 2), UV_PE_BANDS)
+        ).view(N_PATCHES, self.side, self.side, -1)
+        gaussians, state["q"] = self.decode(queries.reshape(-1, self.d).expand(K, -1, -1), state)
         state["mu"] = gaussians["mu"]  # where the lifter samples
         return gaussians, box, state
 
