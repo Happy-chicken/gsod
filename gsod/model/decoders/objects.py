@@ -172,9 +172,10 @@ class ObjectHead(nn.Module):
         # Discs on the surface: tangents from the neighbours on each patch's grid.
         grid = mu.view(k, N_PATCHES, side, side, 3)
         du, dv = _grid_diff(grid, 3), _grid_diff(grid, 2)
-        normal = F.normalize(torch.linalg.cross(du, dv), dim=-1)
-        t1 = F.normalize(du, dim=-1)
-        rot = torch.stack([t1, torch.linalg.cross(normal, t1), normal], -1)  # columns: tangents, normal
+        with torch.no_grad():  # the disc follows the surface; no gradient (quaternions of near-axis frames blow up)
+            normal = F.normalize(torch.linalg.cross(du, dv), dim=-1)
+            t1 = F.normalize(du, dim=-1)
+            rot = torch.stack([t1, torch.linalg.cross(normal, t1), normal], -1)  # columns: tangents, normal
         in_plane = COVER * torch.stack([du.norm(dim=-1), dv.norm(dim=-1)], -1).view(k, g, 2)
         in_plane = in_plane * torch.exp(raw[..., 3:5])
         scale = torch.cat([in_plane, THIN * in_plane.mean(-1, keepdim=True)], -1).clamp_min(1e-5)
