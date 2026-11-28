@@ -7,11 +7,16 @@
                 across the ray (on the floor); half sizes (ex, ey, ez). The
                 box spans x, y: anchor +- (ex, ey), z: [0, 2 ez], so its
                 centre is at height ez.
-3. Gaussians  on N_PATCHES surface patches per slot (AtlasNet-like): each query is a point
-              (u, v) of a patch; the decoder folds the patches into the object's surface in
-              the box, starting from a sphere (a cube's faces pushed onto it). Gaussians are
-              flat discs on the surface: rotation from the surface's tangents, in-plane sizes
-              from the neighbours' spacing; so they cover a surface, never fill a volume.
+3. shape      N_PATCHES surface patches per slot (AtlasNet): patch queries read the slot
+              tokens -> a latent per patch; a point (u, v) of a patch lands at
+              MLP(latent, u, v) in the box, from a sphere (a cube's faces pushed onto it).
+              Nothing but (latent, u, v) places a point, so each patch is a smooth surface;
+              (u, v) jittered within its cell in training.
+4. Gaussians  one per (u, v), bound to the surface: a flat disc along its tangents (in-plane
+              sizes from the neighbours' spacing), moved off its point by at most a cell
+              along the surface and NORMAL_OFFSET x the box across it.
+5. refine     what each Gaussian sees in view 0 (the lifter) updates its patch's latent
+              (the shape) and its own offsets and appearance; it stays bound to the surface.
 
 Box sizes, shifts and Gaussian scales unbounded; BOX_INIT only sets where they start.
 Opacity = per-slot share of its brightest Gaussian x presence (attention area /
@@ -25,17 +30,19 @@ import torch.nn.functional as F
 from torch import nn
 
 from gsod.model.decoders.background import BACKGROUND_THICKNESS, FLOOR_HALF
-from gsod.model.layers import mlp, positional_encoding, shift_colour
+from gsod.model.layers import mlp, shift_colour
 from gsod.utils.geometry import SceneFrame, camera_directions, matrix_to_quat
 
 # Attention area (fraction of tokens) at which a slot is fully present.
 AREA_FULL = 0.004
 # Initial box half side (units of R; an initial value, not a limit).
 BOX_INIT = 0.25
-# Surface patches per slot (a cube's faces), the sphere they start on (box units), (u, v) PE bands.
-N_PATCHES, TEMPLATE_RADIUS, UV_PE_BANDS = 6, 0.7, 4
+# Surface patches per slot (a cube's faces), the sphere they start on (box units).
+N_PATCHES, TEMPLATE_RADIUS = 6, 0.7
 # Disc sizes: in-plane this x the neighbours' spacing, across the surface this x the in-plane size.
 COVER, THIN = 0.6, 0.1
+# A Gaussian may leave its surface point by this x the box's mean half size (across the surface).
+NORMAL_OFFSET = 0.05
 # Transformer: heads, slot tokens, layers; RegionHead MLP width.
 N_HEADS, N_TOKENS, N_LAYERS = 4, 8, 2
 REGION_HIDDEN = 64
@@ -109,21 +116,27 @@ class RegionHead(nn.Module):
         return anchor, extent
 
 
-def patch_grid(side: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """-> (u, v) of every patch point (N_PATCHES, side, side, 2) in [-1, 1] and where it starts:
-    the cube's face point pushed onto the unit sphere (N_PATCHES, side, side, 3)."""
+def patch_uv(side: int, device, dtype, jitter: bool) -> torch.Tensor:
+    """(u, v) of every patch point (N_PATCHES, side, side, 2) in [-1, 1]: cell centres, or a random
+    point of each cell (jitter)."""
     g = (torch.arange(side, device=device, dtype=dtype) + 0.5) / side * 2 - 1
     v, u = torch.meshgrid(g, g, indexing="ij")
-    uv = torch.stack([u, v], -1)
+    uv = torch.stack([u, v], -1).expand(N_PATCHES, -1, -1, -1)
+    if jitter:
+        uv = uv + (torch.rand_like(uv) - 0.5) * (2 / side)
+    return uv
+
+
+def sphere_template(uv: torch.Tensor) -> torch.Tensor:
+    """(u, v) (N_PATCHES, ..., 2) -> the cube's face points pushed onto the unit sphere (N_PATCHES, ..., 3)."""
     faces = []
-    for axis in range(3):
-        for sign in (-1.0, 1.0):
-            point = torch.empty(side, side, 3, device=device, dtype=dtype)
-            others = [i for i in range(3) if i != axis]
-            point[..., axis] = sign
-            point[..., others[0]], point[..., others[1]] = sign * u, v  # outward-facing (u, v)
-            faces.append(point)
-    return uv.expand(N_PATCHES, -1, -1, -1), F.normalize(torch.stack(faces), dim=-1)
+    for face, (axis, sign) in enumerate((a, s) for a in range(3) for s in (-1.0, 1.0)):
+        u, v = uv[face].unbind(-1)
+        others = [i for i in range(3) if i != axis]
+        coords = [None, None, None]
+        coords[axis], coords[others[0]], coords[others[1]] = torch.full_like(u, sign), sign * u, v  # outward
+        faces.append(torch.stack(coords, -1))
+    return F.normalize(torch.stack(faces), dim=-1)
 
 
 def _grid_diff(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -135,59 +148,96 @@ def _grid_diff(x: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.cat([first, inner, last], dim)
 
 
-class ObjectHead(nn.Module):
-    """Gaussian feature on a patch -> one disc of the surface."""
+def _laplacian(x: torch.Tensor) -> torch.Tensor:
+    """Grids (..., S, S, C) -> each inner point minus its 4 neighbours' mean (..., S-2, S-2, C)."""
+    mean = (x[..., :-2, 1:-1, :] + x[..., 2:, 1:-1, :] + x[..., 1:-1, :-2, :] + x[..., 1:-1, 2:, :]) / 4
+    return x[..., 1:-1, 1:-1, :] - mean
+
+
+class SurfaceHead(nn.Module):
+    """Patch latent + (u, v) -> the surface point (box units, before tanh, as a residual on the
+    sphere) and a point feature."""
 
     def __init__(self, d_model: int):
         super().__init__()
-        # Position residual (3), in-plane log size residual (2), opacity, rgb residual (3), sh1 (9).
+        d = d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(d + 2, d), nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True), nn.Linear(d, d), nn.ReLU(True)
+        )
+        self.to_point = nn.Linear(d, 3)
+        nn.init.zeros_(self.to_point.weight)  # the sphere at first
+        nn.init.zeros_(self.to_point.bias)
+
+    def forward(self, latent: torch.Tensor, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """latent (K, N_PATCHES, d), uv (N_PATCHES, S, S, 2) -> point residual (K, N_PATCHES, S, S, 3),
+        feature (K, N_PATCHES, S, S, d)."""
+        k = latent.shape[0]
+        x = torch.cat([latent[:, :, None, None].expand(-1, -1, *uv.shape[1:3], -1), uv.expand(k, -1, -1, -1, -1)], -1)
+        feat = self.mlp(x)
+        return self.to_point(feat), feat
+
+
+class GaussianHead(nn.Module):
+    """Point feature -> a disc bound to the surface: offsets (normal, 2 tangents), in-plane log
+    size residual (2), opacity, rgb residual (3), sh1 (9)."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
         self.mlp = mlp(d_model, d_model, 18)
         with torch.no_grad():
             out = self.mlp[-1]
             out.weight.mul_(0.1)
+            out.weight[:3].zero_()  # on the surface at first
             out.weight[9:].zero_()  # view-independent at first
             out.bias.zero_()
 
     def forward(
         self,
+        point: torch.Tensor,
         feat: torch.Tensor,
         anchor: torch.Tensor,
         extent: torch.Tensor,
         colour: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """feat (K, G, d) on the patches' grids, box anchor (K, 2), half sizes / slot colour (K, 3)
-        -> Gaussians (K, G, ...)."""
-        raw = self.mlp(feat)
-        k, g = raw.shape[:2]
-        side = int(round((g // N_PATCHES) ** 0.5))
-        _, start = patch_grid(side, raw.device, raw.dtype)
-        start = torch.atanh(TEMPLATE_RADIUS * start).reshape(-1, 3)  # the sphere, before tanh
-        t = torch.tanh(start + raw[..., 0:3])  # position in the box, [-1, 1]^3
-        xy = anchor[:, None] + extent[:, None, :2] * t[..., :2]
+        uv: torch.Tensor,
+        view_dependent: bool,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Point residual (K, N_PATCHES, S, S, 3), feature (K, N_PATCHES, S, S, d), box anchor (K, 2),
+        half sizes / slot colour (K, 3), uv -> Gaussians (K, G, ...) and the surface's roughness
+        (K,): the mean squared Laplacian of its deformation from the sphere, per cell."""
+        side = point.shape[2]
+        t = torch.tanh(torch.atanh(TEMPLATE_RADIUS * sphere_template(uv)) + point)  # the surface in the box, [-1, 1]^3
+        roughness = (side * _laplacian(point)).pow(2).sum(-1).flatten(1).mean(-1)
+        xy = anchor[:, None, None, None] + extent[:, None, None, None, :2] * t[..., :2]
         # Height: the box's [0, 2 ez], kept above the floor's Gaussians.
-        lo = BACKGROUND_THICKNESS
-        hi = (2.0 * extent[:, 2])[:, None, None]
-        mu = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)
+        lo, hi = BACKGROUND_THICKNESS, (2.0 * extent[:, 2])[:, None, None, None, None]
+        surface = torch.cat([xy, lo + (hi - lo) * 0.5 * (t[..., 2:] + 1.0)], -1)  # (K, N_PATCHES, S, S, 3)
 
-        # Discs on the surface: tangents from the neighbours on each patch's grid.
-        grid = mu.view(k, N_PATCHES, side, side, 3)
-        du, dv = _grid_diff(grid, 3), _grid_diff(grid, 2)
-        with torch.no_grad():  # the disc follows the surface; no gradient (quaternions of near-axis frames blow up)
+        # The surface's frame at each point (no gradient: quaternions of near-axis frames blow up).
+        du, dv = _grid_diff(surface, 3), _grid_diff(surface, 2)
+        with torch.no_grad():
             normal = F.normalize(torch.linalg.cross(du, dv), dim=-1)
             t1 = F.normalize(du, dim=-1)
-            rot = torch.stack([t1, torch.linalg.cross(normal, t1), normal], -1)  # columns: tangents, normal
-        in_plane = COVER * torch.stack([du.norm(dim=-1), dv.norm(dim=-1)], -1).view(k, g, 2)
-        in_plane = in_plane * torch.exp(raw[..., 3:5])
-        scale = torch.cat([in_plane, THIN * in_plane.mean(-1, keepdim=True)], -1).clamp_min(1e-5)
+            t2 = torch.linalg.cross(normal, t1)
+            quat = matrix_to_quat(torch.stack([t1, t2, normal], -1))
+        spacing = torch.stack([du.norm(dim=-1), dv.norm(dim=-1)], -1)  # (K, N_PATCHES, S, S, 2)
 
-        return {
+        raw = self.mlp(feat)
+        off = torch.tanh(raw[..., 0:3])
+        across = NORMAL_OFFSET * extent.mean(-1)[:, None, None, None, None]
+        mu = surface + off[..., :1] * across * normal + off[..., 1:2] * spacing[..., :1] * t1
+        mu = mu + off[..., 2:3] * spacing[..., 1:] * t2
+        in_plane = COVER * spacing * torch.exp(raw[..., 3:5])
+        scale = torch.cat([in_plane, THIN * in_plane.mean(-1, keepdim=True)], -1).clamp_min(1e-5)
+        sh1 = raw[..., 9:18].unflatten(-1, (3, 3))
+        gaussians = {
             "mu": mu,
             "scale": scale,
-            "quat": F.normalize(matrix_to_quat(rot).view(k, g, 4), dim=-1),
+            "quat": F.normalize(quat, dim=-1),
             "opacity": torch.sigmoid(raw[..., 5]),
-            "rgb": shift_colour(colour[:, None], raw[..., 6:9]),  # slot colour + a residual
-            "sh1": raw[..., 9:18].unflatten(-1, (3, 3)),
+            "rgb": shift_colour(colour[:, None, None, None], raw[..., 6:9]),  # slot colour + a residual
+            "sh1": sh1 if view_dependent else torch.zeros_like(sh1),
         }
+        return {name: value.flatten(1, 3) for name, value in gaussians.items()}, roughness
 
 
 class DecoderLayer(nn.Module):
@@ -212,7 +262,7 @@ class DecoderLayer(nn.Module):
 
 
 class ObjectDecoder(nn.Module):
-    """Object slots -> Gaussians, scene frame."""
+    """Object slots -> Gaussians on each slot's surface patches, scene frame."""
 
     def __init__(
         self,
@@ -227,22 +277,26 @@ class ObjectDecoder(nn.Module):
         d = int(hidden_dim)
         self.d = d
         self.side = int((gaussians_per_slot // N_PATCHES) ** 0.5)  # G = N_PATCHES * side^2
-        self.patch_embed = nn.Parameter(torch.randn(N_PATCHES, d))  # which patch
-        self.uv_to_q = nn.Linear(2 + 4 * UV_PE_BANDS, d)  # where on it
+        self.view_dependent = True  # sh1 on; the trainer turns it off early on
+        self.patch_queries = nn.Parameter(torch.randn(N_PATCHES, d))
         self.to_k = nn.Linear(z_dim, N_TOKENS * d)
         self.to_v = nn.Linear(z_dim, N_TOKENS * d)
         self.norm_kv = nn.LayerNorm(d)
         self.layers = nn.ModuleList(DecoderLayer(d, N_HEADS) for _ in range(N_LAYERS))
         self.region = RegionHead(z_dim)
-        self.head = ObjectHead(d)
+        self.surface = SurfaceHead(d)
+        self.gaussian = GaussianHead(d)
+        self.seen_to_latent = nn.Linear(d, d)  # refine: what a patch's Gaussians see -> its latent
+        nn.init.zeros_(self.seen_to_latent.weight)
+        nn.init.zeros_(self.seen_to_latent.bias)
 
     def forward(
         self, slots: torch.Tensor, attn: torch.Tensor, colours: torch.Tensor, frame: SceneFrame
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
         """Object slots (B, K, C), their attention (B, K, N), token colours
-        (B, N, 3), view 0's SceneFrames -> Gaussians (B, K, G, ...), the box
-        {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3)} and the
-        state for decode(); scene frame."""
+        (B, N, 3), view 0's SceneFrames -> sketch Gaussians (B, K, G, ...), the box
+        {"anchor_init" (B, K, 3), "anchor" (B, K, 2), "extent" (B, K, 3), "roughness" (B, K)}
+        and the state for refine(); scene frame."""
         b, n_slots = slots.shape[:2]
         anchor_init, colour = init_attention_anchor(attn, colours, frame, self.image_size, self.focal_ratio)
         ray = F.normalize(anchor_init - frame.origin[:, None], dim=-1)  # camera -> anchor_init
@@ -250,32 +304,54 @@ class ObjectDecoder(nn.Module):
         slots, anchor_init, ray, colour = (x.flatten(0, 1) for x in (slots, anchor_init, ray, colour))
         K = slots.shape[0]
         anchor, extent = self.region(slots, anchor_init, ray)
+        k, v = (self.norm_kv(f(slots).view(K, N_TOKENS, self.d)) for f in (self.to_k, self.to_v))  # slot tokens
+        latent = self.patch_queries.expand(K, -1, -1)
+        for layer in self.layers:
+            latent = layer(latent, k, v)  # (B*K, N_PATCHES, d)
         state = {
-            "k": self.norm_kv(self.to_k(slots).view(K, N_TOKENS, self.d)),  # slot tokens
-            "v": self.norm_kv(self.to_v(slots).view(K, N_TOKENS, self.d)),
             "anchor": anchor,
             "extent": extent,
             "colour": colour,
             "presence": (attn.mean(-1).flatten() / AREA_FULL).clamp(max=1.0),
             "shape": (b, n_slots),
+            "uv": patch_uv(self.side, slots.device, slots.dtype, self.training),
+            "latent": latent,
         }
         box["anchor"] = anchor.unflatten(0, (b, n_slots))
         box["extent"] = extent.unflatten(0, (b, n_slots))
-        uv, _ = patch_grid(self.side, slots.device, slots.dtype)
-        queries = self.patch_embed[:, None, None] + self.uv_to_q(
-            positional_encoding(uv.reshape(-1, 2), UV_PE_BANDS)
-        ).view(N_PATCHES, self.side, self.side, -1)
-        gaussians, state["q"] = self.decode(queries.reshape(-1, self.d).expand(K, -1, -1), state)
-        state["mu"] = gaussians["mu"]  # where the lifter samples
+        gaussians, feat, box["roughness"] = self.decode(latent, None, state)
+        state["feat"], state["mu"] = feat, gaussians["mu"]  # where the lifter samples
         return gaussians, box, state
 
-    def decode(self, q: torch.Tensor, state: dict) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """q (B*K, G, d) through the decoder layers (cross-attention to the slot tokens) ->
-        Gaussians (B, K, G, ...) in the box, and q after the layers."""
-        for layer in self.layers:
-            q = layer(q, state["k"], state["v"])
-        gaussians = self.head(q, state["anchor"], state["extent"], state["colour"])
+    def refine(self, seen: torch.Tensor, state: dict) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """What each sketch Gaussian sees in view 0 (B*K, G, d) -> refined Gaussians (B, K, G, ...)
+        and the surface's roughness (B, K): the patches' latents move by their Gaussians' mean;
+        each Gaussian adds its own to its feature."""
+        k = seen.shape[0]
+        latent = state["latent"] + self.seen_to_latent(seen.view(k, N_PATCHES, -1, self.d).mean(2))
+        gaussians, _, roughness = self.decode(latent, seen, state)
+        return gaussians, roughness
+
+    def decode(
+        self, latent: torch.Tensor, seen: torch.Tensor | None, state: dict
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Patch latents (B*K, N_PATCHES, d), what each Gaussian sees (B*K, G, d) or None ->
+        Gaussians (B, K, G, ...), point features (B*K, G, d), roughness (B, K)."""
+        point, feat = self.surface(latent, state["uv"])
+        feat = feat.flatten(1, 3)  # (B*K, G, d)
+        if seen is not None:
+            feat = feat + seen
+        gaussians, roughness = self.gaussian(
+            point,
+            feat.view(*point.shape[:4], -1),
+            state["anchor"],
+            state["extent"],
+            state["colour"],
+            state["uv"],
+            self.view_dependent,
+        )
         # Each slot's brightest Gaussian at its presence.
         opacity = gaussians["opacity"]
         gaussians["opacity"] = opacity / opacity.amax(dim=1, keepdim=True).clamp_min(1e-6) * state["presence"][:, None]
-        return {name: value.unflatten(0, state["shape"]) for name, value in gaussians.items()}, q
+        gaussians = {name: value.unflatten(0, state["shape"]) for name, value in gaussians.items()}
+        return gaussians, feat, roughness.unflatten(0, state["shape"])

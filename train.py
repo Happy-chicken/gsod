@@ -104,8 +104,10 @@ class GSODTraining(L.LightningModule):
         # Batches seen. Noise annealed by scenes seen.
         step = (self.start_epoch + self.current_epoch) * self.steps_per_epoch + batch_idx
         self.model.slot_attention.anneal(step * self.cfg.batch_scenes)
-        outputs = self.model(images, cams)
         progress = step / (self.cfg.epochs * self.steps_per_epoch)
+        # View-dependent colour (sh1) only from late_start: geometry first, not faked by colour.
+        self.model.obj_decoder.view_dependent = progress >= self.cfg.loss.late_start
+        outputs = self.model(images, cams)
         loss, terms = self.criterion(outputs, images, progress)
         for name, value in terms.items():
             self.log(f"train/{name}", value, prog_bar=name == "recon", batch_size=1)
@@ -258,7 +260,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussians-per-slot", type=int, default=None)
     parser.add_argument("--decoder-hidden-dim", type=int, default=None)
     parser.add_argument("--box", type=float, default=None, help="box size penalty weight; 0 = off")
-    parser.add_argument("--late-start", type=float, default=None, help="LPIPS and box from this fraction on")
+    parser.add_argument("--surface", type=float, default=None, help="surface roughness weight; 0 = off")
+    parser.add_argument("--late-start", type=float, default=None, help="LPIPS, box and sh1 from this fraction on")
     parser.add_argument("--train-scenes", type=int, default=None, help="first N training scenes")
     parser.add_argument("--val-scenes", type=int, default=None, help="first N val scenes")
     parser.add_argument("--monitor-scenes", type=int, default=None, help="first N test scenes")
@@ -281,7 +284,7 @@ def main() -> None:
         values["data_root"] = args.data
     if args.out is not None:
         values["out_dir"] = args.out
-    loss = {k: getattr(args, k) for k in ("box", "late_start") if getattr(args, k) is not None}
+    loss = {k: getattr(args, k) for k in ("box", "surface", "late_start") if getattr(args, k) is not None}
     values["loss"] = replace(cfg.loss, **loss)
     cfg = replace(cfg, **values)
 

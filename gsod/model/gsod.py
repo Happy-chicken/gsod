@@ -82,6 +82,7 @@ class GSODModel(nn.Module):
             "extent": box["extent"],
             "box": points_to_world(box_corners(box["anchor"], box["extent"]), frame),
             "anchor_init": points_to_world(box["anchor_init"], frame),
+            "roughness": box["roughness"],  # (B, K-1), the sketch surface's
         }
         return to_world(local, frame), box, state
 
@@ -146,12 +147,13 @@ class GSODModel(nn.Module):
         floor = self.decode_background(bg_slot, attn[:, 0], colours, frame)
         objects, box, state = self.decode_objects(slots, attn[:, 1:], colours, frame)  # the sketch
 
-        # Refine: each object Gaussian reads view 0 around its pixel; decoding continues from its q.
-        q = self.lifter(state["q"], state["mu"], images[:, 0], attn[:, 1:], frame)
-        refined, _ = self.obj_decoder.decode(q, state)
+        # Refine: each object Gaussian reads view 0 around its pixel; the surface and the Gaussians move.
+        seen = self.lifter(state["feat"], state["mu"], images[:, 0], attn[:, 1:], frame)
+        refined, roughness = self.obj_decoder.refine(seen, state)
 
         out = self.render(to_world(refined, frame), floor, cam2world)
         out.update(attn=attn, **box)  # attn (B, K, s*s); extent, box, anchor_init
+        out["roughness"] = (out["roughness"] + roughness) / 2  # (B, K-1): sketch and refined surfaces
         cams = (cam2world, self.image_size, self.focal_ratio, self.near)
         out["rgb_pre"] = splat(self.merge(objects, floor), *cams)["rgb"]  # the sketch: auxiliary loss, panels
         return out

@@ -1,5 +1,5 @@
 """PixelLifter: each object Gaussian reads view 0 around its pixel (U-Net features, rgb, its slot's
-ownership; deformable sampling) -> a refined q, decoded on by the object decoder."""
+ownership; deformable sampling) -> what it sees, an embedding the object decoder refines with."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def sample_own_pixels(
 
 
 class PixelLifter(nn.Module):
-    """q (B*K, G, d) + what each Gaussian sees in view 0 -> refined q (B*K, G, d)."""
+    """Gaussian features q (B*K, G, d) -> what each Gaussian sees in view 0 (B*K, G, d)."""
 
     def __init__(
         self,
@@ -84,7 +84,7 @@ class PixelLifter(nn.Module):
         frame: SceneFrame,
     ) -> torch.Tensor:
         """q (B*K, G, d), Gaussian centres mu (B, K, G, 3), view-0 image (B, 3, H, W), the object
-        slots' attention (B, K, s*s) -> q + what each Gaussian sees (B*K, G, d)."""
+        slots' attention (B, K, s*s) -> what each Gaussian sees (B*K, G, d), zero at first."""
         side = (self.input_size, self.input_size)
         enc = self.encoder(F.interpolate(image, size=side, mode="bilinear", align_corners=False))  # (B, C, s, s)
         attn = attn.unflatten(2, side)  # (B, K, s, s)
@@ -93,4 +93,4 @@ class PixelLifter(nn.Module):
         weights = self.to_weights(q).softmax(-1).unflatten(0, shape)  # (B, K, G, M)
         samples = sample_own_pixels(mu, offsets, attn, enc, image, frame, self.image_size, self.focal_ratio)
         pixel_info = (weights[..., None] * samples).sum(-2).flatten(0, 1)  # (B*K, G, C + 4)
-        return q + self.pixel_to_q(pixel_info)
+        return self.pixel_to_q(pixel_info)

@@ -2,6 +2,7 @@
 
 total = recon * MSE (images in [-1, 1]) + ssim * (1 - SSIM)
         + refine_aux * (recon * MSE + ssim * (1 - SSIM)) before refinement
+        + surface * the object surface patches' roughness
         + lpips * LPIPS (VGG) + box * mean object box half size, both from late_start of training on
 """
 
@@ -61,6 +62,9 @@ class GSODLoss(nn.Module):
             "ssim": 1.0 - ssim(rendered, images),
         }
         weights = {"recon": cfg.recon, "ssim": cfg.ssim}
+        if "roughness" in outputs and cfg.surface > 0:  # smooth object surfaces
+            terms["surface"] = outputs["roughness"].mean()
+            weights["surface"] = cfg.surface
         if "rgb_pre" in outputs and cfg.refine_aux > 0:
             pre = outputs["rgb_pre"].flatten(0, -4)
             terms["refine_aux"] = cfg.recon * F.mse_loss(2.0 * pre - 1.0, 2.0 * images - 1.0) + cfg.ssim * (

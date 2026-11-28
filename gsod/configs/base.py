@@ -17,6 +17,7 @@ class LossConfig:
     late_start: float = 0.3  # LPIPS and box from this fraction of training on
     refine_aux: float = 0.5  # MSE + SSIM terms on the render before refinement
     box: float = 0.005  # mean box half size (keeps boxes tight)
+    surface: float = 1.0  # roughness of the object surface patches (mean squared Laplacian)
 
 
 @dataclass
